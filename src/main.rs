@@ -3147,6 +3147,7 @@ async fn initialize_agents(
             mcp_manager,
             task_store: task_store.clone(),
             project_store: project_store.clone(),
+            topic_store: Arc::new(spacebot::topics::TopicStore::new(db.sqlite.clone())),
             cron_tool: None,
             runtime_config,
             event_tx,
@@ -3219,6 +3220,7 @@ async fn initialize_agents(
         let mut mcp_managers = std::collections::HashMap::new();
         let mut task_stores = std::collections::HashMap::new();
         let mut project_stores = std::collections::HashMap::new();
+        let mut topic_stores = std::collections::HashMap::new();
         let mut agent_workspaces = std::collections::HashMap::new();
         let mut agent_identity_dirs = std::collections::HashMap::new();
         let mut agent_data_dirs = std::collections::HashMap::new();
@@ -3232,6 +3234,7 @@ async fn initialize_agents(
             mcp_managers.insert(agent_id.to_string(), agent.deps.mcp_manager.clone());
             task_stores.insert(agent_id.to_string(), agent.deps.task_store.clone());
             project_stores.insert(agent_id.to_string(), agent.deps.project_store.clone());
+            topic_stores.insert(agent_id.to_string(), agent.deps.topic_store.clone());
             agent_workspaces.insert(agent_id.to_string(), agent.config.workspace.clone());
             agent_identity_dirs.insert(agent_id.to_string(), agent.config.identity_dir.clone());
             agent_data_dirs.insert(agent_id.to_string(), agent.config.data_dir.clone());
@@ -3256,6 +3259,7 @@ async fn initialize_agents(
         api_state.set_mcp_managers(mcp_managers);
         api_state.set_task_stores(task_stores);
         api_state.set_project_stores(project_stores);
+        api_state.set_topic_stores(topic_stores);
         api_state.set_runtime_configs(runtime_configs);
         api_state.set_agent_workspaces(agent_workspaces);
         api_state.set_agent_identity_dirs(agent_identity_dirs);
@@ -3816,6 +3820,13 @@ async fn initialize_agents(
         );
         cortex_handles.push(ready_task_handle);
         tracing::info!(agent_id = %agent_id, "cortex ready-task loop started");
+
+        let topic_sync_handle = spacebot::agent::cortex::spawn_topic_sync_loop(
+            agent.deps.clone(),
+            spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone()),
+        );
+        cortex_handles.push(topic_sync_handle);
+        tracing::info!(agent_id = %agent_id, "cortex topic sync loop started");
     }
 
     // Create cortex chat sessions for each agent

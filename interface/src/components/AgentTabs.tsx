@@ -11,6 +11,7 @@ const tabs = [
 	{ label: "Workers", to: "/agents/$agentId/workers" as const, exact: false },
 	{ label: "Projects", to: "/agents/$agentId/projects" as const, exact: false },
 	{ label: "Tasks", to: "/agents/$agentId/tasks" as const, exact: false },
+	{ label: "Topics", to: "/agents/$agentId/topics" as const, exact: false },
 	{ label: "Cortex", to: "/agents/$agentId/cortex" as const, exact: false },
 	{ label: "Skills", to: "/agents/$agentId/skills" as const, exact: false },
 	{ label: "Cron", to: "/agents/$agentId/cron" as const, exact: false },

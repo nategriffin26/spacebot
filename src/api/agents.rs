@@ -431,6 +431,9 @@ pub(super) async fn trigger_warmup(
                 sandbox,
                 task_store,
                 project_store,
+                topic_store: std::sync::Arc::new(crate::topics::TopicStore::new(
+                    sqlite_pool.clone(),
+                )),
                 links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
                 agent_names: Arc::new(std::collections::HashMap::new()),
                 humans: Arc::new(arc_swap::ArcSwap::from_pointee(humans)),
@@ -685,6 +688,7 @@ pub async fn create_agent_internal(
         embedding_model,
     ));
     let task_store = std::sync::Arc::new(crate::tasks::TaskStore::new(db.sqlite.clone()));
+    let topic_store = std::sync::Arc::new(crate::topics::TopicStore::new(db.sqlite.clone()));
 
     let (event_tx, memory_event_tx) = crate::create_process_event_buses();
     let arc_agent_id: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
@@ -772,6 +776,7 @@ pub async fn create_agent_internal(
         mcp_manager: mcp_manager.clone(),
         task_store: task_store.clone(),
         project_store: project_store.clone(),
+        topic_store: topic_store.clone(),
         cron_tool: None,
         runtime_config: runtime_config.clone(),
         event_tx: event_tx.clone(),
@@ -919,6 +924,12 @@ pub async fn create_agent_internal(
         let mut task_stores = (**state.task_stores.load()).clone();
         task_stores.insert(agent_id.clone(), task_store.clone());
         state.task_stores.store(std::sync::Arc::new(task_stores));
+
+        let mut topic_stores_map = (**state.topic_stores.load()).clone();
+        topic_stores_map.insert(agent_id.clone(), topic_store);
+        state
+            .topic_stores
+            .store(std::sync::Arc::new(topic_stores_map));
 
         let mut registry = (**state.task_store_registry.load()).clone();
         registry.insert(agent_id.clone(), task_store);

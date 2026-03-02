@@ -4,7 +4,7 @@ use super::state::ApiState;
 use super::{
     agents, bindings, channels, config, cortex, cron, factory, ingest, links, mcp, memories,
     messaging, models, opencode_proxy, projects, providers, secrets, settings, skills, ssh, system,
-    tasks, tools, webchat, workers,
+    tasks, tools, topics, webchat, workers,
 };
 
 use axum::Json;
@@ -190,6 +190,18 @@ pub async fn start_http_server(
             "/agents/projects/{id}/worktrees/{wt_id}",
             delete(projects::delete_worktree),
         )
+        .route(
+            "/agents/topics",
+            get(topics::list_topics).post(topics::create_topic),
+        )
+        .route(
+            "/agents/topics/{id}",
+            get(topics::get_topic)
+                .put(topics::update_topic)
+                .delete(topics::delete_topic),
+        )
+        .route("/agents/topics/{id}/sync", post(topics::sync_topic))
+        .route("/agents/topics/{id}/versions", get(topics::topic_versions))
         .route("/channels/cancel", post(channels::cancel_process))
         .route(
             "/agents/ingest/files",

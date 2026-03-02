@@ -1843,7 +1843,25 @@ impl Channel {
         let prompt_engine = rc.prompts.load();
 
         let identity_context = rc.identity.load().render();
-        let memory_bulletin = rc.memory_bulletin.load();
+
+        // Use channel-specific topics if assigned, otherwise fall back to the global bulletin.
+        let channel_topics = self
+            .deps
+            .topic_store
+            .get_for_channel(&self.deps.agent_id, &self.id)
+            .await
+            .unwrap_or_default();
+        let memory_bulletin = if channel_topics.is_empty() {
+            rc.memory_bulletin.load().to_string()
+        } else {
+            channel_topics
+                .iter()
+                .filter(|topic| !topic.content.is_empty())
+                .map(|topic| format!("### {}\n\n{}", topic.title, topic.content))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
         let skills = rc.skills.load();
         let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
 
@@ -2507,7 +2525,44 @@ impl Channel {
         let prompt_engine = rc.prompts.load();
 
         let identity_context = rc.identity.load().render();
-        let memory_bulletin = rc.memory_bulletin.load();
+
+        // Use channel-specific topics if assigned, otherwise fall back to the global bulletin.
+        let channel_topics = self
+            .deps
+            .topic_store
+            .get_for_channel(&self.deps.agent_id, &self.id)
+            .await
+            .unwrap_or_default();
+        let memory_bulletin = if channel_topics.is_empty() {
+            rc.memory_bulletin.load().to_string()
+        } else {
+            channel_topics
+                .iter()
+                .filter(|topic| !topic.content.is_empty())
+                .map(|topic| format!("### {}\n\n{}", topic.title, topic.content))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        // List all active topics so the LLM can reference topic IDs when spawning workers.
+        let all_active_topics = self
+            .deps
+            .topic_store
+            .list_active(&self.deps.agent_id)
+            .await
+            .unwrap_or_default();
+        let available_topics = if all_active_topics.is_empty() {
+            String::new()
+        } else {
+            let mut section = String::from(
+                "\n## Available Topics\nYou can pass these topic IDs to `spawn_worker` via the `topic_ids` parameter:\n",
+            );
+            for topic in &all_active_topics {
+                section.push_str(&format!("- `{}`: {}\n", topic.id, topic.title));
+            }
+            section
+        };
+
         let skills = rc.skills.load();
         let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
 
@@ -2528,7 +2583,11 @@ impl Channel {
         let system_info = self.build_system_info().await;
         let status_text = {
             let status = self.state.status_block.read().await;
-            status.render_full(&current_time_line, &system_info)
+            let mut rendered = status.render_full(&current_time_line, &system_info);
+            if !available_topics.is_empty() {
+                rendered.push_str(&available_topics);
+            }
+            rendered
         };
 
         let available_channels = self.build_available_channels().await;

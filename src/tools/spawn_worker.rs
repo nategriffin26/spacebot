@@ -72,6 +72,10 @@ pub struct SpawnWorkerArgs {
     /// automatically set to the worktree path.
     #[serde(default)]
     pub worktree_id: Option<String>,
+    /// Topic IDs to inject as context. The synthesized content of each topic
+    /// is prepended to the worker's task prompt.
+    #[serde(default)]
+    pub topic_ids: Vec<String>,
 }
 
 /// Output from spawn worker tool.
@@ -133,6 +137,11 @@ impl Tool for SpawnWorkerTool {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Skill names from <available_skills> that are likely relevant to this task. The worker sees all skills and decides what to read, but suggested skills are flagged as recommended."
+            },
+            "topic_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Topic IDs to inject as context into the worker. The synthesized content of each topic is prepended to the task. See the Available Topics section for IDs."
             }
         });
 
@@ -235,6 +244,7 @@ impl Tool for SpawnWorkerTool {
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
+                &args.topic_ids,
             )
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?

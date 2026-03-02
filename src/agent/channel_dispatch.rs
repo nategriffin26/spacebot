@@ -438,13 +438,14 @@ pub async fn spawn_worker_from_state(
     task: impl Into<String>,
     interactive: bool,
     suggested_skills: &[&str],
+    topic_ids: &[String],
 ) -> std::result::Result<WorkerId, AgentError> {
     check_worker_limit(state).await?;
     let task = task.into();
     reserve_task_if_unique(state, &task).await?;
     ensure_dispatch_readiness(state, "worker");
 
-    let result = spawn_worker_inner(state, &task, interactive, suggested_skills).await;
+    let result = spawn_worker_inner(state, &task, interactive, suggested_skills, topic_ids).await;
 
     // Release the reservation regardless of success or failure.
     // On success the task is now in the status block; on failure it needs cleanup.
@@ -460,11 +461,32 @@ async fn spawn_worker_inner(
     task: &str,
     interactive: bool,
     suggested_skills: &[&str],
+    topic_ids: &[String],
 ) -> std::result::Result<WorkerId, AgentError> {
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
 
     let worker_status_text = build_worker_status_text(rc.as_ref(), &state.deps.sandbox);
+    let temporal_context = TemporalContext::from_runtime(rc.as_ref());
+    let mut worker_task =
+        build_worker_task_with_temporal_context(&task, &temporal_context, &prompt_engine)
+            .map_err(|error| AgentError::Other(anyhow::anyhow!("{error}")))?;
+
+    // Inject topic context if topic_ids were provided.
+    if !topic_ids.is_empty() {
+        let mut topic_context = String::from("## Topic Context\n\n");
+        for topic_id in topic_ids {
+            if let Ok(Some(topic)) = state.deps.topic_store.get(topic_id).await {
+                if !topic.content.is_empty() {
+                    topic_context
+                        .push_str(&format!("### {}\n\n{}\n\n", topic.title, topic.content));
+                }
+            }
+        }
+        if topic_context.len() > "## Topic Context\n\n".len() {
+            worker_task = format!("{topic_context}---\n\n{worker_task}");
+        }
+    }
 
     let sandbox_enabled = state.deps.sandbox.mode_enabled();
     let sandbox_containment_active = state.deps.sandbox.containment_active();
@@ -511,7 +533,7 @@ async fn spawn_worker_inner(
     let worker = if interactive {
         let (worker, input_tx, inject_tx) = Worker::new_interactive(
             Some(state.channel_id.clone()),
-            task,
+            &worker_task,
             &system_prompt,
             state.deps.clone(),
             browser_config.clone(),
@@ -534,7 +556,7 @@ async fn spawn_worker_inner(
     } else {
         let (worker, inject_tx) = Worker::new(
             Some(state.channel_id.clone()),
-            task,
+            &worker_task,
             &system_prompt,
             state.deps.clone(),
             browser_config,

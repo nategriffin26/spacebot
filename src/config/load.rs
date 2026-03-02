@@ -201,6 +201,9 @@ impl CortexConfig {
             branch_timeout_secs: overrides
                 .branch_timeout_secs
                 .unwrap_or(defaults.branch_timeout_secs),
+            topic_sync_interval_secs: overrides
+                .topic_sync_interval_secs
+                .unwrap_or(defaults.topic_sync_interval_secs),
             detached_worker_timeout_retry_limit: overrides
                 .detached_worker_timeout_retry_limit
                 .unwrap_or(defaults.detached_worker_timeout_retry_limit),

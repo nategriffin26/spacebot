@@ -398,6 +398,16 @@ impl PromptEngine {
         )
     }
 
+    /// Convenience method for rendering topic synthesis system prompt.
+    pub fn render_topic_synthesis_prompt(&self, title: &str) -> Result<String> {
+        self.render(
+            "cortex_topic_synthesis",
+            context! {
+                title => title,
+            },
+        )
+    }
+
     /// Convenience method for rendering ingestion chunk prompt.
     pub fn render_system_ingestion_chunk(
         &self,
