@@ -3616,7 +3616,12 @@ async fn run_topic_sync_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow:
 
     loop {
         let interval = deps.runtime_config.cortex.load().topic_sync_interval_secs;
-        tokio::time::sleep(Duration::from_secs(interval.max(30))).await;
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(interval.max(30))) => {},
+            () = deps.topic_sync_notify.notified() => {
+                tracing::info!("topic sync loop woken by notify");
+            },
+        }
 
         if let Err(error) = sync_all_topics(deps, logger).await {
             tracing::warn!(%error, "topic sync pass failed");

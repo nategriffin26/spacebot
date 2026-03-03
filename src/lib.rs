@@ -411,6 +411,8 @@ pub struct AgentDeps {
     /// Sender for injecting messages into channels from outside the normal
     /// inbound message flow (e.g. cross-agent task completion notifications).
     pub injection_tx: tokio::sync::mpsc::Sender<ChannelInjection>,
+    /// Notify handle to wake the topic sync loop for on-demand syncing.
+    pub topic_sync_notify: Arc<tokio::sync::Notify>,
 }
 
 impl AgentDeps {

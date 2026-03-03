@@ -131,6 +131,7 @@ async fn bootstrap_deps() -> anyhow::Result<spacebot::AgentDeps> {
             spacebot::agent::process_control::ProcessControlRegistry::new(),
         ),
         injection_tx: tokio::sync::mpsc::channel(1).0,
+        topic_sync_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     })
 }
 

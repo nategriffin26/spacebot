@@ -3163,6 +3163,7 @@ async fn initialize_agents(
                 spacebot::agent::process_control::ProcessControlRegistry::new(),
             ),
             injection_tx: injection_tx.clone(),
+            topic_sync_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let agent = spacebot::Agent {
@@ -3221,6 +3222,7 @@ async fn initialize_agents(
         let mut task_stores = std::collections::HashMap::new();
         let mut project_stores = std::collections::HashMap::new();
         let mut topic_stores = std::collections::HashMap::new();
+        let mut topic_sync_notifiers = std::collections::HashMap::new();
         let mut agent_workspaces = std::collections::HashMap::new();
         let mut agent_identity_dirs = std::collections::HashMap::new();
         let mut agent_data_dirs = std::collections::HashMap::new();
@@ -3235,6 +3237,7 @@ async fn initialize_agents(
             task_stores.insert(agent_id.to_string(), agent.deps.task_store.clone());
             project_stores.insert(agent_id.to_string(), agent.deps.project_store.clone());
             topic_stores.insert(agent_id.to_string(), agent.deps.topic_store.clone());
+            topic_sync_notifiers.insert(agent_id.to_string(), agent.deps.topic_sync_notify.clone());
             agent_workspaces.insert(agent_id.to_string(), agent.config.workspace.clone());
             agent_identity_dirs.insert(agent_id.to_string(), agent.config.identity_dir.clone());
             agent_data_dirs.insert(agent_id.to_string(), agent.config.data_dir.clone());
@@ -3260,6 +3263,7 @@ async fn initialize_agents(
         api_state.set_task_stores(task_stores);
         api_state.set_project_stores(project_stores);
         api_state.set_topic_stores(topic_stores);
+        api_state.set_topic_sync_notifiers(topic_sync_notifiers);
         api_state.set_runtime_configs(runtime_configs);
         api_state.set_agent_workspaces(agent_workspaces);
         api_state.set_agent_identity_dirs(agent_identity_dirs);

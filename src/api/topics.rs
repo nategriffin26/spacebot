@@ -257,13 +257,19 @@ pub(super) async fn sync_topic(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Clear last_synced_at to force a re-sync on the next topic sync pass.
+    // Clear last_synced_at to force a re-sync and wake the sync loop immediately.
     let mut updated = topic;
     updated.last_synced_at = None;
     store.update(&updated).await.map_err(|error| {
         tracing::warn!(%error, "failed to clear topic sync timestamp");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Wake the topic sync loop so it picks up the stale topic immediately.
+    let notifiers = state.topic_sync_notifiers.load();
+    if let Some(notify) = notifiers.get(&request.agent_id) {
+        notify.notify_one();
+    }
 
     Ok(Json(TopicResponse { topic: updated }))
 }

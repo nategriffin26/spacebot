@@ -442,6 +442,7 @@ pub(super) async fn trigger_warmup(
                     crate::agent::process_control::ProcessControlRegistry::new(),
                 ),
                 injection_tx,
+                topic_sync_notify: Arc::new(tokio::sync::Notify::new()),
             };
             let logger = CortexLogger::new(sqlite_pool);
             crate::agent::cortex::run_warmup_once(&deps, &logger, "api_trigger", force).await;
@@ -795,6 +796,7 @@ pub async fn create_agent_internal(
             crate::agent::process_control::ProcessControlRegistry::new(),
         ),
         injection_tx: state.injection_tx.clone(),
+        topic_sync_notify: Arc::new(tokio::sync::Notify::new()),
         agent_names: {
             let configs = state.agent_configs.load();
             let mut names: std::collections::HashMap<String, String> = configs
