@@ -122,7 +122,6 @@ pub struct Topic {
     pub content: String,
     pub criteria: TopicCriteria,
     pub pin_ids: Vec<String>,
-    pub channel_ids: Vec<String>,
     pub status: TopicStatus,
     pub max_words: usize,
     pub last_memory_at: Option<String>,
@@ -155,16 +154,14 @@ impl TopicStore {
             serde_json::to_string(&topic.criteria).context("failed to serialize topic criteria")?;
         let pin_ids_json =
             serde_json::to_string(&topic.pin_ids).context("failed to serialize topic pin_ids")?;
-        let channel_ids_json = serde_json::to_string(&topic.channel_ids)
-            .context("failed to serialize topic channel_ids")?;
 
         sqlx::query(
             r#"
             INSERT INTO topics (
-                id, agent_id, title, content, criteria, pin_ids, channel_ids,
+                id, agent_id, title, content, criteria, pin_ids,
                 status, max_words, last_memory_at, last_synced_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&topic.id)
@@ -173,7 +170,6 @@ impl TopicStore {
         .bind(&topic.content)
         .bind(&criteria_json)
         .bind(&pin_ids_json)
-        .bind(&channel_ids_json)
         .bind(topic.status.as_str())
         .bind(topic.max_words as i64)
         .bind(&topic.last_memory_at)
@@ -187,7 +183,7 @@ impl TopicStore {
 
     pub async fn get(&self, id: &str) -> Result<Option<Topic>> {
         let row = sqlx::query(
-            "SELECT id, agent_id, title, content, criteria, pin_ids, channel_ids, \
+            "SELECT id, agent_id, title, content, criteria, pin_ids, \
              status, max_words, last_memory_at, last_synced_at, created_at, updated_at \
              FROM topics WHERE id = ?",
         )
@@ -201,7 +197,7 @@ impl TopicStore {
 
     pub async fn list(&self, agent_id: &str) -> Result<Vec<Topic>> {
         let rows = sqlx::query(
-            "SELECT id, agent_id, title, content, criteria, pin_ids, channel_ids, \
+            "SELECT id, agent_id, title, content, criteria, pin_ids, \
              status, max_words, last_memory_at, last_synced_at, created_at, updated_at \
              FROM topics WHERE agent_id = ? ORDER BY created_at DESC",
         )
@@ -215,7 +211,7 @@ impl TopicStore {
 
     pub async fn list_active(&self, agent_id: &str) -> Result<Vec<Topic>> {
         let rows = sqlx::query(
-            "SELECT id, agent_id, title, content, criteria, pin_ids, channel_ids, \
+            "SELECT id, agent_id, title, content, criteria, pin_ids, \
              status, max_words, last_memory_at, last_synced_at, created_at, updated_at \
              FROM topics WHERE agent_id = ? AND status = 'active' ORDER BY created_at DESC",
         )
@@ -232,13 +228,11 @@ impl TopicStore {
             serde_json::to_string(&topic.criteria).context("failed to serialize topic criteria")?;
         let pin_ids_json =
             serde_json::to_string(&topic.pin_ids).context("failed to serialize topic pin_ids")?;
-        let channel_ids_json = serde_json::to_string(&topic.channel_ids)
-            .context("failed to serialize topic channel_ids")?;
 
         sqlx::query(
             r#"
             UPDATE topics SET
-                title = ?, content = ?, criteria = ?, pin_ids = ?, channel_ids = ?,
+                title = ?, content = ?, criteria = ?, pin_ids = ?,
                 status = ?, max_words = ?, last_memory_at = ?, last_synced_at = ?,
                 updated_at = datetime('now')
             WHERE id = ?
@@ -248,7 +242,6 @@ impl TopicStore {
         .bind(&topic.content)
         .bind(&criteria_json)
         .bind(&pin_ids_json)
-        .bind(&channel_ids_json)
         .bind(topic.status.as_str())
         .bind(topic.max_words as i64)
         .bind(&topic.last_memory_at)
@@ -269,25 +262,6 @@ impl TopicStore {
             .context("failed to delete topic")?;
 
         Ok(result.rows_affected() > 0)
-    }
-
-    /// Load all active topics that are assigned to a specific channel.
-    pub async fn get_for_channel(&self, agent_id: &str, channel_id: &str) -> Result<Vec<Topic>> {
-        // channel_ids is a JSON array stored as TEXT. Use json_each to match.
-        let rows = sqlx::query(
-            "SELECT t.id, t.agent_id, t.title, t.content, t.criteria, t.pin_ids, t.channel_ids, \
-             t.status, t.max_words, t.last_memory_at, t.last_synced_at, t.created_at, t.updated_at \
-             FROM topics t, json_each(t.channel_ids) j \
-             WHERE t.agent_id = ? AND t.status = 'active' AND j.value = ? \
-             ORDER BY t.created_at DESC",
-        )
-        .bind(agent_id)
-        .bind(channel_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to fetch topics for channel")?;
-
-        rows.into_iter().map(topic_from_row).collect()
     }
 
     pub async fn save_version(&self, version: &TopicVersion) -> Result<()> {
@@ -348,9 +322,6 @@ fn topic_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Topic> {
         .context("failed to read topic status")?;
     let criteria_value: String = row.try_get("criteria").unwrap_or_else(|_| "{}".to_string());
     let pin_ids_value: String = row.try_get("pin_ids").unwrap_or_else(|_| "[]".to_string());
-    let channel_ids_value: String = row
-        .try_get("channel_ids")
-        .unwrap_or_else(|_| "[]".to_string());
 
     let status = TopicStatus::parse(&status_value)
         .with_context(|| format!("invalid topic status in database: {status_value}"))?;
@@ -366,7 +337,6 @@ fn topic_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Topic> {
             .context("failed to read topic content")?,
         criteria: parse_criteria(&criteria_value),
         pin_ids: parse_json_string_array(&pin_ids_value),
-        channel_ids: parse_json_string_array(&channel_ids_value),
         status,
         max_words: row
             .try_get::<i64, _>("max_words")
@@ -427,7 +397,6 @@ mod tests {
                 content         TEXT NOT NULL DEFAULT '',
                 criteria        TEXT NOT NULL,
                 pin_ids         TEXT NOT NULL DEFAULT '[]',
-                channel_ids     TEXT NOT NULL DEFAULT '[]',
                 status          TEXT NOT NULL DEFAULT 'active',
                 max_words       INTEGER NOT NULL DEFAULT 1500,
                 last_memory_at  TEXT,
@@ -468,7 +437,6 @@ mod tests {
             content: String::new(),
             criteria: TopicCriteria::default(),
             pin_ids: Vec::new(),
-            channel_ids: Vec::new(),
             status: TopicStatus::Active,
             max_words: 1500,
             last_memory_at: None,
@@ -549,32 +517,6 @@ mod tests {
 
         let loaded = store.get(&topic.id).await.expect("get should succeed");
         assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_for_channel() {
-        let store = setup_store().await;
-
-        let mut topic = make_topic("agent-1", "Channel Topic");
-        topic.channel_ids = vec!["chan-1".to_string(), "chan-2".to_string()];
-        store.create(&topic).await.expect("create should succeed");
-
-        let mut other = make_topic("agent-1", "Other Topic");
-        other.channel_ids = vec!["chan-3".to_string()];
-        store.create(&other).await.expect("create should succeed");
-
-        let results = store
-            .get_for_channel("agent-1", "chan-1")
-            .await
-            .expect("get_for_channel should succeed");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Channel Topic");
-
-        let empty = store
-            .get_for_channel("agent-1", "chan-99")
-            .await
-            .expect("get_for_channel should succeed");
-        assert!(empty.is_empty());
     }
 
     #[tokio::test]

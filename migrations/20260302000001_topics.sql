@@ -7,7 +7,6 @@ CREATE TABLE IF NOT EXISTS topics (
     content         TEXT NOT NULL DEFAULT '',
     criteria        TEXT NOT NULL,
     pin_ids         TEXT NOT NULL DEFAULT '[]',
-    channel_ids     TEXT NOT NULL DEFAULT '[]',
     status          TEXT NOT NULL DEFAULT 'active',
     max_words       INTEGER NOT NULL DEFAULT 1500,
     last_memory_at  TEXT,

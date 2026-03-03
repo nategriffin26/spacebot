@@ -27,8 +27,6 @@ pub(super) struct CreateTopicRequest {
     #[serde(default)]
     criteria: Option<crate::topics::TopicCriteria>,
     #[serde(default)]
-    channel_ids: Vec<String>,
-    #[serde(default)]
     pin_ids: Vec<String>,
     #[serde(default)]
     status: Option<String>,
@@ -43,8 +41,6 @@ pub(super) struct UpdateTopicRequest {
     title: Option<String>,
     #[serde(default)]
     criteria: Option<crate::topics::TopicCriteria>,
-    #[serde(default)]
-    channel_ids: Option<Vec<String>>,
     #[serde(default)]
     pin_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -160,7 +156,6 @@ pub(super) async fn create_topic(
         content: String::new(),
         criteria: request.criteria.unwrap_or_default(),
         pin_ids: request.pin_ids,
-        channel_ids: request.channel_ids,
         status,
         max_words: request.max_words.unwrap_or(1500),
         last_memory_at: None,
@@ -199,9 +194,6 @@ pub(super) async fn update_topic(
     }
     if let Some(criteria) = request.criteria {
         topic.criteria = criteria;
-    }
-    if let Some(channel_ids) = request.channel_ids {
-        topic.channel_ids = channel_ids;
     }
     if let Some(pin_ids) = request.pin_ids {
         topic.pin_ids = pin_ids;

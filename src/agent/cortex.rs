@@ -980,15 +980,14 @@ impl Cortex {
 
         // When a memory is saved, mark all active topics as stale so the
         // topic sync loop re-synthesizes them on its next pass.
-        if is_memory_saved {
-            if let Err(error) = self
+        if is_memory_saved
+            && let Err(error) = self
                 .deps
                 .topic_store
                 .mark_all_stale(&self.deps.agent_id)
                 .await
-            {
-                tracing::warn!(%error, "failed to mark topics stale after memory save");
-            }
+        {
+            tracing::warn!(%error, "failed to mark topics stale after memory save");
         }
     }
 
@@ -2770,11 +2769,10 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
         if !topic_ids.is_empty() {
             let mut topic_content = String::new();
             for topic_id in &topic_ids {
-                if let Ok(Some(topic)) = deps.topic_store.get(topic_id).await {
-                    if !topic.content.is_empty() {
-                        topic_content
-                            .push_str(&format!("\n## {}\n{}\n", topic.title, topic.content));
-                    }
+                if let Ok(Some(topic)) = deps.topic_store.get(topic_id).await
+                    && !topic.content.is_empty()
+                {
+                    topic_content.push_str(&format!("\n## {}\n{}\n", topic.title, topic.content));
                 }
             }
             if !topic_content.is_empty() {

@@ -550,24 +550,7 @@ impl CortexChatSession {
             runtime_config,
         );
 
-        // Compose all active topics for the cortex chat context, falling
-        // back to the global bulletin if no topics exist.
-        let all_topics = self
-            .deps
-            .topic_store
-            .list_active(&self.deps.agent_id)
-            .await
-            .unwrap_or_default();
-        let context_content = if all_topics.is_empty() {
-            runtime_config.memory_bulletin.load().to_string()
-        } else {
-            all_topics
-                .iter()
-                .filter(|topic| !topic.content.is_empty())
-                .map(|topic| format!("### {}\n\n{}", topic.title, topic.content))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
+        let context_content = runtime_config.memory_bulletin.load().to_string();
 
         let browser_enabled = runtime_config.browser_config.load().enabled;
         let web_search_enabled = runtime_config.brave_search_key.load().is_some();

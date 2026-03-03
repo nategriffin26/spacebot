@@ -476,11 +476,10 @@ async fn spawn_worker_inner(
     if !topic_ids.is_empty() {
         let mut topic_context = String::from("## Topic Context\n\n");
         for topic_id in topic_ids {
-            if let Ok(Some(topic)) = state.deps.topic_store.get(topic_id).await {
-                if !topic.content.is_empty() {
-                    topic_context
-                        .push_str(&format!("### {}\n\n{}\n\n", topic.title, topic.content));
-                }
+            if let Ok(Some(topic)) = state.deps.topic_store.get(topic_id).await
+                && !topic.content.is_empty()
+            {
+                topic_context.push_str(&format!("### {}\n\n{}\n\n", topic.title, topic.content));
             }
         }
         if topic_context.len() > "## Topic Context\n\n".len() {
