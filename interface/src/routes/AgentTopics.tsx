@@ -8,7 +8,6 @@ import {
   type CreateTopicRequest,
   type UpdateTopicRequest,
   type TopicCriteria,
-  type ChannelInfo,
   type MemoryItem,
   MEMORY_TYPES,
   type MemoryType,
@@ -49,15 +48,6 @@ export function AgentTopics({ agentId }: { agentId: string }) {
     queryFn: () => api.listTopics(agentId),
     refetchInterval: 15_000,
   });
-
-  const { data: channelsData } = useQuery({
-    queryKey: ["channels"],
-    queryFn: api.channels,
-  });
-
-  const agentChannels = (channelsData?.channels ?? []).filter(
-    (c) => c.agent_id === agentId,
-  );
 
   const topics = data?.topics ?? [];
 
@@ -126,7 +116,6 @@ export function AgentTopics({ agentId }: { agentId: string }) {
           onClose={() => setCreateOpen(false)}
           onCreate={(request) => createMutation.mutate(request)}
           isPending={createMutation.isPending}
-          channels={agentChannels}
         />
       </div>
     );
@@ -171,7 +160,6 @@ export function AgentTopics({ agentId }: { agentId: string }) {
         onClose={() => setCreateOpen(false)}
         onCreate={(request) => createMutation.mutate(request)}
         isPending={createMutation.isPending}
-        channels={agentChannels}
       />
 
       {/* Detail Dialog */}
@@ -179,7 +167,6 @@ export function AgentTopics({ agentId }: { agentId: string }) {
         <TopicDetailDialog
           agentId={agentId}
           topic={selectedTopic}
-          channels={agentChannels}
           onClose={() => setSelectedTopicId(null)}
           onUpdate={(request) =>
             updateMutation.mutate({
@@ -239,12 +226,6 @@ function TopicCard({
           <span>Synced {formatTimeAgo(topic.last_synced_at)}</span>
         )}
         {!topic.last_synced_at && <span>Never synced</span>}
-        {topic.channel_ids.length > 0 && (
-          <span>
-            {topic.channel_ids.length} channel
-            {topic.channel_ids.length !== 1 ? "s" : ""}
-          </span>
-        )}
         {wordCount > 0 && <span>{wordCount} words</span>}
       </div>
 
@@ -268,20 +249,17 @@ function CreateTopicDialog({
   onClose,
   onCreate,
   isPending,
-  channels,
 }: {
   open: boolean;
   onClose: () => void;
   onCreate: (request: CreateTopicRequest) => void;
   isPending: boolean;
-  channels: ChannelInfo[];
 }) {
   const [title, setTitle] = useState("");
   const [query, setQuery] = useState("");
   const [selectedTypes, setSelectedTypes] = useState<MemoryType[]>([]);
   const [maxAge, setMaxAge] = useState("");
   const [maxWords, setMaxWords] = useState(1500);
-  const [selectedChannels, setSelectedChannels] = useState<string[]>([]);
 
   const handleSubmit = useCallback(() => {
     if (!title.trim()) return;
@@ -292,7 +270,6 @@ function CreateTopicDialog({
     onCreate({
       title: title.trim(),
       criteria: Object.keys(criteria).length > 0 ? criteria : undefined,
-      channel_ids: selectedChannels.length > 0 ? selectedChannels : undefined,
       max_words: maxWords,
     });
     setTitle("");
@@ -300,8 +277,7 @@ function CreateTopicDialog({
     setSelectedTypes([]);
     setMaxAge("");
     setMaxWords(1500);
-    setSelectedChannels([]);
-  }, [title, query, selectedTypes, maxAge, maxWords, selectedChannels, onCreate]);
+  }, [title, query, selectedTypes, maxAge, maxWords, onCreate]);
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
@@ -358,38 +334,6 @@ function CreateTopicDialog({
               ))}
             </div>
           </div>
-          {channels.length > 0 && (
-            <div>
-              <label className="mb-1 block text-xs text-ink-dull">
-                Channel Assignments
-              </label>
-              <div className="max-h-32 space-y-1 overflow-y-auto rounded-md border border-app-line/50 bg-app-darkBox/30 p-2">
-                {channels.map((channel) => (
-                  <label
-                    key={channel.id}
-                    className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-app-darkBox"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedChannels.includes(channel.id)}
-                      onChange={() =>
-                        setSelectedChannels((prev) =>
-                          prev.includes(channel.id)
-                            ? prev.filter((id) => id !== channel.id)
-                            : [...prev, channel.id],
-                        )
-                      }
-                      className="accent-accent"
-                    />
-                    <span className="text-ink">
-                      {channel.display_name || channel.id}
-                    </span>
-                    <span className="text-ink-faint">{channel.platform}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
           <div className="flex gap-4">
             <div className="flex-1">
               <label className="mb-1 block text-xs text-ink-dull">
@@ -444,7 +388,6 @@ function CreateTopicDialog({
 function TopicDetailDialog({
   agentId,
   topic,
-  channels,
   onClose,
   onUpdate,
   onDelete,
@@ -453,7 +396,6 @@ function TopicDetailDialog({
 }: {
   agentId: string;
   topic: TopicItem;
-  channels: ChannelInfo[];
   onClose: () => void;
   onUpdate: (request: UpdateTopicRequest) => void;
   onDelete: () => void;
@@ -514,7 +456,6 @@ function TopicDetailDialog({
             <ConfigTab
               agentId={agentId}
               topic={topic}
-              channels={channels}
               onUpdate={onUpdate}
             />
           )}
@@ -563,12 +504,6 @@ function ContentTab({
           {topic.last_synced_at && (
             <span>Last synced {formatTimeAgo(topic.last_synced_at)}</span>
           )}
-          {topic.channel_ids.length > 0 && (
-            <span>
-              {topic.channel_ids.length} channel
-              {topic.channel_ids.length !== 1 ? "s" : ""}
-            </span>
-          )}
         </div>
         <Button
           size="sm"
@@ -599,12 +534,10 @@ function ContentTab({
 function ConfigTab({
   agentId,
   topic,
-  channels,
   onUpdate,
 }: {
   agentId: string;
   topic: TopicItem;
-  channels: ChannelInfo[];
   onUpdate: (request: UpdateTopicRequest) => void;
 }) {
   const [title, setTitle] = useState(topic.title);
@@ -621,9 +554,6 @@ function ConfigTab({
     topic.criteria.max_memories ?? 30,
   );
   const [maxWords, setMaxWords] = useState(topic.max_words);
-  const [selectedChannels, setSelectedChannels] = useState<string[]>(
-    topic.channel_ids,
-  );
   const [pinIds, setPinIds] = useState<string[]>(topic.pin_ids);
   const [pinSearch, setPinSearch] = useState("");
   const [pinResults, setPinResults] = useState<MemoryItem[]>([]);
@@ -657,8 +587,6 @@ function ConfigTab({
     maxAge !== (topic.criteria.max_age ?? "") ||
     maxMemories !== (topic.criteria.max_memories ?? 30) ||
     maxWords !== topic.max_words ||
-    JSON.stringify(selectedChannels.slice().sort()) !==
-      JSON.stringify(topic.channel_ids.slice().sort()) ||
     JSON.stringify(pinIds.slice().sort()) !==
       JSON.stringify(topic.pin_ids.slice().sort());
 
@@ -676,7 +604,6 @@ function ConfigTab({
       status: status !== topic.status ? status : undefined,
       criteria,
       max_words: maxWords !== topic.max_words ? maxWords : undefined,
-      channel_ids: selectedChannels,
       pin_ids: pinIds,
     });
   };
@@ -712,40 +639,6 @@ function ConfigTab({
           ))}
         </div>
       </div>
-
-      {/* Channel Assignments */}
-      {channels.length > 0 && (
-        <div>
-          <label className="mb-1 block text-xs text-ink-dull">
-            Channel Assignments
-          </label>
-          <div className="max-h-32 space-y-1 overflow-y-auto rounded-md border border-app-line/50 bg-app-darkBox/30 p-2">
-            {channels.map((channel) => (
-              <label
-                key={channel.id}
-                className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-app-darkBox"
-              >
-                <input
-                  type="checkbox"
-                  checked={selectedChannels.includes(channel.id)}
-                  onChange={() =>
-                    setSelectedChannels((prev) =>
-                      prev.includes(channel.id)
-                        ? prev.filter((id) => id !== channel.id)
-                        : [...prev, channel.id],
-                    )
-                  }
-                  className="accent-accent"
-                />
-                <span className="text-ink">
-                  {channel.display_name || channel.id}
-                </span>
-                <span className="text-ink-faint">{channel.platform}</span>
-              </label>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Semantic Query */}
       <div>
