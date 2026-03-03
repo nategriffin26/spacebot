@@ -65,6 +65,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "ingestion") => include_str!("../../prompts/en/ingestion.md.j2"),
         ("en", "cortex_chat") => include_str!("../../prompts/en/cortex_chat.md.j2"),
         ("en", "factory") => include_str!("../../prompts/en/factory.md.j2"),
+        ("en", "cortex_topic_synthesis") => {
+            include_str!("../../prompts/en/cortex_topic_synthesis.md.j2")
+        }
 
         // Adapter-specific prompt fragments
         ("en", "adapters/email") => include_str!("../../prompts/en/adapters/email.md.j2"),
