@@ -2619,7 +2619,6 @@ async fn run(
                                         }
                                     }
                                 }
-                                else => break,
                             }
                         }
                         tracing::debug!(

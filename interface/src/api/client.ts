@@ -624,9 +624,10 @@ export interface CortexChatThreadsResponse {
 
 export type CortexChatSSEEvent =
 	| { type: "thinking" }
-	| { type: "tool_started"; tool: string; call_id: string; args: string }
-	| { type: "tool_completed"; tool: string; call_id: string; args: string; result: string; result_preview: string }
-	| { type: "done"; full_text: string; tool_calls: CortexChatToolCall[] }
+	| { type: "text_delta"; text_delta: string }
+	| { type: "tool_started"; tool: string }
+	| { type: "tool_completed"; tool: string; result_preview: string }
+	| { type: "done"; full_text: string }
 	| { type: "error"; message: string };
 
 // -- Factory Presets --
