@@ -1,13 +1,12 @@
 use super::providers::{
     ANTHROPIC_PROVIDER_BASE_URL, DEEPSEEK_PROVIDER_BASE_URL, FIREWORKS_PROVIDER_BASE_URL,
-    GEMINI_PROVIDER_BASE_URL, GITHUB_COPILOT_DEFAULT_BASE_URL, GROQ_PROVIDER_BASE_URL,
-    KILO_PROVIDER_BASE_URL, MINIMAX_CN_PROVIDER_BASE_URL, MINIMAX_PROVIDER_BASE_URL,
-    MISTRAL_PROVIDER_BASE_URL, MOONSHOT_PROVIDER_BASE_URL, NVIDIA_PROVIDER_BASE_URL,
-    OLLAMA_PROVIDER_BASE_URL, OPENAI_PROVIDER_BASE_URL, OPENCODE_GO_PROVIDER_BASE_URL,
-    OPENCODE_ZEN_PROVIDER_BASE_URL, OPENROUTER_PROVIDER_BASE_URL, TOGETHER_PROVIDER_BASE_URL,
-    XAI_PROVIDER_BASE_URL, ZAI_CODING_PLAN_BASE_URL, ZHIPU_PROVIDER_BASE_URL,
-    add_shorthand_provider, infer_routing_from_providers, openrouter_extra_headers,
-    resolve_routing,
+    GEMINI_PROVIDER_BASE_URL, GROQ_PROVIDER_BASE_URL, KILO_PROVIDER_BASE_URL,
+    MINIMAX_CN_PROVIDER_BASE_URL, MINIMAX_PROVIDER_BASE_URL, MISTRAL_PROVIDER_BASE_URL,
+    MOONSHOT_PROVIDER_BASE_URL, NVIDIA_PROVIDER_BASE_URL, OLLAMA_PROVIDER_BASE_URL,
+    OPENAI_PROVIDER_BASE_URL, OPENCODE_GO_PROVIDER_BASE_URL, OPENCODE_ZEN_PROVIDER_BASE_URL,
+    OPENROUTER_PROVIDER_BASE_URL, TOGETHER_PROVIDER_BASE_URL, XAI_PROVIDER_BASE_URL,
+    ZAI_CODING_PLAN_BASE_URL, ZHIPU_PROVIDER_BASE_URL, add_shorthand_provider,
+    infer_routing_from_providers, openrouter_extra_headers, resolve_routing,
 };
 use super::toml_schema::*;
 use super::{
@@ -15,10 +14,10 @@ use super::{
     CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig, DiscordConfig,
     DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef, IngestionConfig,
     LinkDef, LlmConfig, McpServerConfig, McpTransport, MemoryPersistenceConfig, MessagingConfig,
-    MetricsConfig, OpenCodeConfig, ProjectsConfig, ProviderConfig, SignalConfig,
-    SignalInstanceConfig, SlackCommandConfig, SlackConfig, SlackInstanceConfig, TelegramConfig,
-    TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig, WarmupConfig,
-    WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
+    MetricsConfig, OpenCodeConfig, ProviderConfig, RigAlignmentConfig, RigSemanticsMode,
+    SlackCommandConfig, SlackConfig, SlackInstanceConfig, TelegramConfig, TelegramInstanceConfig,
+    TelemetryConfig, TwitchConfig, TwitchInstanceConfig, WarmupConfig, WebhookConfig,
+    normalize_adapter, validate_named_messaging_adapters,
 };
 use crate::error::{ConfigError, Result};
 
@@ -33,7 +32,7 @@ use std::path::{Path, PathBuf};
 /// - `secret:NAME` — look up from the secrets store (if available).
 /// - `env:VAR_NAME` — read from system environment variable.
 /// - Anything else — literal value.
-pub(crate) fn resolve_env_value(value: &str) -> Option<String> {
+pub(super) fn resolve_env_value(value: &str) -> Option<String> {
     if let Some(alias) = value.strip_prefix("secret:") {
         let guard = RESOLVE_SECRETS_STORE.load();
         match (*guard).as_ref() {
@@ -127,33 +126,62 @@ fn parse_close_policy(value: Option<&str>) -> Option<ClosePolicy> {
     }
 }
 
-/// Resolve the effective close policy. When `persist_session` is enabled and no
-/// explicit `close_policy` was provided, default to `Detach` so browser tabs and
-/// cookies survive across workers.
-fn resolve_close_policy(
-    explicit: Option<&str>,
-    persist_session: bool,
-    fallback: ClosePolicy,
-) -> ClosePolicy {
-    parse_close_policy(explicit).unwrap_or(if persist_session {
-        ClosePolicy::Detach
-    } else {
-        fallback
-    })
+fn parse_rig_semantics_mode(value: Option<&str>, default: RigSemanticsMode) -> RigSemanticsMode {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("off") => RigSemanticsMode::Off,
+        Some("shadow") => RigSemanticsMode::Shadow,
+        Some("enforced") => RigSemanticsMode::Enforced,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "unknown rig_alignment.request_semantics_mode, expected one of: off, shadow, enforced"
+            );
+            default
+        }
+        None => default,
+    }
+}
+
+fn resolve_rig_alignment(
+    overrides: Option<TomlRigAlignmentConfig>,
+    defaults: RigAlignmentConfig,
+) -> RigAlignmentConfig {
+    let Some(overrides) = overrides else {
+        return defaults;
+    };
+
+    RigAlignmentConfig {
+        request_semantics_mode: parse_rig_semantics_mode(
+            overrides.request_semantics_mode.as_deref(),
+            defaults.request_semantics_mode,
+        ),
+        channel_streaming: overrides
+            .channel_streaming
+            .unwrap_or(defaults.channel_streaming),
+        cortex_chat_streaming: overrides
+            .cortex_chat_streaming
+            .unwrap_or(defaults.cortex_chat_streaming),
+        worker_read_only_tool_concurrency: overrides
+            .worker_read_only_tool_concurrency
+            .unwrap_or(defaults.worker_read_only_tool_concurrency),
+        worker_max_tool_concurrency: overrides
+            .worker_max_tool_concurrency
+            .unwrap_or(defaults.worker_max_tool_concurrency),
+        worker_read_only_tool_allowlist: overrides
+            .worker_read_only_tool_allowlist
+            .unwrap_or(defaults.worker_read_only_tool_allowlist),
+        output_schema_provider_allowlist: overrides
+            .output_schema_provider_allowlist
+            .unwrap_or(defaults.output_schema_provider_allowlist),
+        tool_choice_provider_allowlist: overrides
+            .tool_choice_provider_allowlist
+            .unwrap_or(defaults.tool_choice_provider_allowlist),
+    }
 }
 
 impl CortexConfig {
-    fn resolve(overrides: TomlCortexConfig, defaults: CortexConfig) -> Result<CortexConfig> {
-        let maintenance_interval_secs = overrides
-            .maintenance_interval_secs
-            .unwrap_or(defaults.maintenance_interval_secs);
-        if maintenance_interval_secs < 1 {
-            return Err(
-                ConfigError::Invalid("maintenance_interval_secs must be >= 1".to_string()).into(),
-            );
-        }
-
-        let config = CortexConfig {
+    fn resolve(overrides: TomlCortexConfig, defaults: CortexConfig) -> CortexConfig {
+        CortexConfig {
             tick_interval_secs: overrides
                 .tick_interval_secs
                 .unwrap_or(defaults.tick_interval_secs),
@@ -181,19 +209,6 @@ impl CortexConfig {
             bulletin_max_turns: overrides
                 .bulletin_max_turns
                 .unwrap_or(defaults.bulletin_max_turns),
-            maintenance_interval_secs,
-            maintenance_decay_rate: overrides
-                .maintenance_decay_rate
-                .unwrap_or(defaults.maintenance_decay_rate),
-            maintenance_prune_threshold: overrides
-                .maintenance_prune_threshold
-                .unwrap_or(defaults.maintenance_prune_threshold),
-            maintenance_min_age_days: overrides
-                .maintenance_min_age_days
-                .unwrap_or(defaults.maintenance_min_age_days),
-            maintenance_merge_similarity_threshold: overrides
-                .maintenance_merge_similarity_threshold
-                .unwrap_or(defaults.maintenance_merge_similarity_threshold),
             association_interval_secs: overrides
                 .association_interval_secs
                 .unwrap_or(defaults.association_interval_secs),
@@ -206,9 +221,7 @@ impl CortexConfig {
             association_max_per_pass: overrides
                 .association_max_per_pass
                 .unwrap_or(defaults.association_max_per_pass),
-        };
-        config.validate_maintenance_bounds()?;
-        Ok(config)
+        }
     }
 }
 
@@ -431,7 +444,6 @@ impl Config {
             minimax_cn_key: std::env::var("MINIMAX_CN_API_KEY").ok(),
             moonshot_key: std::env::var("MOONSHOT_API_KEY").ok(),
             zai_coding_plan_key: std::env::var("ZAI_CODING_PLAN_API_KEY").ok(),
-            github_copilot_key: std::env::var("GITHUB_COPILOT_API_KEY").ok(),
             providers: HashMap::new(),
         };
 
@@ -510,16 +522,6 @@ impl Config {
             OPENCODE_GO_PROVIDER_BASE_URL,
             None,
             false,
-        );
-
-        add_shorthand_provider(
-            &mut llm.providers,
-            "github-copilot",
-            llm.github_copilot_key.clone(),
-            ApiType::OpenAiChatCompletions,
-            GITHUB_COPILOT_DEFAULT_BASE_URL,
-            Some("GitHub Copilot"),
-            true,
         );
 
         if let Some(minimax_key) = llm.minimax_key.clone() {
@@ -829,8 +831,6 @@ impl Config {
             default: true,
             display_name: None,
             role: None,
-            gradient_start: None,
-            gradient_end: None,
             workspace: None,
             routing: Some(routing),
             max_concurrent_branches: None,
@@ -846,12 +846,12 @@ impl Config {
             warmup: None,
             browser: None,
             channel: None,
+            rig_alignment: None,
             mcp: None,
             brave_search_key: None,
             cron_timezone: None,
             user_timezone: None,
             sandbox: None,
-            projects: None,
             cron: Vec::new(),
         }];
 
@@ -866,23 +866,13 @@ impl Config {
             llm,
             defaults,
             agents,
-            links: vec![LinkDef {
-                from: "admin".into(),
-                to: "main".into(),
-                direction: "one_way".into(),
-                kind: "hierarchical".into(),
-            }],
+            links: Vec::new(),
             groups: Vec::new(),
             humans: vec![HumanDef {
                 id: "admin".into(),
                 display_name: None,
                 role: None,
                 bio: None,
-                description: load_human_md(&instance_dir.join("humans").join("admin")),
-                discord_id: None,
-                telegram_id: None,
-                slack_id: None,
-                email: None,
             }],
             messaging: MessagingConfig::default(),
             bindings: Vec::new(),
@@ -1072,12 +1062,6 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("ZAI_CODING_PLAN_API_KEY").ok()),
-            github_copilot_key: toml
-                .llm
-                .github_copilot_key
-                .as_deref()
-                .and_then(resolve_env_value)
-                .or_else(|| std::env::var("GITHUB_COPILOT_API_KEY").ok()),
             providers: toml
                 .llm
                 .providers
@@ -1202,16 +1186,6 @@ impl Config {
             OPENCODE_GO_PROVIDER_BASE_URL,
             None,
             false,
-        );
-
-        add_shorthand_provider(
-            &mut llm.providers,
-            "github-copilot",
-            llm.github_copilot_key.clone(),
-            ApiType::OpenAiChatCompletions,
-            GITHUB_COPILOT_DEFAULT_BASE_URL,
-            Some("GitHub Copilot"),
-            true,
         );
 
         if let Some(minimax_key) = llm.minimax_key.clone() {
@@ -1396,6 +1370,10 @@ impl Config {
         };
         let defaults = DefaultsConfig {
             routing: resolve_routing(toml.defaults.routing, &base_routing),
+            rig_alignment: resolve_rig_alignment(
+                toml.defaults.rig_alignment,
+                base_defaults.rig_alignment.clone(),
+            ),
             max_concurrent_branches: toml
                 .defaults
                 .max_concurrent_branches
@@ -1470,7 +1448,6 @@ impl Config {
                 .defaults
                 .cortex
                 .map(|c| CortexConfig::resolve(c, base_defaults.cortex))
-                .transpose()?
                 .unwrap_or(base_defaults.cortex),
             warmup: toml
                 .defaults
@@ -1504,11 +1481,8 @@ impl Config {
                                 .map(PathBuf::from)
                                 .or_else(|| base.screenshot_dir.clone()),
                             persist_session: b.persist_session.unwrap_or(base.persist_session),
-                            close_policy: resolve_close_policy(
-                                b.close_policy.as_deref(),
-                                b.persist_session.unwrap_or(base.persist_session),
-                                base.close_policy,
-                            ),
+                            close_policy: parse_close_policy(b.close_policy.as_deref())
+                                .unwrap_or(base.close_policy),
                             chrome_cache_dir: chrome_cache_dir.clone(),
                         }
                     })
@@ -1524,9 +1498,6 @@ impl Config {
                     listen_only_mode: channel_config
                         .listen_only_mode
                         .unwrap_or(base_defaults.channel.listen_only_mode),
-                    save_attachments: channel_config
-                        .save_attachments
-                        .unwrap_or(base_defaults.channel.save_attachments),
                 })
                 .unwrap_or(base_defaults.channel),
             mcp: default_mcp,
@@ -1585,31 +1556,6 @@ impl Config {
                 .as_deref()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(base_defaults.worker_log_mode),
-            projects: toml
-                .defaults
-                .projects
-                .map(|p| {
-                    let base = &base_defaults.projects;
-                    ProjectsConfig {
-                        use_worktrees: p.use_worktrees.unwrap_or(base.use_worktrees),
-                        worktree_name_template: p
-                            .worktree_name_template
-                            .unwrap_or_else(|| base.worktree_name_template.clone()),
-                        auto_create_worktrees: p
-                            .auto_create_worktrees
-                            .unwrap_or(base.auto_create_worktrees),
-                        auto_discover_repos: p
-                            .auto_discover_repos
-                            .unwrap_or(base.auto_discover_repos),
-                        auto_discover_worktrees: p
-                            .auto_discover_worktrees
-                            .unwrap_or(base.auto_discover_worktrees),
-                        disk_usage_warning_threshold: p
-                            .disk_usage_warning_threshold
-                            .unwrap_or(base.disk_usage_warning_threshold),
-                    }
-                })
-                .unwrap_or_else(|| base_defaults.projects.clone()),
         };
 
         let mut agents: Vec<AgentConfig> = toml
@@ -1645,8 +1591,6 @@ impl Config {
                     default: a.default,
                     display_name: a.display_name,
                     role: a.role,
-                    gradient_start: a.gradient_start,
-                    gradient_end: a.gradient_end,
                     workspace: a.workspace.map(PathBuf::from),
                     routing: agent_routing,
                     max_concurrent_branches: a.max_concurrent_branches,
@@ -1687,10 +1631,7 @@ impl Config {
                             .unwrap_or(defaults.ingestion.poll_interval_secs),
                         chunk_size: ig.chunk_size.unwrap_or(defaults.ingestion.chunk_size),
                     }),
-                    cortex: a
-                        .cortex
-                        .map(|c| CortexConfig::resolve(c, defaults.cortex))
-                        .transpose()?,
+                    cortex: a.cortex.map(|c| CortexConfig::resolve(c, defaults.cortex)),
                     warmup: a.warmup.map(|w| WarmupConfig {
                         enabled: w.enabled.unwrap_or(defaults.warmup.enabled),
                         eager_embedding_load: w
@@ -1717,21 +1658,17 @@ impl Config {
                         persist_session: b
                             .persist_session
                             .unwrap_or(defaults.browser.persist_session),
-                        close_policy: resolve_close_policy(
-                            b.close_policy.as_deref(),
-                            b.persist_session
-                                .unwrap_or(defaults.browser.persist_session),
-                            defaults.browser.close_policy,
-                        ),
+                        close_policy: parse_close_policy(b.close_policy.as_deref())
+                            .unwrap_or(defaults.browser.close_policy),
                         chrome_cache_dir: defaults.browser.chrome_cache_dir.clone(),
                     }),
-                    channel: a.channel.map(|channel_config| ChannelConfig {
-                        listen_only_mode: channel_config
+                    channel: a.channel.and_then(|channel_config| {
+                        channel_config
                             .listen_only_mode
-                            .unwrap_or(defaults.channel.listen_only_mode),
-                        save_attachments: channel_config
-                            .save_attachments
-                            .unwrap_or(defaults.channel.save_attachments),
+                            .map(|listen_only_mode| ChannelConfig { listen_only_mode })
+                    }),
+                    rig_alignment: a.rig_alignment.map(|rig_alignment| {
+                        resolve_rig_alignment(Some(rig_alignment), defaults.rig_alignment.clone())
                     }),
                     mcp: match a.mcp {
                         Some(mcp_servers) => Some(
@@ -1746,27 +1683,6 @@ impl Config {
                     cron_timezone: a.cron_timezone.as_deref().and_then(resolve_env_value),
                     user_timezone: a.user_timezone.as_deref().and_then(resolve_env_value),
                     sandbox: a.sandbox,
-                    projects: a.projects.map(|p| {
-                        let base = &defaults.projects;
-                        ProjectsConfig {
-                            use_worktrees: p.use_worktrees.unwrap_or(base.use_worktrees),
-                            worktree_name_template: p
-                                .worktree_name_template
-                                .unwrap_or_else(|| base.worktree_name_template.clone()),
-                            auto_create_worktrees: p
-                                .auto_create_worktrees
-                                .unwrap_or(base.auto_create_worktrees),
-                            auto_discover_repos: p
-                                .auto_discover_repos
-                                .unwrap_or(base.auto_discover_repos),
-                            auto_discover_worktrees: p
-                                .auto_discover_worktrees
-                                .unwrap_or(base.auto_discover_worktrees),
-                            disk_usage_warning_threshold: p
-                                .disk_usage_warning_threshold
-                                .unwrap_or(base.disk_usage_warning_threshold),
-                        }
-                    }),
                     cron,
                 })
             })
@@ -1778,8 +1694,6 @@ impl Config {
                 default: true,
                 display_name: None,
                 role: None,
-                gradient_start: None,
-                gradient_end: None,
                 workspace: None,
                 routing: None,
                 max_concurrent_branches: None,
@@ -1795,12 +1709,12 @@ impl Config {
                 warmup: None,
                 browser: None,
                 channel: None,
+                rig_alignment: None,
                 mcp: None,
                 brave_search_key: None,
                 cron_timezone: None,
                 user_timezone: None,
                 sandbox: None,
-                projects: None,
                 cron: Vec::new(),
             });
         }
@@ -2176,57 +2090,6 @@ impl Config {
                     trigger_prefix: t.trigger_prefix,
                 })
             }),
-            signal: toml.messaging.signal.and_then(|s| {
-                let instances = s
-                    .instances
-                    .into_iter()
-                    .map(|instance| {
-                        let http_url = instance.http_url.as_deref().and_then(resolve_env_value);
-                        let account = instance.account.as_deref().and_then(resolve_env_value);
-                        if instance.enabled && (http_url.is_none() || account.is_none()) {
-                            tracing::warn!(
-                                adapter = %instance.name,
-                                "signal instance is enabled but http_url or account is missing/unresolvable — disabling"
-                            );
-                        }
-                        let has_credentials = http_url.is_some() && account.is_some();
-                        SignalInstanceConfig {
-                            name: instance.name,
-                            enabled: instance.enabled && has_credentials,
-                            http_url: http_url.unwrap_or_default(),
-                            account: account.unwrap_or_default(),
-                            dm_allowed_users: instance.dm_allowed_users,
-                            group_ids: instance.group_ids,
-                            group_allowed_users: instance.group_allowed_users,
-                            ignore_stories: instance.ignore_stories,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-
-                let http_url = std::env::var("SIGNAL_HTTP_URL")
-                    .ok()
-                    .or_else(|| s.http_url.as_deref().and_then(resolve_env_value));
-                let account = std::env::var("SIGNAL_ACCOUNT")
-                    .ok()
-                    .or_else(|| s.account.as_deref().and_then(resolve_env_value));
-
-                if (http_url.is_none() || account.is_none())
-                    && !instances.iter().any(|inst| inst.enabled)
-                {
-                    return None;
-                }
-
-                Some(SignalConfig {
-                    enabled: s.enabled,
-                    http_url: http_url.unwrap_or_default(),
-                    account: account.unwrap_or_default(),
-                    instances,
-                    dm_allowed_users: s.dm_allowed_users,
-                    group_ids: s.group_ids,
-                    group_allowed_users: s.group_allowed_users,
-                    ignore_stories: s.ignore_stories,
-                })
-            }),
         };
 
         let bindings: Vec<Binding> = toml
@@ -2283,7 +2146,7 @@ impl Config {
             }
         };
 
-        let mut links: Vec<LinkDef> = toml
+        let links = toml
             .links
             .into_iter()
             .map(|l| {
@@ -2312,53 +2175,25 @@ impl Config {
             })
             .collect();
 
-        let humans_dir = instance_dir.join("humans");
         let mut humans: Vec<HumanDef> = toml
             .humans
             .into_iter()
-            .map(|h| {
-                let description = load_human_md(&humans_dir.join(&h.id));
-                HumanDef {
-                    id: h.id,
-                    display_name: h.display_name,
-                    role: h.role,
-                    bio: h.bio,
-                    description,
-                    discord_id: h.discord_id,
-                    telegram_id: h.telegram_id,
-                    slack_id: h.slack_id,
-                    email: h.email,
-                }
+            .map(|h| HumanDef {
+                id: h.id,
+                display_name: h.display_name,
+                role: h.role,
+                bio: h.bio,
             })
             .collect();
 
         // Default admin human if none defined
         if humans.is_empty() {
-            let description = load_human_md(&humans_dir.join("admin"));
             humans.push(HumanDef {
                 id: "admin".into(),
                 display_name: None,
                 role: None,
                 bio: None,
-                description,
-                discord_id: None,
-                telegram_id: None,
-                slack_id: None,
-                email: None,
             });
-
-            // Link the default admin to the default agent so the agent sees
-            // the human's context in its system prompt automatically.
-            if links.is_empty()
-                && let Some(default_agent) = agents.iter().find(|a| a.default)
-            {
-                links.push(LinkDef {
-                    from: "admin".into(),
-                    to: default_agent.id.clone(),
-                    direction: "one_way".into(),
-                    kind: "hierarchical".into(),
-                });
-            }
         }
 
         Ok(Config {
@@ -2375,15 +2210,5 @@ impl Config {
             metrics,
             telemetry,
         })
-    }
-}
-
-/// Load `HUMAN.md` from a human's directory, returning `None` if the file
-/// doesn't exist or is empty/whitespace.
-fn load_human_md(human_dir: &std::path::Path) -> Option<String> {
-    let path = human_dir.join("HUMAN.md");
-    match std::fs::read_to_string(&path) {
-        Ok(content) if !content.trim().is_empty() => Some(content),
-        _ => None,
     }
 }

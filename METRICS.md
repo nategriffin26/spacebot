@@ -16,6 +16,18 @@ The `[metrics]` config block is always parsed (so config validation works) but h
 
 The Docker image always includes metrics — `--features metrics` is hardcoded in the Dockerfile. Local development without metrics is still possible via `cargo build --release` (without the feature flag).
 
+## Rig Alignment Telemetry Status
+
+`[defaults.rig_alignment]` now emits dedicated `spacebot_rig_*` Prometheus metrics.
+
+These metrics complement the existing request/tool metrics rather than replacing them:
+
+- Existing request/tool metrics still cover end-to-end execution paths (`spacebot_llm_requests_total`, duration histograms, tool counters).
+- `spacebot_rig_request_semantics_total` records whether `tool_choice` / `output_schema` were applied, shadowed, rejected, or unsupported.
+- `spacebot_rig_stream_sessions_total` and `spacebot_rig_time_to_first_delta_ms` separate native vs synthetic streaming behavior and expose first-delta latency.
+- `spacebot_rig_tool_concurrency_total` records the request-level concurrency chosen for builtin workers.
+- `spacebot_rig_drift_detected_total` records semantics requests that the custom Rig bridge could not apply cleanly.
+
 ## Metric Inventory
 
 All metrics are prefixed with `spacebot_`. The registry uses a private `prometheus::Registry` (not the default global one) to avoid conflicts with other libraries.
@@ -40,6 +52,50 @@ All metrics are prefixed with `spacebot_`. The registry uses a private `promethe
 | Buckets | 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60, 120 |
 | Instrumented in | `src/llm/model.rs` — `SpacebotModel::completion()` |
 | Description | End-to-end LLM request duration in seconds. Includes retry loops and fallback chain traversal. |
+
+#### `spacebot_rig_request_semantics_total`
+
+| Field | Value |
+|-------|-------|
+| Type | `IntCounterVec` |
+| Labels | `process`, `provider`, `field`, `decision` |
+| Instrumented in | `src/llm/model.rs` — `SpacebotModel::evaluate_request_semantics()` |
+| Description | Request-semantic decisions for `tool_choice` and `output_schema`. `decision` is one of `applied`, `shadowed`, `rejected`, or `unsupported`. |
+
+**Cardinality:** `processes × providers × 2 fields × 4 decisions`.
+
+#### `spacebot_rig_stream_sessions_total`
+
+| Field | Value |
+|-------|-------|
+| Type | `IntCounterVec` |
+| Labels | `process`, `provider`, `mode` |
+| Instrumented in | `src/llm/model.rs` — `SpacebotModel::stream()` |
+| Description | Streaming session starts. `mode` is `native` for provider-backed streaming and `synthetic` when Spacebot wraps a non-streaming completion into Rig streaming events. |
+
+**Cardinality:** `processes × providers × 2 modes`.
+
+#### `spacebot_rig_tool_concurrency_total`
+
+| Field | Value |
+|-------|-------|
+| Type | `IntCounterVec` |
+| Labels | `worker_type`, `concurrency` |
+| Instrumented in | `src/agent/worker.rs` — builtin worker startup |
+| Description | Request-level tool concurrency chosen for worker prompts after allowlist validation and runtime clamping. |
+
+**Cardinality:** `worker_types × concurrency values`.
+
+#### `spacebot_rig_drift_detected_total`
+
+| Field | Value |
+|-------|-------|
+| Type | `IntCounterVec` |
+| Labels | `surface` |
+| Instrumented in | `src/llm/model.rs` — `SpacebotModel::evaluate_request_semantics()` |
+| Description | Counts semantic requests that the custom Rig bridge could not apply cleanly and therefore shadowed, rejected, or treated as unsupported. |
+
+**Cardinality:** one series per drift surface (currently `tool_choice`, `output_schema`).
 
 #### `spacebot_llm_tokens_total`
 
@@ -219,6 +275,71 @@ All metrics are prefixed with `spacebot_`. The registry uses a private `promethe
 | Instrumented in | `src/memory/store.rs` (save/delete), `src/tools/memory_save.rs`, `src/tools/memory_delete.rs` (forget) |
 | Description | Memory mutation operations. `operation` is one of `save`, `delete`, or `forget`. |
 
+**Cardinality:** `agents × operations(3)`. Expect 3–15 series.
+
+### Histograms
+
+#### `spacebot_llm_request_duration_seconds`
+
+| Field | Value |
+|-------|-------|
+| Type | `HistogramVec` |
+| Labels | `agent_id`, `model`, `tier` |
+| Buckets | 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60, 120 |
+| Instrumented in | `src/llm/model.rs` — `SpacebotModel::completion()` |
+| Description | End-to-end LLM request duration in seconds. Includes retry loops and fallback chain traversal. |
+
+**Cardinality:** Same as `spacebot_llm_requests_total` (per-bucket overhead is fixed, not per-series).
+
+#### `spacebot_rig_time_to_first_delta_ms`
+
+| Field | Value |
+|-------|-------|
+| Type | `HistogramVec` |
+| Labels | `process`, `provider` |
+| Buckets | 25, 50, 100, 250, 500, 1000, 1500, 2500, 3500, 5000, 10000, 30000 |
+| Instrumented in | `src/llm/model.rs` — instrumented streaming result wrapper |
+| Description | Milliseconds from stream start until the first non-empty text delta is emitted. Covers both native and synthetic streaming paths. |
+
+**Cardinality:** `processes × providers`.
+
+#### `spacebot_tool_call_duration_seconds`
+
+| Field | Value |
+|-------|-------|
+| Type | `Histogram` (no labels) |
+| Buckets | 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30 |
+| Instrumented in | `src/hooks/spacebot.rs` — `on_tool_call()` starts timer, `on_tool_result()` observes |
+| Description | Tool call execution duration in seconds. |
+
+**Cardinality:** 1 series.
+
+**Implementation note:** Duration is tracked via a `LazyLock<Mutex<HashMap<String, Instant>>>` static keyed by Rig's internal call ID. If a tool call starts but the agent terminates before `on_tool_result` fires (e.g. leak detection), the timer entry remains — bounded by concurrent tool calls, not a practical concern.
+
+#### `spacebot_worker_duration_seconds`
+
+| Field | Value |
+|-------|-------|
+| Type | `HistogramVec` |
+| Labels | `agent_id`, `worker_type` |
+| Buckets | 1, 5, 10, 30, 60, 120, 300, 600, 1800 |
+| Instrumented in | `src/agent/channel.rs` — `spawn_worker_task()` |
+| Description | Worker lifetime duration in seconds from spawn to completion. |
+
+**Cardinality:** `agents × worker_types`. Currently `worker_type` is `"builtin"` — expect 1–5 series.
+
+### Gauges
+
+#### `spacebot_active_workers`
+
+| Field | Value |
+|-------|-------|
+| Type | `IntGaugeVec` |
+| Labels | `agent_id` |
+| Instrumented in | `src/agent/channel.rs` — `spawn_worker_task()` |
+| Description | Currently active workers. Incremented when a worker task is spawned, decremented when it completes. |
+
+**Cardinality:** Number of agents (1–5).
 #### `spacebot_memory_entry_count`
 
 | Field | Value |

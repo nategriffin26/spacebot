@@ -1,11 +1,8 @@
 //! SpacebotHook: Prompt hook for channels, branches, and workers.
 
-use crate::hooks::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
-use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
 use crate::{AgentId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, CompletionResponse, Message, Prompt, PromptError};
-use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Controls whether hook-driven tool nudge retries are enabled.
@@ -40,27 +37,10 @@ pub struct SpacebotHook {
     tool_nudge_policy: ToolNudgePolicy,
     completion_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     nudge_request_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    completion_contract_request_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set to `true` when the worker calls `set_status` with `kind: "outcome"`.
     /// Once signaled, the nudge system allows text-only responses to pass
     /// through as legitimate completions.
     outcome_signaled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Counts consecutive text-only nudge attempts. Reset to zero whenever a
-    /// tool call completes successfully, so the budget tracks *consecutive*
-    /// text-only responses rather than total across the worker's lifetime.
-    nudge_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Detects repetitive tool calling patterns (identical calls, identical
-    /// outcomes, ping-pong cycles) and blocks them before execution.
-    loop_guard: std::sync::Arc<std::sync::Mutex<LoopGuard>>,
-    /// Receiver for context injection messages. When a channel routes addendum
-    /// context to a running worker, the messages arrive on this channel and are
-    /// drained in `on_completion_call` before each LLM turn.
-    inject_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>>,
-    /// Buffer of injected messages drained from `inject_rx`. The
-    /// `prompt_with_tool_nudge_retry` loop reads and clears this buffer to
-    /// append the messages to history before re-prompting.
-    injected_messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
 }
 
 impl SpacebotHook {
@@ -70,21 +50,8 @@ impl SpacebotHook {
          before finishing.";
     /// PromptCancelled reason used internally for tool nudge retries.
     pub const TOOL_NUDGE_REASON: &str = "spacebot_tool_nudge_retry";
-    /// PromptCancelled reason used when injected context is pending.
-    pub const CONTEXT_INJECTION_REASON: &str = "spacebot_context_injection";
-    /// PromptCancelled reason used for memory-persistence contract retries.
-    pub const MEMORY_PERSISTENCE_CONTRACT_REASON: &str =
-        "spacebot_memory_persistence_contract_retry";
     /// Maximum nudge retries per prompt request.
     pub const TOOL_NUDGE_MAX_RETRIES: usize = 2;
-    /// Maximum completion-contract retries per prompt request.
-    pub const MEMORY_PERSISTENCE_CONTRACT_MAX_RETRIES: usize = 2;
-    /// Prompt used to nudge memory-persistence branches toward a terminal tool outcome.
-    pub const MEMORY_PERSISTENCE_CONTRACT_PROMPT: &str = "You must finish this memory-persistence run by calling memory_persistence_complete. \
-         First recall relevant memories, then save real memories if needed, then call \
-         memory_persistence_complete with either outcome=\"saved\" and exact saved_memory_ids \
-         from successful memory_save calls in this run, or outcome=\"no_memories\" with a short \
-         reason and no saved IDs. Do not invent memory IDs.";
 
     /// Create a new hook.
     pub fn new(
@@ -94,7 +61,6 @@ impl SpacebotHook {
         channel_id: Option<ChannelId>,
         event_tx: broadcast::Sender<ProcessEvent>,
     ) -> Self {
-        let loop_guard_config = LoopGuardConfig::for_process(process_type);
         Self {
             agent_id,
             process_id,
@@ -104,17 +70,7 @@ impl SpacebotHook {
             tool_nudge_policy: ToolNudgePolicy::for_process(process_type),
             completion_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             nudge_request_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            completion_contract_request_active: std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            nudge_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            loop_guard: std::sync::Arc::new(std::sync::Mutex::new(LoopGuard::new(
-                loop_guard_config,
-            ))),
-            inject_rx: None,
-            injected_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            memory_persistence_contract: None,
         }
     }
 
@@ -124,46 +80,17 @@ impl SpacebotHook {
         self
     }
 
-    pub fn with_memory_persistence_contract(
-        mut self,
-        contract_state: Arc<MemoryPersistenceContractState>,
-    ) -> Self {
-        self.memory_persistence_contract = Some(contract_state);
-        self
-    }
-
-    /// Attach a context injection receiver to this hook.
-    ///
-    /// When set, `on_completion_call` will drain pending messages from the
-    /// receiver into `injected_messages` and return `Terminate` so the retry
-    /// loop can append them to history.
-    pub fn with_inject_rx(mut self, inject_rx: tokio::sync::mpsc::Receiver<String>) -> Self {
-        self.inject_rx = Some(std::sync::Arc::new(tokio::sync::Mutex::new(inject_rx)));
-        self
-    }
-
     /// Return the current tool nudge policy for this hook.
     pub fn tool_nudge_policy(&self) -> ToolNudgePolicy {
         self.tool_nudge_policy
     }
 
-    /// Returns `true` if the worker has called `set_status` with `kind: "outcome"`.
-    pub fn outcome_signaled(&self) -> bool {
-        self.outcome_signaled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Reset per-prompt state (tool nudging, outcome tracking, and loop guard).
+    /// Reset per-prompt state (tool nudging and outcome tracking).
     pub fn reset_tool_nudge_state(&self) {
         self.completion_calls
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.outcome_signaled
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.nudge_attempts
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut guard) = self.loop_guard.lock() {
-            guard.reset();
-        }
     }
 
     fn set_tool_nudge_request_active(&self, active: bool) {
@@ -171,31 +98,9 @@ impl SpacebotHook {
             .store(active, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn set_completion_contract_request_active(&self, active: bool) {
-        self.completion_contract_request_active
-            .store(active, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Return true if a PromptCancelled reason indicates a tool nudge retry.
     pub fn is_tool_nudge_reason(reason: &str) -> bool {
         reason == Self::TOOL_NUDGE_REASON
-    }
-
-    /// Return true if a PromptCancelled reason indicates context injection.
-    pub fn is_context_injection_reason(reason: &str) -> bool {
-        reason == Self::CONTEXT_INJECTION_REASON
-    }
-
-    pub fn is_memory_persistence_contract_reason(reason: &str) -> bool {
-        reason == Self::MEMORY_PERSISTENCE_CONTRACT_REASON
-    }
-
-    /// Drain and return all buffered injected messages.
-    pub fn take_injected_messages(&self) -> Vec<String> {
-        self.injected_messages
-            .lock()
-            .map(|mut messages| std::mem::take(&mut *messages))
-            .unwrap_or_default()
     }
 
     /// Prompt an agent with bounded hook-driven tool nudge retries.
@@ -211,83 +116,61 @@ impl SpacebotHook {
     where
         M: CompletionModel,
     {
+        self.prompt_with_tool_nudge_retry_with_concurrency(agent, history, prompt, 1)
+            .await
+    }
+
+    /// Prompt an agent with bounded hook-driven tool nudge retries and request-level
+    /// tool concurrency.
+    pub async fn prompt_with_tool_nudge_retry_with_concurrency<M>(
+        &self,
+        agent: &rig::agent::Agent<M>,
+        history: &mut Vec<Message>,
+        prompt: &str,
+        tool_concurrency: usize,
+    ) -> std::result::Result<String, PromptError>
+    where
+        M: CompletionModel,
+    {
         self.reset_tool_nudge_state();
         self.set_tool_nudge_request_active(true);
-        self.set_completion_contract_request_active(false);
 
+        let mut nudge_attempts = 0usize;
         let mut current_prompt = std::borrow::Cow::Borrowed(prompt);
         let mut using_tool_nudge_prompt = false;
 
         loop {
             let history_len_before_attempt = history.len();
-            let result = agent
-                .prompt(current_prompt.as_ref())
-                .with_history(history)
-                .with_hook(self.clone())
-                .await;
+            let result = if tool_concurrency > 1 {
+                agent
+                    .prompt(current_prompt.as_ref())
+                    .with_history(history)
+                    .with_hook(self.clone())
+                    .with_tool_concurrency(tool_concurrency)
+                    .await
+            } else {
+                agent
+                    .prompt(current_prompt.as_ref())
+                    .with_history(history)
+                    .with_hook(self.clone())
+                    .await
+            };
 
             match &result {
-                // Context injection: the hook detected pending injected
-                // messages and terminated the agent loop. Drain the buffer,
-                // append each message to history as a User message, and
-                // re-prompt with a continuation hint. This does NOT count
-                // against the nudge attempt budget.
                 Err(PromptError::PromptCancelled { reason, .. })
-                    if Self::is_context_injection_reason(reason) =>
+                    if Self::is_tool_nudge_reason(reason)
+                        && nudge_attempts < Self::TOOL_NUDGE_MAX_RETRIES =>
                 {
-                    let injected = self.take_injected_messages();
-                    if injected.is_empty() {
-                        // Shouldn't happen, but guard against it.
-                        tracing::warn!(
-                            process_id = %self.process_id,
-                            "context injection termination but no buffered messages"
-                        );
-                    }
-
-                    for message in &injected {
-                        tracing::info!(
-                            process_id = %self.process_id,
-                            "injecting context into worker history"
-                        );
-                        history.push(Message::user(format!(
-                            "[Context update from the user]: {message}"
-                        )));
-                    }
-
-                    // Re-prompt asking the worker to incorporate the new context.
-                    current_prompt = std::borrow::Cow::Borrowed(
-                        "New context has been provided above. Incorporate this \
-                         information and continue working on your task. Do not \
-                         repeat completed work.",
-                    );
-                    using_tool_nudge_prompt = false;
-                    continue;
-                }
-                Err(PromptError::PromptCancelled { reason, .. })
-                    if Self::is_tool_nudge_reason(reason) =>
-                {
-                    // Read the current attempt count. on_tool_result resets
-                    // this to zero whenever a tool call completes, so this
-                    // tracks *consecutive* text-only responses rather than
-                    // total nudges across the worker's lifetime.
-                    let attempts = self
-                        .nudge_attempts
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if attempts >= Self::TOOL_NUDGE_MAX_RETRIES {
-                        // Retries exhausted — propagate the cancellation.
-                        self.set_tool_nudge_request_active(false);
-                        self.set_completion_contract_request_active(false);
-                        return result;
-                    }
                     Self::prune_tool_nudge_retry_history(
                         history,
                         history_len_before_attempt,
                         using_tool_nudge_prompt,
                     );
+                    nudge_attempts += 1;
                     tracing::warn!(
                         process_id = %self.process_id,
                         process_type = %self.process_type,
-                        attempt = attempts + 1,
+                        attempt = nudge_attempts,
                         "text-only response without outcome signal, nudging tool usage"
                     );
                     current_prompt = std::borrow::Cow::Borrowed(Self::TOOL_NUDGE_PROMPT);
@@ -303,7 +186,6 @@ impl SpacebotHook {
                         );
                     }
                     self.set_tool_nudge_request_active(false);
-                    self.set_completion_contract_request_active(false);
                     return result;
                 }
             }
@@ -371,13 +253,37 @@ impl SpacebotHook {
     where
         M: CompletionModel,
     {
+        self.prompt_once_with_tool_concurrency(agent, history, prompt, 1)
+            .await
+    }
+
+    /// Prompt once with a per-request tool concurrency setting.
+    pub async fn prompt_once_with_tool_concurrency<M>(
+        &self,
+        agent: &rig::agent::Agent<M>,
+        history: &mut Vec<Message>,
+        prompt: &str,
+        tool_concurrency: usize,
+    ) -> std::result::Result<String, PromptError>
+    where
+        M: CompletionModel,
+    {
         self.reset_tool_nudge_state();
         self.set_tool_nudge_request_active(false);
-        agent
-            .prompt(prompt)
-            .with_history(history)
-            .with_hook(self.clone())
-            .await
+        if tool_concurrency > 1 {
+            agent
+                .prompt(prompt)
+                .with_history(history)
+                .with_hook(self.clone())
+                .with_tool_concurrency(tool_concurrency)
+                .await
+        } else {
+            agent
+                .prompt(prompt)
+                .with_history(history)
+                .with_hook(self.clone())
+                .await
+        }
     }
 
     /// Send a status update event.
@@ -468,16 +374,9 @@ impl SpacebotHook {
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::telemetry::Metrics::global();
-            let process_label = match self.process_type {
-                crate::ProcessType::Channel => "channel",
-                crate::ProcessType::Branch => "branch",
-                crate::ProcessType::Worker => "worker",
-                crate::ProcessType::Compactor => "compactor",
-                crate::ProcessType::Cortex => "cortex",
-            };
             metrics
                 .tool_calls_total
-                .with_label_values(&[&*self.agent_id, tool_name, process_label])
+                .with_label_values(&[&*self.agent_id, tool_name])
                 .inc();
             if let Some(start) = TOOL_CALL_TIMERS
                 .lock()
@@ -486,7 +385,6 @@ impl SpacebotHook {
             {
                 metrics
                     .tool_call_duration_seconds
-                    .with_label_values(&[&*self.agent_id, tool_name, process_label])
                     .observe(start.elapsed().as_secs_f64());
             }
         }
@@ -553,97 +451,14 @@ impl SpacebotHook {
             return false;
         }
 
-        // Response without tool calls and without a prior outcome signal.
-        // Nudge if the response contains any non-empty text, OR if it
-        // contains no text at all (e.g. reasoning-only). A response that
-        // is purely reasoning/image with no text and no tool calls means
-        // the worker hasn't actually done anything — send it back.
-        let has_any_text = response.choice.iter().any(|content| {
+        // Text-only response without a prior outcome signal — nudge.
+        response.choice.iter().any(|content| {
             if let rig::message::AssistantContent::Text(text) = content {
                 !text.text.trim().is_empty()
             } else {
                 false
             }
-        });
-
-        // Nudge on non-empty text (worker tried to narrate instead of
-        // working) or on no text at all (reasoning-only exit attempt).
-        has_any_text
-            || !response.choice.iter().any(|content| {
-                matches!(
-                    content,
-                    rig::message::AssistantContent::Text(_)
-                        | rig::message::AssistantContent::ToolCall(_)
-                )
-            })
-    }
-
-    fn should_reject_memory_persistence_completion<M>(
-        &self,
-        response: &CompletionResponse<M::Response>,
-    ) -> bool
-    where
-        M: CompletionModel,
-    {
-        let Some(contract_state) = &self.memory_persistence_contract else {
-            return false;
-        };
-        if !self
-            .completion_contract_request_active
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-        if contract_state.has_terminal_outcome() {
-            return false;
-        }
-
-        !response
-            .choice
-            .iter()
-            .any(|content| matches!(content, rig::message::AssistantContent::ToolCall(_)))
-    }
-
-    fn parse_memory_persistence_terminal_outcome(
-        result: &str,
-    ) -> Option<MemoryPersistenceTerminalOutcome> {
-        let parsed = serde_json::from_str::<serde_json::Value>(result).ok()?;
-        if parsed.get("success").and_then(|value| value.as_bool()) != Some(true) {
-            return None;
-        }
-
-        match parsed.get("outcome").and_then(|value| value.as_str()) {
-            Some("saved") => {
-                let saved_memory_ids = parsed
-                    .get("saved_memory_ids")
-                    .and_then(|value| value.as_array())
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|value| value.as_str())
-                            .map(str::trim)
-                            .filter(|memory_id| !memory_id.is_empty())
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if saved_memory_ids.is_empty() {
-                    return None;
-                }
-                Some(MemoryPersistenceTerminalOutcome::Saved { saved_memory_ids })
-            }
-            Some("no_memories") => {
-                let reason = parsed
-                    .get("reason")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|reason| !reason.is_empty())?;
-                Some(MemoryPersistenceTerminalOutcome::NoMemories {
-                    reason: reason.to_string(),
-                })
-            }
-            _ => None,
-        }
+        })
     }
 }
 
@@ -664,32 +479,6 @@ where
         if self.tool_nudge_policy.is_enabled() {
             self.completion_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Check for pending injected context before the LLM call.
-        // Drain all available messages from the injection channel and buffer
-        // them for the retry loop to append to history.
-        if let Some(inject_rx) = &self.inject_rx {
-            let mut drained = Vec::new();
-            if let Ok(mut receiver) = inject_rx.try_lock() {
-                while let Ok(message) = receiver.try_recv() {
-                    drained.push(message);
-                }
-            }
-            if !drained.is_empty() {
-                let count = drained.len();
-                if let Ok(mut buffer) = self.injected_messages.lock() {
-                    buffer.extend(drained);
-                }
-                tracing::info!(
-                    process_id = %self.process_id,
-                    count,
-                    "context injection: drained pending messages, terminating for re-prompt"
-                );
-                return HookAction::Terminate {
-                    reason: Self::CONTEXT_INJECTION_REASON.into(),
-                };
-            }
         }
 
         // Log the completion call but don't block it
@@ -718,59 +507,20 @@ where
             };
         }
 
-        if self.should_reject_memory_persistence_completion::<M>(response) {
-            return HookAction::Terminate {
-                reason: Self::MEMORY_PERSISTENCE_CONTRACT_REASON.into(),
-            };
-        }
-
-        // Emit text content from worker completion responses so the live
-        // transcript can show the model's reasoning between tool calls.
-        if self.process_type == ProcessType::Worker {
-            let text: String = response
-                .choice
-                .iter()
-                .filter_map(|content| {
-                    if let rig::message::AssistantContent::Text(text) = content {
-                        let trimmed = text.text.trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed)
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-
-            if !text.is_empty()
-                && let ProcessId::Worker(worker_id) = &self.process_id
-            {
-                let event = ProcessEvent::WorkerText {
-                    agent_id: self.agent_id.clone(),
-                    worker_id: *worker_id,
-                    channel_id: self.channel_id.clone(),
-                    text,
-                };
-                self.event_tx.send(event).ok();
-            }
-        }
-
         HookAction::Continue
     }
 
-    async fn on_text_delta(&self, text_delta: &str, aggregated_text: &str) -> HookAction {
+    async fn on_text_delta(&self, text_delta: &str, _aggregated_text: &str) -> HookAction {
         if self.process_type == ProcessType::Channel
             && let Some(channel_id) = self.channel_id.clone()
         {
+            let scrubbed_text_delta = crate::secrets::scrub::scrub_leaks(text_delta);
             let event = ProcessEvent::TextDelta {
                 agent_id: self.agent_id.clone(),
                 process_id: self.process_id.clone(),
                 channel_id: Some(channel_id),
-                text_delta: text_delta.to_string(),
-                aggregated_text: aggregated_text.to_string(),
+                text_delta: scrubbed_text_delta.clone(),
+                aggregated_text: scrubbed_text_delta,
             };
             self.event_tx.send(event).ok();
         }
@@ -785,31 +535,6 @@ where
         _internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
-        // Loop guard: check for repetitive tool calling before execution.
-        // Runs for all process types. Block → Skip (message becomes tool
-        // result), CircuitBreak → Terminate.
-        if let Ok(mut guard) = self.loop_guard.lock() {
-            match guard.check(tool_name, args) {
-                LoopGuardVerdict::Allow => {}
-                LoopGuardVerdict::Block(reason) => {
-                    tracing::warn!(
-                        process_id = %self.process_id,
-                        tool_name = %tool_name,
-                        "loop guard blocked tool call"
-                    );
-                    return ToolCallHookAction::Skip { reason };
-                }
-                LoopGuardVerdict::CircuitBreak(reason) => {
-                    tracing::warn!(
-                        process_id = %self.process_id,
-                        tool_name = %tool_name,
-                        "loop guard circuit-breaking agent loop"
-                    );
-                    return ToolCallHookAction::Terminate { reason };
-                }
-            }
-        }
-
         // Leak blocking is enforced at channel egress (`reply`). Worker and
         // branch tool calls may legitimately handle secrets internally.
         if self.process_type == ProcessType::Channel
@@ -828,7 +553,8 @@ where
         }
 
         // Send event without blocking. Truncate args to keep broadcast payloads bounded.
-        let capped_args = crate::tools::truncate_output(args, 2_000);
+        let scrubbed_args = crate::secrets::scrub::scrub_leaks(args);
+        let capped_args = crate::tools::truncate_output(&scrubbed_args, 2_000);
         let event = ProcessEvent::ToolStarted {
             agent_id: self.agent_id.clone(),
             process_id: self.process_id.clone(),
@@ -908,33 +634,6 @@ where
 
         self.record_tool_result_metrics(tool_name, internal_call_id);
 
-        // Record outcome for loop guard (outcome-aware repetition detection).
-        // The guard uses the (tool_name, args, result) triple to detect when
-        // the same call produces the same result repeatedly, and poisons the
-        // call hash so the next check() in on_tool_call auto-blocks.
-        if let Ok(mut guard) = self.loop_guard.lock() {
-            guard.record_outcome(tool_name, _args, result);
-        }
-
-        let is_tool_error = result.starts_with("Toolset error:");
-
-        if !is_tool_error
-            && tool_name == "memory_persistence_complete"
-            && let Some(contract_state) = &self.memory_persistence_contract
-            && let Some(outcome) = Self::parse_memory_persistence_terminal_outcome(result)
-        {
-            contract_state.set_terminal_outcome(outcome);
-        }
-
-        // A successful tool call proves the worker is still productive.
-        // Reset the consecutive nudge counter so a brief narration blip
-        // after many tool calls doesn't exhaust the retry budget.
-        // Tool errors (from Rig's error path) don't count as productive.
-        if self.tool_nudge_policy.is_enabled() && !is_tool_error {
-            self.nudge_attempts
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-
         // Detect terminal outcome signal from successful set_status results.
         // We check the *result* (not the args) so the flag is only set after the
         // tool actually executed successfully. A failed set_status call won't
@@ -949,22 +648,12 @@ where
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Channel turns should end immediately after a successful reply or skip
-        // tool call. This avoids extra post-reply LLM iterations that add latency,
-        // cost, and noisy logs when providers return empty trailing responses.
-        // For skip, terminating is critical: without it the model receives the tool
-        // result and almost always generates narration like "The skip was successful"
-        // which either leaks to the user (retrigger path) or wastes tokens.
-        if !is_tool_error
-            && self.process_type == ProcessType::Channel
-            && (tool_name == "reply" || tool_name == "skip")
-        {
+        // Channel turns should end immediately after a successful reply tool call.
+        // This avoids extra post-reply LLM iterations that add latency, cost, and
+        // noisy logs when providers return empty trailing responses.
+        if self.process_type == ProcessType::Channel && tool_name == "reply" {
             return HookAction::Terminate {
-                reason: if tool_name == "reply" {
-                    "reply delivered".into()
-                } else {
-                    "skip".into()
-                },
+                reason: "reply delivered".into(),
             };
         }
 
@@ -978,13 +667,11 @@ mod tests {
     use crate::ProcessEvent;
     use crate::llm::SpacebotModel;
     use crate::llm::model::RawResponse;
-    use crate::tools::MemoryPersistenceContractState;
     use crate::{ProcessId, ProcessType};
     use rig::OneOrMany;
     use rig::agent::{HookAction, PromptHook};
     use rig::completion::{CompletionResponse, Message, Usage};
     use rig::message::AssistantContent;
-    use std::sync::Arc;
 
     fn make_hook() -> SpacebotHook {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
@@ -995,20 +682,6 @@ mod tests {
             None,
             event_tx,
         )
-    }
-
-    fn make_memory_persistence_hook() -> (SpacebotHook, Arc<MemoryPersistenceContractState>) {
-        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
-        let contract_state = Arc::new(MemoryPersistenceContractState::default());
-        let hook = SpacebotHook::new(
-            std::sync::Arc::<str>::from("agent"),
-            ProcessId::Branch(uuid::Uuid::new_v4()),
-            ProcessType::Branch,
-            None,
-            event_tx,
-        )
-        .with_memory_persistence_contract(contract_state.clone());
-        (hook, contract_state)
     }
 
     fn prompt_message() -> Message {
@@ -1514,401 +1187,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_result_resets_consecutive_nudge_counter() {
-        // The exact scenario from the Railway browser worker failure:
-        // worker makes many tool calls, then narrates, gets nudged, but the
-        // nudge counter should have been reset by the prior tool calls so
-        // the budget isn't exhausted from earlier narration blips.
-        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
-        hook.reset_tool_nudge_state();
-        hook.set_tool_nudge_request_active(true);
+    async fn channel_text_delta_scrubs_secret_patterns() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let hook = SpacebotHook::new(
+            std::sync::Arc::<str>::from("agent"),
+            ProcessId::Channel(std::sync::Arc::<str>::from("channel")),
+            ProcessType::Channel,
+            Some(std::sync::Arc::<str>::from("channel")),
+            event_tx,
+        );
 
-        // Simulate 2 nudge attempts (would exhaust budget under old behavior)
-        hook.nudge_attempts
-            .store(2, std::sync::atomic::Ordering::Relaxed);
-
-        // A successful tool call should reset the counter
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_text_delta(
             &hook,
-            "browser_click",
-            None,
-            "internal_1",
-            "{\"index\": 13}",
-            "{\"success\":true,\"message\":\"Clicked element at index 13\"}",
+            "sk-ant-api03-abc1234567890123456789012345678901234567",
+            "token sk-ant-api03-abc1234567890123456789012345678901234567",
         )
         .await;
+        assert!(matches!(action, HookAction::Continue));
 
-        assert_eq!(
-            hook.nudge_attempts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "Tool result should reset consecutive nudge counter to zero"
-        );
+        let event = event_rx.recv().await.expect("text delta event");
+        assert!(matches!(
+            event,
+            ProcessEvent::TextDelta {
+                ref text_delta,
+                ref aggregated_text,
+                ..
+            } if !text_delta.contains("sk-ant-") && !aggregated_text.contains("sk-ant-")
+        ));
     }
 
     #[tokio::test]
-    async fn nudge_counter_not_reset_when_policy_disabled() {
-        // When nudge policy is disabled, on_tool_result should not touch
-        // the counter (it's irrelevant but ensures no side effects).
-        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Disabled);
-        hook.reset_tool_nudge_state();
+    async fn tool_started_event_scrubs_secret_patterns() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let hook = SpacebotHook::new(
+            std::sync::Arc::<str>::from("agent"),
+            ProcessId::Worker(uuid::Uuid::new_v4()),
+            ProcessType::Worker,
+            None,
+            event_tx,
+        );
 
-        hook.nudge_attempts
-            .store(2, std::sync::atomic::Ordering::Relaxed);
-
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call(
             &hook,
             "shell",
             None,
-            "internal_1",
-            "{\"command\":\"ls\"}",
-            "file1.txt\nfile2.txt",
+            "internal-call",
+            r#"{"command":"export API_KEY=sk-ant-api03-abc1234567890123456789012345678901234567"}"#,
         )
         .await;
+        assert!(matches!(action, rig::agent::ToolCallHookAction::Continue));
 
-        assert_eq!(
-            hook.nudge_attempts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "Nudge counter should not be reset when policy is disabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn nudges_on_reasoning_only_response_without_outcome() {
-        // A response with only Reasoning content (no Text, no ToolCall) should
-        // trigger a nudge. This is the exact bug case: models with extended
-        // thinking produce a Reasoning block and exit the agent loop without
-        // doing any work.
-        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
-        let prompt = prompt_message();
-        hook.reset_tool_nudge_state();
-        hook.set_tool_nudge_request_active(true);
-
-        let reasoning_response = CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::reasoning("thinking about the task...")),
-            message_id: None,
-            usage: Usage::default(),
-            raw_response: RawResponse {
-                body: serde_json::json!({}),
-            },
-        };
-
-        let _ =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-        let response = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
-            &hook,
-            &prompt,
-            &reasoning_response,
-        )
-        .await;
-        assert!(
-            matches!(
-                response,
-                HookAction::Terminate { ref reason }
-                if reason == SpacebotHook::TOOL_NUDGE_REASON
-            ),
-            "Expected nudge — reasoning-only response without outcome should be rejected"
-        );
-    }
-
-    // ---- Context injection tests ----
-
-    #[tokio::test]
-    async fn injection_terminates_on_pending_messages() {
-        let hook = make_hook();
-        let (inject_tx, inject_rx) = tokio::sync::mpsc::channel(8);
-        let hook = hook.with_inject_rx(inject_rx);
-        let prompt = prompt_message();
-
-        // Send a message before the completion call
-        inject_tx
-            .send("additional context".to_string())
-            .await
-            .unwrap();
-
-        let action =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-
-        assert!(
-            matches!(
-                action,
-                HookAction::Terminate { ref reason }
-                if reason == SpacebotHook::CONTEXT_INJECTION_REASON
-            ),
-            "Expected termination for context injection, got {action:?}"
-        );
-
-        // The message should be buffered for the retry loop
-        let messages = hook.take_injected_messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0], "additional context");
-    }
-
-    #[tokio::test]
-    async fn injection_continues_when_no_pending_messages() {
-        let hook = make_hook();
-        let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel(8);
-        let hook = hook.with_inject_rx(inject_rx);
-        let prompt = prompt_message();
-
-        let action =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-
-        assert!(
-            matches!(action, HookAction::Continue),
-            "Expected Continue when no injected messages, got {action:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn injection_drains_multiple_messages() {
-        let hook = make_hook();
-        let (inject_tx, inject_rx) = tokio::sync::mpsc::channel(8);
-        let hook = hook.with_inject_rx(inject_rx);
-        let prompt = prompt_message();
-
-        inject_tx.send("first".to_string()).await.unwrap();
-        inject_tx.send("second".to_string()).await.unwrap();
-        inject_tx.send("third".to_string()).await.unwrap();
-
-        let action =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-
+        let event = event_rx.recv().await.expect("tool started event");
         assert!(matches!(
-            action,
-            HookAction::Terminate { ref reason }
-            if reason == SpacebotHook::CONTEXT_INJECTION_REASON
+            event,
+            ProcessEvent::ToolStarted { ref args, .. } if !args.contains("sk-ant-")
         ));
-
-        let messages = hook.take_injected_messages();
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0], "first");
-        assert_eq!(messages[1], "second");
-        assert_eq!(messages[2], "third");
-    }
-
-    #[tokio::test]
-    async fn injection_take_clears_buffer() {
-        let hook = make_hook();
-        let (inject_tx, inject_rx) = tokio::sync::mpsc::channel(8);
-        let hook = hook.with_inject_rx(inject_rx);
-        let prompt = prompt_message();
-
-        inject_tx.send("context".to_string()).await.unwrap();
-
-        let _ =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-
-        let first = hook.take_injected_messages();
-        assert_eq!(first.len(), 1);
-
-        // Second take should be empty
-        let second = hook.take_injected_messages();
-        assert!(second.is_empty(), "Buffer should be empty after take");
-    }
-
-    #[tokio::test]
-    async fn injection_reason_detection() {
-        assert!(SpacebotHook::is_context_injection_reason(
-            SpacebotHook::CONTEXT_INJECTION_REASON
-        ));
-        assert!(!SpacebotHook::is_context_injection_reason(
-            SpacebotHook::TOOL_NUDGE_REASON
-        ));
-        assert!(!SpacebotHook::is_tool_nudge_reason(
-            SpacebotHook::CONTEXT_INJECTION_REASON
-        ));
-    }
-
-    #[tokio::test]
-    async fn injection_does_not_interfere_with_nudge() {
-        // A hook with both injection and nudge enabled should handle them
-        // independently.
-        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
-        let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel(8);
-        let hook = hook.with_inject_rx(inject_rx);
-        let prompt = prompt_message();
-
-        hook.reset_tool_nudge_state();
-        hook.set_tool_nudge_request_active(true);
-
-        // No injection pending, so on_completion_call should Continue
-        let action =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-        assert!(matches!(action, HookAction::Continue));
-
-        // A text-only response should still trigger the nudge
-        let response = text_response("some text without outcome");
-        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
-            &hook, &prompt, &response,
-        )
-        .await;
-        assert!(
-            matches!(
-                action,
-                HookAction::Terminate { ref reason }
-                if reason == SpacebotHook::TOOL_NUDGE_REASON
-            ),
-            "Nudge should still work when inject_rx is attached but empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_persistence_plain_text_completion_is_rejected_without_terminal_tool() {
-        let (hook, _contract_state) = make_memory_persistence_hook();
-        let prompt = prompt_message();
-        hook.set_completion_contract_request_active(true);
-
-        let _ =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
-            &hook,
-            &prompt,
-            &text_response("Saved the memories."),
-        )
-        .await;
-
-        assert!(matches!(
-            action,
-            HookAction::Terminate { ref reason }
-            if reason == SpacebotHook::MEMORY_PERSISTENCE_CONTRACT_REASON
-        ));
-    }
-
-    #[tokio::test]
-    async fn memory_persistence_fabricated_saved_ids_are_rejected() {
-        let (hook, contract_state) = make_memory_persistence_hook();
-        let prompt = prompt_message();
-        hook.set_completion_contract_request_active(true);
-
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
-            &hook,
-            "memory_save",
-            None,
-            "internal_1",
-            "{}",
-            "{\"success\":true,\"memory_id\":\"mem_real_1\"}",
-        )
-        .await;
-
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
-            &hook,
-            "memory_persistence_complete",
-            None,
-            "internal_2",
-            "{\"outcome\":\"saved\",\"saved_memory_ids\":[\"mem_fake\"]}",
-            "Toolset error: memory_persistence_complete failed: saved_memory_ids mismatch",
-        )
-        .await;
-
-        assert!(
-            !contract_state.has_terminal_outcome(),
-            "terminal outcome must not be recorded for fabricated IDs"
-        );
-
-        let _ =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
-            &hook,
-            &prompt,
-            &text_response("Done."),
-        )
-        .await;
-
-        assert!(matches!(
-            action,
-            HookAction::Terminate { ref reason }
-            if reason == SpacebotHook::MEMORY_PERSISTENCE_CONTRACT_REASON
-        ));
-    }
-
-    #[tokio::test]
-    async fn memory_persistence_saved_outcome_accepts_real_memory_save_ids() {
-        let (hook, contract_state) = make_memory_persistence_hook();
-        let prompt = prompt_message();
-        hook.set_completion_contract_request_active(true);
-
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
-            &hook,
-            "memory_save",
-            None,
-            "internal_1",
-            "{}",
-            "{\"success\":true,\"memory_id\":\"mem_real_1\"}",
-        )
-        .await;
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
-            &hook,
-            "memory_save",
-            None,
-            "internal_2",
-            "{}",
-            "{\"success\":true,\"memory_id\":\"mem_real_2\"}",
-        )
-        .await;
-
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
-            &hook,
-            "memory_persistence_complete",
-            None,
-            "internal_3",
-            "{}",
-            "{\"success\":true,\"outcome\":\"saved\",\"saved_memory_ids\":[\"mem_real_1\",\"mem_real_2\"]}",
-        )
-        .await;
-
-        assert!(contract_state.has_terminal_outcome());
-
-        let _ =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
-            &hook,
-            &prompt,
-            &text_response("Persisted memories."),
-        )
-        .await;
-
-        assert!(matches!(action, HookAction::Continue));
-    }
-
-    #[tokio::test]
-    async fn memory_persistence_no_memories_outcome_is_accepted_without_saves() {
-        let (hook, contract_state) = make_memory_persistence_hook();
-        let prompt = prompt_message();
-        hook.set_completion_contract_request_active(true);
-
-        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
-            &hook,
-            "memory_persistence_complete",
-            None,
-            "internal_1",
-            "{}",
-            "{\"success\":true,\"outcome\":\"no_memories\",\"saved_memory_ids\":[],\"reason\":\"No durable facts found\"}",
-        )
-        .await;
-
-        assert!(contract_state.has_terminal_outcome());
-
-        let _ =
-            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
-                .await;
-        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
-            &hook,
-            &prompt,
-            &text_response("No memories persisted."),
-        )
-        .await;
-
-        assert!(matches!(action, HookAction::Continue));
     }
 }

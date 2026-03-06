@@ -49,6 +49,12 @@ export interface OutboundMessageDeltaEvent {
 	aggregated_text: string;
 }
 
+export interface OutboundStreamEndEvent {
+	type: "outbound_stream_end";
+	agent_id: string;
+	channel_id: string;
+}
+
 export interface TypingStateEvent {
 	type: "typing_state";
 	agent_id: string;
@@ -166,6 +172,7 @@ export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
 	| OutboundMessageDeltaEvent
+	| OutboundStreamEndEvent
 	| TypingStateEvent
 	| WorkerStartedEvent
 	| WorkerStatusEvent
