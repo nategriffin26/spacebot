@@ -486,10 +486,20 @@ impl ProcessRunLogger {
 
     /// Record a worker completing with its result. Fire-and-forget.
     pub fn log_worker_completed(&self, worker_id: WorkerId, result: &str, success: bool) {
+        let status = if success { "done" } else { "failed" };
+        self.log_worker_completed_with_status(worker_id, result, status);
+    }
+
+    /// Record a worker as cancelled. Fire-and-forget.
+    pub fn log_worker_cancelled(&self, worker_id: WorkerId, result: &str) {
+        self.log_worker_completed_with_status(worker_id, result, "cancelled");
+    }
+
+    fn log_worker_completed_with_status(&self, worker_id: WorkerId, result: &str, status: &str) {
         let pool = self.pool.clone();
         let id = worker_id.to_string();
         let result = result.to_string();
-        let status = if success { "done" } else { "failed" };
+        let status = status.to_string();
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
