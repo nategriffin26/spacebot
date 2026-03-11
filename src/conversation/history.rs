@@ -716,7 +716,7 @@ impl ProcessRunLogger {
                      WHEN result IS NULL OR result = '' THEN 'Worker cancelled' \
                      ELSE result \
                  END, \
-                 status = 'failed', \
+                 status = 'cancelled', \
                  completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
              WHERE id = ? AND channel_id = ? AND status = 'running'",
         )
@@ -742,7 +742,7 @@ impl ProcessRunLogger {
                      WHEN result IS NULL OR result = '' THEN 'Worker cancelled' \
                      ELSE result \
                  END, \
-                 status = 'failed', \
+                 status = 'cancelled', \
                  completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
              WHERE id = ? AND channel_id IS NULL AND status = 'running'",
         )
@@ -1096,7 +1096,36 @@ mod tests {
 
         let status: String = sqlx::Row::try_get(&row, "status").expect("missing status");
         let result: String = sqlx::Row::try_get(&row, "result").expect("missing result");
-        assert_eq!(status, "failed");
+        assert_eq!(status, "cancelled");
+        assert_eq!(result, "Worker cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_running_worker_sets_cancelled_status() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+            .bind(worker_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("insert");
+
+        let cancelled = logger
+            .cancel_running_worker("ch-1", worker_id)
+            .await
+            .expect("cancel should succeed");
+        assert!(cancelled);
+
+        let row = sqlx::query("SELECT status, result FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("fetch");
+        let status: String = sqlx::Row::try_get(&row, "status").expect("status");
+        let result: String = sqlx::Row::try_get(&row, "result").expect("result");
+        assert_eq!(status, "cancelled");
         assert_eq!(result, "Worker cancelled");
     }
 
