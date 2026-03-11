@@ -96,6 +96,68 @@ impl DiscordAdapter {
             })
             .map(MessageId::new)
     }
+
+    async fn send_text_chunks(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        reply_to: Option<MessageId>,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let chunks = split_message(text, 2000);
+        self.send_text_chunk_slice(http, channel_id, reply_to, &chunks)
+            .await
+    }
+
+    async fn send_text_chunk_slice(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        reply_to: Option<MessageId>,
+        chunks: &[String],
+    ) -> anyhow::Result<()> {
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut builder = CreateMessage::new().content(chunk);
+            if index == 0
+                && let Some(reply_message_id) = reply_to
+            {
+                builder = builder.reference_message((channel_id, reply_message_id));
+            }
+            channel_id
+                .send_message(http, builder)
+                .await
+                .context("failed to send discord message")?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_broadcast_text_chunks(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let chunks = split_message(text, 2000);
+        self.send_broadcast_chunk_slice(http, channel_id, &chunks)
+            .await
+    }
+
+    async fn send_broadcast_chunk_slice(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        chunks: &[String],
+    ) -> anyhow::Result<()> {
+        for chunk in chunks {
+            channel_id
+                .say(http, chunk)
+                .await
+                .context("failed to broadcast discord message")?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Messaging for DiscordAdapter {
@@ -149,19 +211,8 @@ impl Messaging for DiscordAdapter {
             OutboundResponse::Text(text) => {
                 self.stop_typing(message).await;
                 let reply_to = Self::extract_reply_message_id(message);
-
-                for (index, chunk) in split_message(&text, 2000).into_iter().enumerate() {
-                    let mut builder = CreateMessage::new().content(chunk);
-                    if index == 0
-                        && let Some(reply_message_id) = reply_to
-                    {
-                        builder = builder.reference_message((channel_id, reply_message_id));
-                    }
-                    channel_id
-                        .send_message(&*http, builder)
-                        .await
-                        .context("failed to send discord message")?;
-                }
+                self.send_text_chunks(&http, channel_id, reply_to, &text)
+                    .await?;
             }
             OutboundResponse::RichMessage {
                 mut text,
@@ -203,6 +254,10 @@ impl Messaging for DiscordAdapter {
                 };
 
                 let chunks = split_message(&text, 2000);
+                let poll_payload = poll.as_ref().and_then(build_poll);
+                if poll.is_some() && poll_payload.is_none() {
+                    tracing::warn!("dropping invalid discord poll payload before send");
+                }
                 for (i, chunk) in chunks.iter().enumerate() {
                     let is_last = i == chunks.len() - 1;
                     let mut msg = CreateMessage::new();
@@ -223,8 +278,8 @@ impl Messaging for DiscordAdapter {
                             msg = msg.components(components);
                         }
 
-                        if let Some(poll_data) = &poll {
-                            msg = msg.poll(build_poll(poll_data));
+                        if let Some(poll_builder) = poll_payload.clone() {
+                            msg = msg.poll(poll_builder);
                         }
                     }
 
@@ -234,10 +289,26 @@ impl Messaging for DiscordAdapter {
                         msg = msg.reference_message((channel_id, reply_message_id));
                     }
 
-                    channel_id
-                        .send_message(&*http, msg)
+                    if let Err(error) = channel_id.send_message(&*http, msg).await {
+                        tracing::warn!(
+                            %error,
+                            content_len = text.len(),
+                            embed_count = cards.len(),
+                            interactive_count = interactive_elements.len(),
+                            has_poll = poll.is_some(),
+                            "discord rich message failed; falling back to plain text"
+                        );
+                        let remaining_reply_target = if i == 0 { reply_to } else { None };
+                        self.send_text_chunk_slice(
+                            &http,
+                            channel_id,
+                            remaining_reply_target,
+                            &chunks[i..],
+                        )
                         .await
-                        .context("failed to send discord rich message")?;
+                        .context("failed to send discord rich message fallback")?;
+                        break;
+                    }
                 }
             }
             OutboundResponse::ThreadReply { thread_name, text } => {
@@ -441,12 +512,8 @@ impl Messaging for DiscordAdapter {
         };
 
         if let OutboundResponse::Text(text) = response {
-            for chunk in split_message(&text, 2000) {
-                channel_id
-                    .say(&*http, &chunk)
-                    .await
-                    .context("failed to broadcast discord message")?;
-            }
+            self.send_broadcast_text_chunks(&http, channel_id, &text)
+                .await?;
         } else if let OutboundResponse::RichMessage {
             mut text,
             cards,
@@ -484,6 +551,10 @@ impl Messaging for DiscordAdapter {
             };
 
             let chunks = split_message(&text, 2000);
+            let poll_payload = poll.as_ref().and_then(build_poll);
+            if poll.is_some() && poll_payload.is_none() {
+                tracing::warn!("dropping invalid discord poll payload before broadcast");
+            }
             for (i, chunk) in chunks.iter().enumerate() {
                 let is_last = i == chunks.len() - 1;
                 let mut msg = CreateMessage::new();
@@ -504,15 +575,25 @@ impl Messaging for DiscordAdapter {
                         msg = msg.components(components);
                     }
 
-                    if let Some(poll_data) = &poll {
-                        msg = msg.poll(build_poll(poll_data));
+                    if let Some(poll_builder) = poll_payload.clone() {
+                        msg = msg.poll(poll_builder);
                     }
                 }
 
-                channel_id
-                    .send_message(&*http, msg)
-                    .await
-                    .context("failed to broadcast discord rich message")?;
+                if let Err(error) = channel_id.send_message(&*http, msg).await {
+                    tracing::warn!(
+                        %error,
+                        content_len = text.len(),
+                        embed_count = cards.len(),
+                        interactive_count = interactive_elements.len(),
+                        has_poll = poll.is_some(),
+                        "discord rich broadcast failed; falling back to plain text"
+                    );
+                    self.send_broadcast_chunk_slice(&http, channel_id, &chunks[i..])
+                        .await
+                        .context("failed to send discord rich broadcast fallback")?;
+                    break;
+                }
             }
         }
 
@@ -1058,30 +1139,116 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
 
 // --- Rich Message Builders ---
 
+fn truncate_for_discord(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+
+    value[..value.floor_char_boundary(max_len)].to_string()
+}
+
+fn truncate_with_ellipsis(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+
+    if max_len <= 3 {
+        return truncate_for_discord(value, max_len);
+    }
+
+    let prefix_len = max_len - 3;
+    format!("{}...", &value[..value.floor_char_boundary(prefix_len)])
+}
+
+fn sanitize_optional_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(truncate_for_discord(trimmed, 512))
+    } else {
+        None
+    }
+}
+
+fn sanitize_poll(poll: &crate::Poll) -> Option<crate::Poll> {
+    let question = truncate_with_ellipsis(poll.question.trim(), 300);
+    if question.is_empty() {
+        return None;
+    }
+
+    let answers: Vec<String> = poll
+        .answers
+        .iter()
+        .map(|answer| truncate_with_ellipsis(answer.trim(), 55))
+        .filter(|answer| !answer.is_empty())
+        .take(10)
+        .collect();
+
+    if answers.is_empty() {
+        return None;
+    }
+
+    Some(crate::Poll {
+        question,
+        answers,
+        allow_multiselect: poll.allow_multiselect,
+        duration_hours: poll.duration_hours.clamp(1, 720),
+    })
+}
+
 fn build_embed(card: &crate::Card) -> CreateEmbed {
     let mut embed = CreateEmbed::new();
+    let mut remaining_budget = 6000usize;
 
     if let Some(title) = &card.title {
-        embed = embed.title(title);
+        let sanitized = truncate_with_ellipsis(title.trim(), 256);
+        remaining_budget = remaining_budget.saturating_sub(sanitized.len());
+        embed = embed.title(sanitized);
     }
     if let Some(desc) = &card.description {
-        embed = embed.description(desc);
+        let max_description = remaining_budget.min(4096);
+        if max_description > 0 {
+            let sanitized = truncate_with_ellipsis(desc.trim(), max_description);
+            remaining_budget = remaining_budget.saturating_sub(sanitized.len());
+            embed = embed.description(sanitized);
+        }
     }
     if let Some(color) = card.color {
         embed = embed.color(color);
     }
-    if let Some(url) = &card.url {
-        embed = embed.url(url);
+    if let Some(url) = &card.url
+        && let Some(sanitized) = sanitize_optional_url(url)
+    {
+        embed = embed.url(sanitized);
     }
     if let Some(footer) = &card.footer {
-        embed = embed.footer(CreateEmbedFooter::new(footer));
+        let max_footer = remaining_budget.min(2048);
+        if max_footer > 0 {
+            let sanitized = truncate_with_ellipsis(footer.trim(), max_footer);
+            remaining_budget = remaining_budget.saturating_sub(sanitized.len());
+            embed = embed.footer(CreateEmbedFooter::new(sanitized));
+        }
     }
 
     for (i, field) in card.fields.iter().enumerate() {
-        if i >= 25 {
+        if i >= 25 || remaining_budget == 0 {
             break; // Discord limit: max 25 fields per embed
         }
-        embed = embed.field(&field.name, &field.value, field.inline);
+
+        let max_name = remaining_budget.min(256);
+        if max_name == 0 {
+            break;
+        }
+        let field_name = truncate_with_ellipsis(field.name.trim(), max_name);
+        remaining_budget = remaining_budget.saturating_sub(field_name.len());
+
+        let max_value = remaining_budget.min(1024);
+        if max_value == 0 {
+            break;
+        }
+        let field_value = truncate_with_ellipsis(field.value.trim(), max_value);
+        remaining_budget = remaining_budget.saturating_sub(field_value.len());
+
+        embed = embed.field(field_name, field_value, field.inline);
     }
 
     embed
@@ -1101,7 +1268,11 @@ fn build_action_row(elements: &crate::InteractiveElements) -> CreateActionRow {
                         let Some(url) = btn.url.as_deref() else {
                             continue;
                         };
-                        CreateButton::new_link(url).label(&btn.label)
+                        let Some(url) = sanitize_optional_url(url) else {
+                            continue;
+                        };
+                        CreateButton::new_link(url)
+                            .label(truncate_with_ellipsis(btn.label.trim(), 80))
                     }
                     style => {
                         let serenity_style = match style {
@@ -1115,7 +1286,7 @@ fn build_action_row(elements: &crate::InteractiveElements) -> CreateActionRow {
                         // Discord limit: custom_id max 100 characters.
                         let custom_id = &custom_id[..custom_id.floor_char_boundary(100)];
                         CreateButton::new(custom_id)
-                            .label(&btn.label)
+                            .label(truncate_with_ellipsis(btn.label.trim(), 80))
                             .style(serenity_style)
                     }
                 };
@@ -1126,10 +1297,13 @@ fn build_action_row(elements: &crate::InteractiveElements) -> CreateActionRow {
         }
         crate::InteractiveElements::Select { select } => {
             let mut options = Vec::new();
-            for opt in &select.options {
-                let mut discord_opt = CreateSelectMenuOption::new(&opt.label, &opt.value);
+            for opt in select.options.iter().take(25) {
+                let mut discord_opt = CreateSelectMenuOption::new(
+                    truncate_with_ellipsis(opt.label.trim(), 100),
+                    truncate_with_ellipsis(opt.value.trim(), 100),
+                );
                 if let Some(desc) = &opt.description {
-                    discord_opt = discord_opt.description(desc);
+                    discord_opt = discord_opt.description(truncate_with_ellipsis(desc.trim(), 100));
                 }
                 // (Emoji not mapped for now)
                 options.push(discord_opt);
@@ -1141,7 +1315,8 @@ fn build_action_row(elements: &crate::InteractiveElements) -> CreateActionRow {
             let mut discord_select =
                 CreateSelectMenu::new(custom_id, CreateSelectMenuKind::String { options });
             if let Some(placeholder) = &select.placeholder {
-                discord_select = discord_select.placeholder(placeholder);
+                discord_select =
+                    discord_select.placeholder(truncate_with_ellipsis(placeholder.trim(), 150));
             }
 
             CreateActionRow::SelectMenu(discord_select)
@@ -1151,29 +1326,26 @@ fn build_action_row(elements: &crate::InteractiveElements) -> CreateActionRow {
 
 fn build_poll(
     poll: &crate::Poll,
-) -> serenity::builder::CreatePoll<serenity::builder::create_poll::Ready> {
-    // Discord limits: max 10 answers
-    let answers: Vec<_> = poll
+) -> Option<serenity::builder::CreatePoll<serenity::builder::create_poll::Ready>> {
+    let sanitized = sanitize_poll(poll)?;
+    let answers: Vec<_> = sanitized
         .answers
         .iter()
-        .take(10)
-        .map(|a| CreatePollAnswer::new().text(a))
+        .map(|answer| CreatePollAnswer::new().text(answer))
         .collect();
 
-    // Duration must be at least 1 hour, usually up to 720 hours (30 days).
-    // The builder just takes std::time::Duration but it has specific allowed values.
-    let hours = poll.duration_hours.clamp(1, 720);
-
     let mut p = CreatePoll::new()
-        .question(&poll.question)
+        .question(sanitized.question)
         .answers(answers)
-        .duration(std::time::Duration::from_secs((hours as u64) * 3600));
+        .duration(std::time::Duration::from_secs(
+            (sanitized.duration_hours as u64) * 3600,
+        ));
 
-    if poll.allow_multiselect {
+    if sanitized.allow_multiselect {
         p = p.allow_multiselect();
     }
 
-    p
+    Some(p)
 }
 
 #[cfg(test)]
@@ -1236,5 +1408,49 @@ mod tests {
         // build_poll should limit answers to 10 and duration to 720
         let _ = build_poll(&poll);
         // Again, can't easily inspect CreatePoll fields, but we verify it runs.
+    }
+
+    #[test]
+    fn truncate_helpers_respect_discord_boundaries() {
+        let value = "a".repeat(300);
+        assert_eq!(truncate_for_discord(&value, 256).len(), 256);
+        assert_eq!(truncate_with_ellipsis(&value, 80).len(), 80);
+    }
+
+    #[test]
+    fn sanitize_optional_url_rejects_non_http_urls() {
+        assert!(sanitize_optional_url("https://example.com").is_some());
+        assert!(sanitize_optional_url("http://example.com").is_some());
+        assert!(sanitize_optional_url("ftp://example.com").is_none());
+        assert!(sanitize_optional_url("not-a-url").is_none());
+    }
+
+    #[test]
+    fn sanitize_poll_drops_blank_payloads() {
+        let poll = Poll {
+            question: "   ".into(),
+            answers: vec!["   ".into()],
+            allow_multiselect: false,
+            duration_hours: 1,
+        };
+
+        assert!(sanitize_poll(&poll).is_none());
+        assert!(build_poll(&poll).is_none());
+    }
+
+    #[test]
+    fn sanitize_poll_keeps_only_non_empty_answers() {
+        let poll = Poll {
+            question: "Which path?".into(),
+            answers: vec![" first ".into(), "   ".into(), "second".into()],
+            allow_multiselect: true,
+            duration_hours: 0,
+        };
+
+        let sanitized = sanitize_poll(&poll).expect("poll should sanitize");
+        assert_eq!(sanitized.question, "Which path?");
+        assert_eq!(sanitized.answers, vec!["first", "second"]);
+        assert_eq!(sanitized.duration_hours, 1);
+        assert!(sanitized.allow_multiselect);
     }
 }
