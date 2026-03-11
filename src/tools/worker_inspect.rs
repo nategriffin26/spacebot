@@ -207,6 +207,7 @@ impl WorkerInspectTool {
                 "running" => "[running]",
                 "done" => "[done]",
                 "failed" => "[failed]",
+                "cancelled" => "[cancelled]",
                 _ => "[-]",
             };
             summary.push_str(&format!(

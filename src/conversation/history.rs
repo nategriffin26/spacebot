@@ -503,7 +503,7 @@ impl ProcessRunLogger {
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "UPDATE worker_runs SET result = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?"
+                "UPDATE worker_runs SET result = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND completed_at IS NULL"
             )
             .bind(&result)
             .bind(status)
