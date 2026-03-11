@@ -417,7 +417,7 @@ Read the full vision in the [roadmap](docs/content/docs/(deployment)/roadmap.mdx
 ### Prerequisites
 
 - **Rust** 1.85+ ([rustup](https://rustup.rs/))
-- An LLM API key from any supported provider (Anthropic, OpenAI, OpenRouter, Kilo Gateway, Z.ai, Groq, Together, Fireworks, DeepSeek, xAI, Mistral, NVIDIA, MiniMax, Moonshot AI, OpenCode Zen, OpenCode Go) — or use `spacebot auth login` for Anthropic OAuth
+- An LLM API key from any supported provider (Anthropic, OpenAI, OpenRouter, Kilo Gateway, Z.ai, Groq, Together, Fireworks, DeepSeek, xAI, Mistral, NVIDIA, MiniMax, Moonshot AI, OpenCode Zen, OpenCode Go) — or use `spacebot auth login` for Anthropic OAuth / `spacebot auth login --provider openai` for ChatGPT OAuth
 
 ### Build and Run
 
@@ -469,23 +469,37 @@ spacebot stop                 # graceful shutdown
 spacebot restart              # stop + start
 spacebot status               # show pid and uptime
 spacebot auth login           # authenticate via Anthropic OAuth
+spacebot auth login --provider openai --model openai-chatgpt/gpt-5.4
 ```
 
 The binary creates all databases and directories automatically on first run. See the [quickstart guide](docs/content/docs/(getting-started)/quickstart.mdx) for more detail.
 
 ### Authentication
 
-Spacebot supports Anthropic OAuth as an alternative to static API keys. Use your Claude Pro, Max, or API Console subscription directly:
+Spacebot supports OAuth for Anthropic and ChatGPT-backed OpenAI access as alternatives to static API keys.
+
+Use your Claude Pro, Max, or API Console subscription directly:
 
 ```bash
 spacebot auth login             # OAuth via Claude Pro/Max (opens browser)
 spacebot auth login --console   # OAuth via API Console
-spacebot auth status            # show credential status and expiry
-spacebot auth refresh           # manually refresh the access token
-spacebot auth logout            # remove stored credentials
+spacebot auth status            # show Anthropic credential status and expiry
+spacebot auth refresh           # manually refresh the Anthropic access token
+spacebot auth logout            # remove Anthropic credentials
 ```
 
 OAuth tokens are stored in `anthropic_oauth.json` and auto-refresh transparently before each API call. When OAuth credentials are present, they take priority over a static `ANTHROPIC_API_KEY`.
+
+Use your ChatGPT subscription directly for `openai-chatgpt/<model>` routing:
+
+```bash
+spacebot auth login --provider openai --model openai-chatgpt/gpt-5.4
+spacebot auth status --provider openai
+spacebot auth refresh --provider openai
+spacebot auth logout --provider openai
+```
+
+OpenAI OAuth tokens are stored in `openai_chatgpt_oauth.json` and auto-refresh before each call to the ChatGPT Codex backend. The login flow uses a device code and updates `config.toml` routing to the selected `openai-chatgpt/...` model after sign-in completes.
 
 ---
 

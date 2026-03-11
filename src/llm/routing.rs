@@ -213,8 +213,8 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
             }
         }
         "openai-chatgpt" => {
-            let channel: String = "openai-chatgpt/gpt-4.1".into();
-            let worker: String = "openai-chatgpt/gpt-4.1-mini".into();
+            let channel: String = "openai-chatgpt/gpt-5.4".into();
+            let worker: String = "openai-chatgpt/gpt-5-mini".into();
             RoutingConfig {
                 channel: channel.clone(),
                 branch: channel.clone(),
@@ -452,4 +452,31 @@ pub const RETRY_BASE_DELAY_MS: u64 = 500;
 pub fn is_rate_limit_error(error_message: &str) -> bool {
     let lower = error_message.to_lowercase();
     lower.contains("429") || lower.contains("rate limit")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::defaults_for_provider;
+
+    #[test]
+    fn openai_chatgpt_defaults_use_gpt_5_4_primary_model() {
+        let routing = defaults_for_provider("openai-chatgpt");
+
+        assert_eq!(routing.channel, "openai-chatgpt/gpt-5.4");
+        assert_eq!(routing.branch, "openai-chatgpt/gpt-5.4");
+        assert_eq!(routing.worker, "openai-chatgpt/gpt-5-mini");
+        assert_eq!(routing.compactor, "openai-chatgpt/gpt-5-mini");
+        assert_eq!(routing.cortex, "openai-chatgpt/gpt-5-mini");
+        assert_eq!(
+            routing.task_overrides.get("coding").map(String::as_str),
+            Some("openai-chatgpt/gpt-5.4")
+        );
+        assert_eq!(
+            routing
+                .fallbacks
+                .get("openai-chatgpt/gpt-5.4")
+                .map(Vec::as_slice),
+            Some(&["openai-chatgpt/gpt-5-mini".to_string()][..])
+        );
+    }
 }

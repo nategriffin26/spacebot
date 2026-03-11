@@ -2,7 +2,7 @@
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 
 use std::collections::HashMap;
@@ -56,18 +56,42 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AuthCommand {
-    /// Log in to Anthropic via OAuth (opens browser)
+    /// Log in to a provider via OAuth (opens browser or device flow)
     Login {
+        /// OAuth provider to use
+        #[arg(long, value_enum, default_value_t = AuthProvider::Anthropic)]
+        provider: AuthProvider,
         /// Use API console instead of Claude Pro/Max
         #[arg(long)]
         console: bool,
+        /// Model to apply to routing after OpenAI OAuth completes
+        #[arg(long, default_value = "openai-chatgpt/gpt-5.4")]
+        model: String,
     },
     /// Show current auth status
-    Status,
+    Status {
+        /// OAuth provider to inspect
+        #[arg(long, value_enum, default_value_t = AuthProvider::Anthropic)]
+        provider: AuthProvider,
+    },
     /// Log out (remove stored credentials)
-    Logout,
+    Logout {
+        /// OAuth provider to remove
+        #[arg(long, value_enum, default_value_t = AuthProvider::Anthropic)]
+        provider: AuthProvider,
+    },
     /// Refresh the access token
-    Refresh,
+    Refresh {
+        /// OAuth provider to refresh
+        #[arg(long, value_enum, default_value_t = AuthProvider::Anthropic)]
+        provider: AuthProvider,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AuthProvider {
+    Anthropic,
+    Openai,
 }
 
 #[derive(Subcommand)]
@@ -502,62 +526,297 @@ fn cmd_auth(config_path: Option<std::path::PathBuf>, auth_cmd: AuthCommand) -> a
 
     runtime.block_on(async {
         match auth_cmd {
-            AuthCommand::Login { console } => {
-                let mode = if console {
-                    spacebot::auth::AuthMode::Console
-                } else {
-                    spacebot::auth::AuthMode::Max
-                };
-                spacebot::auth::login_interactive(&instance_dir, mode).await?;
-                Ok(())
-            }
-            AuthCommand::Status => {
-                match spacebot::auth::load_credentials(&instance_dir)? {
-                    Some(creds) => {
-                        let expires_in = creds.expires_at - chrono::Utc::now().timestamp_millis();
-                        let expires_min = expires_in / 60_000;
-                        if creds.is_expired() {
-                            eprintln!("Anthropic OAuth: expired ({}m ago)", -expires_min);
-                        } else {
-                            eprintln!("Anthropic OAuth: valid (expires in {}m)", expires_min);
-                        }
-                        eprintln!("  access token: {}...", &creds.access_token[..20]);
-                        eprintln!("  refresh token: {}...", &creds.refresh_token[..20]);
+            AuthCommand::Login {
+                provider,
+                console,
+                model,
+            } => match provider {
+                AuthProvider::Anthropic => {
+                    if model != "openai-chatgpt/gpt-5.4" {
                         eprintln!(
-                            "  credentials file: {}",
-                            spacebot::auth::credentials_path(&instance_dir).display()
+                            "Ignoring --model for Anthropic OAuth; it only applies to OpenAI OAuth."
                         );
                     }
-                    None => {
-                        eprintln!("No OAuth credentials found.");
-                        eprintln!("Run `spacebot auth login` to authenticate.");
+                    let mode = if console {
+                        spacebot::auth::AuthMode::Console
+                    } else {
+                        spacebot::auth::AuthMode::Max
+                    };
+                    spacebot::auth::login_interactive(&instance_dir, mode).await?;
+                    Ok(())
+                }
+                AuthProvider::Openai => {
+                    if console {
+                        anyhow::bail!("--console is only supported for Anthropic OAuth");
                     }
+                    login_openai_interactive(&instance_dir, &model).await
                 }
-                Ok(())
-            }
-            AuthCommand::Logout => {
-                let path = spacebot::auth::credentials_path(&instance_dir);
-                if path.exists() {
-                    std::fs::remove_file(&path)?;
-                    eprintln!("Credentials removed.");
-                } else {
-                    eprintln!("No credentials found.");
-                }
-                Ok(())
-            }
-            AuthCommand::Refresh => {
-                let creds = spacebot::auth::load_credentials(&instance_dir)?
-                    .context("no credentials found — run `spacebot auth login` first")?;
-                eprintln!("Refreshing access token...");
-                let new_creds = creds.refresh().await.context("refresh failed")?;
-                spacebot::auth::save_credentials(&instance_dir, &new_creds)?;
-                let expires_min =
-                    (new_creds.expires_at - chrono::Utc::now().timestamp_millis()) / 60_000;
-                eprintln!("Token refreshed (expires in {}m)", expires_min);
-                Ok(())
-            }
+            },
+            AuthCommand::Status { provider } => match provider {
+                AuthProvider::Anthropic => print_anthropic_auth_status(&instance_dir),
+                AuthProvider::Openai => print_openai_auth_status(&instance_dir),
+            },
+            AuthCommand::Logout { provider } => match provider {
+                AuthProvider::Anthropic => logout_auth_provider(
+                    &spacebot::auth::credentials_path(&instance_dir),
+                    "Anthropic OAuth",
+                ),
+                AuthProvider::Openai => logout_auth_provider(
+                    &spacebot::openai_auth::credentials_path(&instance_dir),
+                    "OpenAI OAuth",
+                ),
+            },
+            AuthCommand::Refresh { provider } => match provider {
+                AuthProvider::Anthropic => refresh_anthropic_auth(&instance_dir).await,
+                AuthProvider::Openai => refresh_openai_auth(&instance_dir).await,
+            },
         }
     })
+}
+
+fn print_anthropic_auth_status(instance_dir: &std::path::Path) -> anyhow::Result<()> {
+    match spacebot::auth::load_credentials(instance_dir)? {
+        Some(creds) => {
+            let expires_in = creds.expires_at - chrono::Utc::now().timestamp_millis();
+            let expires_min = expires_in / 60_000;
+            if creds.is_expired() {
+                eprintln!("Anthropic OAuth: expired ({}m ago)", -expires_min);
+            } else {
+                eprintln!("Anthropic OAuth: valid (expires in {}m)", expires_min);
+            }
+            eprintln!("  access token: {}...", redact_token(&creds.access_token));
+            eprintln!("  refresh token: {}...", redact_token(&creds.refresh_token));
+            eprintln!(
+                "  credentials file: {}",
+                spacebot::auth::credentials_path(instance_dir).display()
+            );
+        }
+        None => {
+            eprintln!("No Anthropic OAuth credentials found.");
+            eprintln!("Run `spacebot auth login` to authenticate.");
+        }
+    }
+    Ok(())
+}
+
+fn print_openai_auth_status(instance_dir: &std::path::Path) -> anyhow::Result<()> {
+    match spacebot::openai_auth::load_credentials(instance_dir)? {
+        Some(creds) => {
+            let expires_in = creds.expires_at - chrono::Utc::now().timestamp_millis();
+            let expires_min = expires_in / 60_000;
+            if creds.is_expired() {
+                eprintln!("OpenAI OAuth: expired ({}m ago)", -expires_min);
+            } else {
+                eprintln!("OpenAI OAuth: valid (expires in {}m)", expires_min);
+            }
+            eprintln!("  access token: {}...", redact_token(&creds.access_token));
+            eprintln!("  refresh token: {}...", redact_token(&creds.refresh_token));
+            if let Some(account_id) = creds.account_id.as_deref() {
+                eprintln!("  account id: {account_id}");
+            }
+            eprintln!(
+                "  credentials file: {}",
+                spacebot::openai_auth::credentials_path(instance_dir).display()
+            );
+        }
+        None => {
+            eprintln!("No OpenAI OAuth credentials found.");
+            eprintln!("Run `spacebot auth login --provider openai` to authenticate.");
+        }
+    }
+    Ok(())
+}
+
+fn logout_auth_provider(path: &std::path::Path, label: &str) -> anyhow::Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+        eprintln!("{label} credentials removed.");
+    } else {
+        eprintln!("No {label} credentials found.");
+    }
+    Ok(())
+}
+
+async fn refresh_anthropic_auth(instance_dir: &std::path::Path) -> anyhow::Result<()> {
+    let creds = spacebot::auth::load_credentials(instance_dir)?
+        .context("no credentials found — run `spacebot auth login` first")?;
+    eprintln!("Refreshing Anthropic access token...");
+    let new_creds = creds.refresh().await.context("refresh failed")?;
+    spacebot::auth::save_credentials(instance_dir, &new_creds)?;
+    let expires_min = (new_creds.expires_at - chrono::Utc::now().timestamp_millis()) / 60_000;
+    eprintln!("Token refreshed (expires in {}m)", expires_min);
+    Ok(())
+}
+
+async fn refresh_openai_auth(instance_dir: &std::path::Path) -> anyhow::Result<()> {
+    let creds = spacebot::openai_auth::load_credentials(instance_dir)?
+        .context("no credentials found — run `spacebot auth login --provider openai` first")?;
+    eprintln!("Refreshing OpenAI access token...");
+    let new_creds = creds.refresh().await.context("refresh failed")?;
+    spacebot::openai_auth::save_credentials(instance_dir, &new_creds)?;
+    let expires_min = (new_creds.expires_at - chrono::Utc::now().timestamp_millis()) / 60_000;
+    eprintln!("Token refreshed (expires in {}m)", expires_min);
+    Ok(())
+}
+
+async fn login_openai_interactive(
+    instance_dir: &std::path::Path,
+    requested_model: &str,
+) -> anyhow::Result<()> {
+    let model = normalize_openai_chatgpt_model(requested_model).with_context(|| {
+        format!(
+            "invalid OpenAI OAuth model '{requested_model}' - use 'openai/<model>' or 'openai-chatgpt/<model>'"
+        )
+    })?;
+
+    let device_code = spacebot::openai_auth::request_device_code()
+        .await
+        .context("failed to start OpenAI device authorization")?;
+
+    let verification_url = spacebot::openai_auth::device_verification_url(&device_code);
+    let expires_in = device_code.expires_in.unwrap_or(30 * 60);
+    let mut poll_interval_secs = device_code.interval.unwrap_or(5).max(1);
+
+    eprintln!("OpenAI device authorization started.");
+    eprintln!("  verification URL: {verification_url}");
+    eprintln!("  user code: {}", device_code.user_code);
+    eprintln!("  model: {model}");
+    eprintln!("  expires in: {} minutes", expires_in / 60);
+    eprintln!("Open the URL above, enter the code, and approve access.");
+
+    let started_at = chrono::Utc::now().timestamp();
+    let expires_at = started_at + expires_in as i64;
+
+    loop {
+        if chrono::Utc::now().timestamp() >= expires_at {
+            anyhow::bail!("OpenAI device authorization expired before approval");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+
+        match spacebot::openai_auth::poll_device_token(
+            &device_code.device_auth_id,
+            &device_code.user_code,
+        )
+        .await
+        .context("OpenAI device authorization polling failed")?
+        {
+            spacebot::openai_auth::DeviceTokenPollResult::Pending => continue,
+            spacebot::openai_auth::DeviceTokenPollResult::SlowDown => {
+                poll_interval_secs = (poll_interval_secs + 5).min(30);
+            }
+            spacebot::openai_auth::DeviceTokenPollResult::Approved(grant) => {
+                let credentials = spacebot::openai_auth::exchange_device_code(
+                    &grant.authorization_code,
+                    &grant.code_verifier,
+                )
+                .await
+                .context("failed to exchange OpenAI device code")?;
+                spacebot::openai_auth::save_credentials(instance_dir, &credentials)?;
+                update_openai_routing_in_config(instance_dir, &model)?;
+                eprintln!("OpenAI OAuth complete.");
+                eprintln!(
+                    "Saved credentials to {}",
+                    spacebot::openai_auth::credentials_path(instance_dir).display()
+                );
+                eprintln!(
+                    "Updated routing in {}",
+                    instance_dir.join("config.toml").display()
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn update_openai_routing_in_config(
+    instance_dir: &std::path::Path,
+    model: &str,
+) -> anyhow::Result<()> {
+    let config_path = instance_dir.join("config.toml");
+    let content = if config_path.exists() {
+        std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .context("failed to parse config.toml while updating OpenAI OAuth routing")?;
+    apply_model_routing(&mut doc, model);
+    std::fs::write(&config_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn apply_model_routing(doc: &mut toml_edit::DocumentMut, model: &str) {
+    if doc.get("defaults").is_none() {
+        doc["defaults"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    if let Some(defaults) = doc.get_mut("defaults").and_then(|item| item.as_table_mut()) {
+        if defaults.get("routing").is_none() {
+            defaults["routing"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        if let Some(routing_table) = defaults
+            .get_mut("routing")
+            .and_then(|item| item.as_table_mut())
+        {
+            routing_table["channel"] = toml_edit::value(model);
+            routing_table["branch"] = toml_edit::value(model);
+            routing_table["worker"] = toml_edit::value(model);
+            routing_table["compactor"] = toml_edit::value(model);
+            routing_table["cortex"] = toml_edit::value(model);
+        }
+    }
+
+    if let Some(agents) = doc
+        .get_mut("agents")
+        .and_then(|agents_item| agents_item.as_array_of_tables_mut())
+        && let Some(default_agent) = agents.iter_mut().find(|agent| {
+            agent
+                .get("default")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+    {
+        if default_agent.get("routing").is_none() {
+            default_agent["routing"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        if let Some(routing_table) = default_agent
+            .get_mut("routing")
+            .and_then(|routing_item| routing_item.as_table_mut())
+        {
+            routing_table["channel"] = toml_edit::value(model);
+            routing_table["branch"] = toml_edit::value(model);
+            routing_table["worker"] = toml_edit::value(model);
+            routing_table["compactor"] = toml_edit::value(model);
+            routing_table["cortex"] = toml_edit::value(model);
+        }
+    }
+}
+
+fn normalize_openai_chatgpt_model(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    let (provider, model_name) = trimmed.split_once('/')?;
+    if model_name.is_empty() {
+        return None;
+    }
+
+    match provider {
+        "openai" => Some(format!("openai-chatgpt/{model_name}")),
+        "openai-chatgpt" => Some(trimmed.to_string()),
+        _ => None,
+    }
+}
+
+fn redact_token(token: &str) -> &str {
+    let prefix_len = token
+        .char_indices()
+        .nth(20)
+        .map(|(index, _)| index)
+        .unwrap_or(token.len());
+    &token[..prefix_len]
 }
 
 fn cmd_secrets(

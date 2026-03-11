@@ -462,14 +462,24 @@ At least one provider (legacy key or custom provider) must be configured.
 | `worker` | string | `anthropic/claude-haiku-4.5-20250514` | Model for task workers |
 | `compactor` | string | `anthropic/claude-haiku-4.5-20250514` | Model for summarization |
 | `cortex` | string | `anthropic/claude-haiku-4.5-20250514` | Model for system observation |
+| `voice` | string | `""` | Optional model for voice-specific flows |
 | `rate_limit_cooldown_secs` | integer | 60 | How long to deprioritize a rate-limited model |
+| `channel_thinking_effort` | string | `"auto"` | Thinking effort hint for channel model calls |
+| `branch_thinking_effort` | string | `"auto"` | Thinking effort hint for branch model calls |
+| `worker_thinking_effort` | string | `"auto"` | Thinking effort hint for worker model calls |
+| `compactor_thinking_effort` | string | `"auto"` | Thinking effort hint for compactor model calls |
+| `cortex_thinking_effort` | string | `"auto"` | Thinking effort hint for cortex model calls |
 
 Routing selects providers by the prefix before the first `/` in the model name.
+
+`openai-chatgpt/<model>` is a built-in internal provider that uses ChatGPT OAuth credentials from `openai_chatgpt_oauth.json`. Configure it with `spacebot auth login --provider openai` rather than an `[llm]` API key.
 
 ```toml
 [defaults.routing]
 channel = "my_openai/gpt-4o-mini"
 worker = "custom_anthropic/claude-3-5-sonnet"
+channel_thinking_effort = "auto"
+worker_thinking_effort = "low"
 
 [llm.provider.my_openai]
 api_type = "openai_completions"

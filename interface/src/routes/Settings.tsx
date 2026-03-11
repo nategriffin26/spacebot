@@ -252,7 +252,7 @@ const PROVIDERS = [
 	},
 ] as const;
 
-const CHATGPT_OAUTH_DEFAULT_MODEL = "openai-chatgpt/gpt-5.3-codex";
+const CHATGPT_OAUTH_DEFAULT_MODEL = "openai-chatgpt/gpt-5.4";
 
 export function Settings() {
 	const queryClient = useQueryClient();
