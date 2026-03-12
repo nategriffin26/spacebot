@@ -1129,6 +1129,30 @@ mod tests {
         assert_eq!(result, "Worker cancelled");
     }
 
+    /// Poll until a worker's status changes from "running", with a timeout.
+    async fn poll_worker_status(
+        pool: &sqlx::SqlitePool,
+        worker_id: uuid::Uuid,
+        timeout_ms: u64,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let row = sqlx::query("SELECT status FROM worker_runs WHERE id = ?")
+                .bind(worker_id.to_string())
+                .fetch_one(pool)
+                .await
+                .expect("fetch");
+            let status: String = sqlx::Row::try_get(&row, "status").expect("status");
+            if status != "running" {
+                return status;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("worker status did not transition within {timeout_ms}ms");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn log_worker_completed_success_sets_done_status() {
         let pool = setup_worker_runs_table().await;
@@ -1142,16 +1166,15 @@ mod tests {
             .expect("insert");
 
         logger.log_worker_completed(worker_id, "task finished", true);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let status = poll_worker_status(&pool, worker_id, 2000).await;
 
-        let row = sqlx::query("SELECT status, result FROM worker_runs WHERE id = ?")
+        assert_eq!(status, "done");
+        let row = sqlx::query("SELECT result FROM worker_runs WHERE id = ?")
             .bind(worker_id.to_string())
             .fetch_one(&pool)
             .await
             .expect("fetch");
-        let status: String = sqlx::Row::try_get(&row, "status").expect("status");
         let result: String = sqlx::Row::try_get(&row, "result").expect("result");
-        assert_eq!(status, "done");
         assert_eq!(result, "task finished");
     }
 
@@ -1168,14 +1191,8 @@ mod tests {
             .expect("insert");
 
         logger.log_worker_completed(worker_id, "something broke", false);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let status = poll_worker_status(&pool, worker_id, 2000).await;
 
-        let row = sqlx::query("SELECT status FROM worker_runs WHERE id = ?")
-            .bind(worker_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .expect("fetch");
-        let status: String = sqlx::Row::try_get(&row, "status").expect("status");
         assert_eq!(status, "failed");
     }
 
@@ -1192,16 +1209,15 @@ mod tests {
             .expect("insert");
 
         logger.log_worker_cancelled(worker_id, "Worker cancelled: user requested");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let status = poll_worker_status(&pool, worker_id, 2000).await;
 
-        let row = sqlx::query("SELECT status, result FROM worker_runs WHERE id = ?")
+        assert_eq!(status, "cancelled");
+        let row = sqlx::query("SELECT result FROM worker_runs WHERE id = ?")
             .bind(worker_id.to_string())
             .fetch_one(&pool)
             .await
             .expect("fetch");
-        let status: String = sqlx::Row::try_get(&row, "status").expect("status");
         let result: String = sqlx::Row::try_get(&row, "result").expect("result");
-        assert_eq!(status, "cancelled");
         assert_eq!(result, "Worker cancelled: user requested");
     }
 
