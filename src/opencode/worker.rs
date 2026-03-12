@@ -383,6 +383,7 @@ impl OpenCodeWorker {
             };
 
         // Interactive follow-up loop
+        let mut follow_up_failure: Option<String> = None;
         if let Some(mut input_rx) = self.input_rx.take() {
             if resuming {
                 // Resumed worker: go straight to idle without emitting initial result
@@ -456,16 +457,23 @@ impl OpenCodeWorker {
                         self.send_idle();
                     }
                     Err(error) => {
+                        let failure_reason = format!("OpenCode follow-up failed: {error}");
                         tracing::error!(
                             worker_id = %self.id,
                             %error,
                             "OpenCode follow-up failed"
                         );
+                        self.persist_transcript_snapshot(&event_state).await;
                         self.send_status("failed");
+                        follow_up_failure = Some(failure_reason);
                         break;
                     }
                 }
             }
+        }
+
+        if let Some(failure_reason) = follow_up_failure {
+            anyhow::bail!(failure_reason);
         }
 
         self.send_status("completed");

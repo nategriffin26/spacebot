@@ -2586,6 +2586,11 @@ fn collect_openai_text_content(value: &serde_json::Value, text_parts: &mut Vec<S
             {
                 text_parts.push(text.to_string());
             }
+            if let Some(value_text) = map.get("value").and_then(serde_json::Value::as_str)
+                && !value_text.is_empty()
+            {
+                text_parts.push(value_text.to_string());
+            }
             if let Some(summary) = map.get("summary").and_then(serde_json::Value::as_str)
                 && !summary.is_empty()
             {
@@ -2599,6 +2604,9 @@ fn collect_openai_text_content(value: &serde_json::Value, text_parts: &mut Vec<S
 
             if let Some(content) = map.get("content") {
                 collect_openai_text_content(content, text_parts);
+            }
+            if let Some(value) = map.get("value") {
+                collect_openai_text_content(value, text_parts);
             }
         }
         _ => {}
@@ -2670,6 +2678,11 @@ fn extract_text_content_from_responses_output_item(
             {
                 text_parts.push(text.to_string());
             }
+            if let Some(text) = map.get("value").and_then(serde_json::Value::as_str)
+                && !text.is_empty()
+            {
+                text_parts.push(text.to_string());
+            }
             if let Some(summary) = map.get("summary") {
                 collect_openai_text_content(summary, text_parts);
             }
@@ -2678,6 +2691,12 @@ fn extract_text_content_from_responses_output_item(
             }
             if let Some(content) = map.get("content") {
                 extract_text_content_from_responses_output_item(content, text_parts);
+            }
+            if let Some(text) = map.get("text") {
+                extract_text_content_from_responses_output_item(text, text_parts);
+            }
+            if let Some(value) = map.get("value") {
+                extract_text_content_from_responses_output_item(value, text_parts);
             }
         }
         _ => {}
@@ -2741,6 +2760,11 @@ fn parse_openai_responses_response(
                             assistant_content.push(AssistantContent::Text(Text { text }));
                         }
                     }
+                } else {
+                    extract_text_content_from_responses_output_item(
+                        output_item,
+                        &mut fallback_text_parts,
+                    );
                 }
             }
             Some("function_call") => {
@@ -3354,6 +3378,39 @@ mod tests {
             .collect();
 
         assert_eq!(texts, vec!["step 1".to_string(), "step 2".to_string()]);
+    }
+
+    #[test]
+    fn parse_openai_responses_response_parses_message_text_value_shape() {
+        let body = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": {
+                    "type": "text",
+                    "text": {
+                        "value": "Recovered text"
+                    }
+                }
+            }],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 0}
+            }
+        });
+
+        let response =
+            parse_openai_responses_response(body, "OpenAI").expect("value text should parse");
+        let texts: Vec<_> = response
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(texts, vec!["Recovered text".to_string()]);
     }
 
     #[test]

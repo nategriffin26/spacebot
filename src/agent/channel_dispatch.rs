@@ -4,6 +4,7 @@
 //! background processes: `spawn_branch_from_state`, `spawn_worker_from_state`,
 //! and `spawn_opencode_worker_from_state`.
 
+use crate::ProcessType;
 use crate::agent::branch::{Branch, BranchExecutionConfig};
 use crate::agent::channel::ChannelState;
 use crate::agent::channel_prompt::TemporalContext;
@@ -111,6 +112,14 @@ fn build_worker_status_text(
     let temporal_context = TemporalContext::from_runtime(runtime_config);
     let current_time_line = temporal_context.current_time_line();
     Some(system_info.render_for_worker(&current_time_line))
+}
+
+fn resolve_opencode_model(routing: &crate::llm::routing::RoutingConfig) -> String {
+    if let Some(coding_model) = routing.task_overrides.get("coding") {
+        return coding_model.clone();
+    }
+
+    routing.resolve(ProcessType::Worker, None).to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +661,8 @@ async fn spawn_opencode_worker_inner(
     // Build temporal/status context so OpenCode workers get the same system
     // info (time, model, context window) as builtin workers.
     let worker_status_text = build_worker_status_text(rc.as_ref(), &state.deps.sandbox);
+    let routing = rc.routing.load();
+    let opencode_model = resolve_opencode_model(routing.as_ref());
 
     let worker = if interactive {
         let (worker, input_tx) = crate::opencode::OpenCodeWorker::new_interactive(
@@ -672,6 +683,7 @@ async fn spawn_opencode_worker_inner(
             Some(ref prompt) => worker.with_system_prompt(prompt),
             None => worker,
         };
+        let worker = worker.with_model(opencode_model.clone());
         let worker = match &oc_secrets_store {
             Some(store) => worker.with_secrets_store(store.clone()),
             None => worker,
@@ -690,6 +702,7 @@ async fn spawn_opencode_worker_inner(
             Some(ref prompt) => worker.with_system_prompt(prompt),
             None => worker,
         };
+        let worker = worker.with_model(opencode_model.clone());
         let worker = match &oc_secrets_store {
             Some(store) => worker.with_secrets_store(store.clone()),
             None => worker,
@@ -941,6 +954,9 @@ pub async fn resume_idle_worker_into_state(
 
             // Apply builder chain (same as spawn_opencode_worker_from_state).
             let oc_secrets_store = state.deps.runtime_config.secrets.load().as_ref().clone();
+            let routing = state.deps.runtime_config.routing.load();
+            let opencode_model = resolve_opencode_model(routing.as_ref());
+            worker = worker.with_model(opencode_model);
             if let Some(store) = &oc_secrets_store {
                 worker = worker.with_secrets_store(store.clone());
             }
@@ -1148,7 +1164,11 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerCompletionError, map_worker_completion_result, spawn_worker_task};
+    use super::{
+        WorkerCompletionError, map_worker_completion_result, resolve_opencode_model,
+        spawn_worker_task,
+    };
+    use crate::llm::routing::RoutingConfig;
     use crate::{ProcessEvent, WorkerId};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1246,5 +1266,29 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_opencode_model_prefers_explicit_coding_override() {
+        let mut routing = RoutingConfig {
+            worker: "openai-chatgpt/gpt-5.4".into(),
+            ..RoutingConfig::default()
+        };
+        routing
+            .task_overrides
+            .insert("coding".into(), "openai-chatgpt/gpt-5.4".into());
+
+        assert_eq!(resolve_opencode_model(&routing), "openai-chatgpt/gpt-5.4");
+    }
+
+    #[test]
+    fn resolve_opencode_model_falls_back_to_worker_model_without_override() {
+        let mut routing = RoutingConfig {
+            worker: "openai-chatgpt/gpt-5.4".into(),
+            ..RoutingConfig::default()
+        };
+        routing.task_overrides.clear();
+
+        assert_eq!(resolve_opencode_model(&routing), "openai-chatgpt/gpt-5.4");
     }
 }

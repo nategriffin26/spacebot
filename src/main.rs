@@ -850,6 +850,15 @@ fn apply_model_routing(doc: &mut toml_edit::DocumentMut, model: &str) {
             routing_table["worker"] = toml_edit::value(model);
             routing_table["compactor"] = toml_edit::value(model);
             routing_table["cortex"] = toml_edit::value(model);
+            if routing_table.get("task_overrides").is_none() {
+                routing_table["task_overrides"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            if let Some(task_overrides) = routing_table
+                .get_mut("task_overrides")
+                .and_then(|item| item.as_table_mut())
+            {
+                task_overrides["coding"] = toml_edit::value(model);
+            }
         }
     }
 
@@ -875,6 +884,15 @@ fn apply_model_routing(doc: &mut toml_edit::DocumentMut, model: &str) {
             routing_table["worker"] = toml_edit::value(model);
             routing_table["compactor"] = toml_edit::value(model);
             routing_table["cortex"] = toml_edit::value(model);
+            if routing_table.get("task_overrides").is_none() {
+                routing_table["task_overrides"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            if let Some(task_overrides) = routing_table
+                .get_mut("task_overrides")
+                .and_then(|item| item.as_table_mut())
+            {
+                task_overrides["coding"] = toml_edit::value(model);
+            }
         }
     }
 }

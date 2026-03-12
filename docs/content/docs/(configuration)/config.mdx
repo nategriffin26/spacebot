@@ -497,6 +497,7 @@ If no prefix is provided (for example `claude-sonnet-4-20250514`), Spacebot defa
 ### `[defaults.routing.task_overrides]`
 
 Map of task type names to model names. Applied when workers or branches are spawned with a specific task type.
+OpenCode workers use the `coding` override before falling back to the normal worker model.
 
 ```toml
 [defaults.routing.task_overrides]
