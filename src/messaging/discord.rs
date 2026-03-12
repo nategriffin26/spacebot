@@ -1139,7 +1139,7 @@ fn sanitize_poll(poll: &crate::Poll) -> Option<crate::Poll> {
         .take(10)
         .collect();
 
-    if answers.is_empty() {
+    if answers.len() < 2 {
         return None;
     }
 
