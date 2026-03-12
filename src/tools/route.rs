@@ -2,6 +2,7 @@
 
 use crate::WorkerId;
 use crate::agent::channel::ChannelState;
+use crate::tools::TurnActionTracker;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -11,12 +12,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct RouteTool {
     state: ChannelState,
+    turn_action_tracker: TurnActionTracker,
 }
 
 impl RouteTool {
     /// Create a new route tool with access to channel state.
-    pub fn new(state: ChannelState) -> Self {
-        Self { state }
+    pub fn new(state: ChannelState, turn_action_tracker: TurnActionTracker) -> Self {
+        Self {
+            state,
+            turn_action_tracker,
+        }
     }
 }
 
@@ -111,6 +116,7 @@ impl Tool for RouteTool {
                         channel_id = %self.state.channel_id,
                         "message routed to interactive worker (input)"
                     );
+                    self.turn_action_tracker.mark_action("route:input");
 
                     return Ok(RouteOutput {
                         routed: true,
@@ -142,6 +148,7 @@ impl Tool for RouteTool {
                         channel_id = %self.state.channel_id,
                         "context injected into running worker"
                     );
+                    self.turn_action_tracker.mark_action("route:inject");
 
                     return Ok(RouteOutput {
                         routed: true,

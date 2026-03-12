@@ -75,6 +75,39 @@ fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
     )
 }
 
+fn reply_looks_like_deferred_action(reply: &str) -> bool {
+    let normalized = reply.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    [
+        "on it",
+        "fetching ",
+        "running ",
+        "checking ",
+        "looking ",
+        "testing ",
+        "investigating ",
+        "working on ",
+        "trying ",
+        "i'm checking",
+        "i am checking",
+        "i'll check",
+        "i will check",
+        "let me check",
+        "let me look",
+        "i'm fetching",
+        "i am fetching",
+        "i'll fetch",
+        "i will fetch",
+        "will report back",
+        "should hear back shortly",
+    ]
+    .iter()
+    .any(|needle| normalized.starts_with(needle) || normalized.contains(needle))
+}
+
 /// Shared state that channel tools need to act on the channel.
 ///
 /// Wrapped in Arc and passed to tools (branch, spawn_worker, route, cancel)
@@ -1423,7 +1456,7 @@ impl Channel {
         }
 
         // Run agent turn with any image/audio attachments preserved
-        let (result, skip_flag, replied_flag, _) = self
+        let (result, skip_flag, replied_flag, turn_action_tracker, _) = self
             .run_agent_turn(
                 &combined_text,
                 &system_prompt,
@@ -1436,6 +1469,13 @@ impl Channel {
 
         self.handle_agent_result(result, &skip_flag, &replied_flag, false)
             .await;
+        self.maybe_recover_unbacked_action_reply(
+            &combined_text,
+            &system_prompt,
+            &conversation_id,
+            &turn_action_tracker,
+        )
+        .await;
         // Check compaction
         if let Err(error) = self.compactor.check_and_compact().await {
             tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
@@ -1762,8 +1802,8 @@ impl Channel {
             .adapter
             .as_deref()
             .or_else(|| self.current_adapter());
-        let (result, skip_flag, replied_flag, retrigger_reply_preserved) = self
-            .run_agent_turn(
+        let (result, skip_flag, replied_flag, turn_action_tracker, retrigger_reply_preserved) =
+            self.run_agent_turn(
                 &user_text,
                 &system_prompt,
                 &message.conversation_id,
@@ -1775,6 +1815,15 @@ impl Channel {
 
         self.handle_agent_result(result, &skip_flag, &replied_flag, is_retrigger)
             .await;
+        if !is_retrigger {
+            self.maybe_recover_unbacked_action_reply(
+                &user_text,
+                &system_prompt,
+                &message.conversation_id,
+                &turn_action_tracker,
+            )
+            .await;
+        }
 
         // Safety-net: in quiet mode, explicit mention/reply should never be dropped silently.
         if self.listen_only_mode
@@ -2196,10 +2245,12 @@ impl Channel {
         std::result::Result<String, rig::completion::PromptError>,
         crate::tools::SkipFlag,
         crate::tools::RepliedFlag,
+        crate::tools::TurnActionTracker,
         bool,
     )> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
+        let turn_action_tracker = crate::tools::TurnActionTracker::new();
         let allow_direct_reply = !self.suppress_plaintext_fallback();
 
         // Set the originating channel on the delegation tool so task completion
@@ -2216,6 +2267,7 @@ impl Channel {
             conversation_id,
             skip_flag.clone(),
             replied_flag.clone(),
+            turn_action_tracker.clone(),
             self.deps.cron_tool.clone(),
             send_agent_message_tool,
             allow_direct_reply,
@@ -2342,7 +2394,86 @@ impl Channel {
             tracing::warn!(%error, "failed to remove channel tools");
         }
 
-        Ok((result, skip_flag, replied_flag, retrigger_reply_preserved))
+        Ok((
+            result,
+            skip_flag,
+            replied_flag,
+            turn_action_tracker,
+            retrigger_reply_preserved,
+        ))
+    }
+
+    async fn maybe_recover_unbacked_action_reply(
+        &mut self,
+        user_text: &str,
+        system_prompt: &str,
+        conversation_id: &str,
+        turn_action_tracker: &crate::tools::TurnActionTracker,
+    ) {
+        if turn_action_tracker.has_action() {
+            return;
+        }
+
+        let Some(reply_preview) = turn_action_tracker.reply_preview() else {
+            return;
+        };
+
+        if !reply_looks_like_deferred_action(&reply_preview) {
+            return;
+        }
+
+        tracing::warn!(
+            channel_id = %self.id,
+            reply_preview = %reply_preview,
+            "channel sent an action-style reply without calling an action tool; attempting one-shot recovery"
+        );
+
+        let correction = format!(
+            "SYSTEM CORRECTION: In your immediately previous turn, you told the user you were starting work, but you did not call any action tool. User request: {user_text}\nPrevious reply: {reply_preview}\n\nTake the appropriate action now using branch, spawn_worker, route, cancel, cron, or another relevant action tool. Do not send another acknowledgment unless it adds necessary information. If no action is actually appropriate, call skip."
+        );
+
+        match self
+            .run_agent_turn(
+                &correction,
+                system_prompt,
+                conversation_id,
+                Vec::new(),
+                false,
+                self.current_adapter(),
+            )
+            .await
+        {
+            Ok((
+                recovery_result,
+                recovery_skip_flag,
+                recovery_replied_flag,
+                recovery_actions,
+                _,
+            )) => {
+                self.handle_agent_result(
+                    recovery_result,
+                    &recovery_skip_flag,
+                    &recovery_replied_flag,
+                    false,
+                )
+                .await;
+
+                if !recovery_actions.has_action() {
+                    tracing::error!(
+                        channel_id = %self.id,
+                        recovery_actions = %recovery_actions.action_summary(),
+                        "action-recovery turn still failed to call an action tool"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    channel_id = %self.id,
+                    %error,
+                    "failed to run action-recovery turn"
+                );
+            }
+        }
     }
 
     /// Send outbound text and record send metrics.
@@ -3138,7 +3269,9 @@ impl Channel {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_channel_event, should_process_event_for_channel};
+    use super::{
+        recv_channel_event, reply_looks_like_deferred_action, should_process_event_for_channel,
+    };
     use crate::memory::MemoryType;
     use crate::{AgentId, ChannelId, ProcessEvent, ProcessId};
     use std::sync::Arc;
@@ -3281,5 +3414,25 @@ mod tests {
         };
 
         assert!(!should_process_event_for_channel(&event, &channel_id));
+    }
+
+    #[test]
+    fn deferred_action_reply_detector_matches_work_acknowledgements() {
+        assert!(reply_looks_like_deferred_action(
+            "Fetching your bookmarks now..."
+        ));
+        assert!(reply_looks_like_deferred_action(
+            "Let me check the MCP tools and I'll report back."
+        ));
+    }
+
+    #[test]
+    fn deferred_action_reply_detector_ignores_plain_conversation() {
+        assert!(!reply_looks_like_deferred_action(
+            "Hey Nate. I'm here — ready when you are."
+        ));
+        assert!(!reply_looks_like_deferred_action(
+            "The MCP connectivity test already failed earlier."
+        ));
     }
 }

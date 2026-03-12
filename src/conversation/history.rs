@@ -598,7 +598,7 @@ impl ProcessRunLogger {
         agent_id: &str,
     ) -> crate::error::Result<Vec<IdleWorkerRow>> {
         let rows = sqlx::query_as::<_, IdleWorkerRow>(
-            "SELECT id, task, channel_id, worker_type, transcript, \
+            "SELECT id, task, channel_id, worker_type, started_at, transcript, \
                     COALESCE(tool_calls, 0) AS tool_calls, \
                     opencode_session_id, opencode_port, directory \
              FROM worker_runs \
@@ -970,6 +970,7 @@ pub struct IdleWorkerRow {
     pub task: String,
     pub channel_id: Option<String>,
     pub worker_type: String,
+    pub started_at: String,
     pub transcript: Option<Vec<u8>>,
     pub tool_calls: i64,
     pub opencode_session_id: Option<String>,

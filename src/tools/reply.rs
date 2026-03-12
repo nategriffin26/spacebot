@@ -1,6 +1,7 @@
 //! Reply tool for sending messages to users (channel only).
 
 use crate::conversation::ConversationLogger;
+use crate::tools::TurnActionTracker;
 
 use crate::{ChannelId, OutboundResponse};
 use regex::Regex;
@@ -45,6 +46,7 @@ pub struct ReplyTool {
     conversation_logger: ConversationLogger,
     channel_id: ChannelId,
     replied_flag: RepliedFlag,
+    turn_action_tracker: TurnActionTracker,
     agent_display_name: String,
 }
 
@@ -56,6 +58,7 @@ impl ReplyTool {
         conversation_logger: ConversationLogger,
         channel_id: ChannelId,
         replied_flag: RepliedFlag,
+        turn_action_tracker: TurnActionTracker,
         agent_display_name: impl Into<String>,
     ) -> Self {
         Self {
@@ -64,6 +67,7 @@ impl ReplyTool {
             conversation_logger,
             channel_id,
             replied_flag,
+            turn_action_tracker,
             agent_display_name: agent_display_name.into(),
         }
     }
@@ -349,6 +353,8 @@ impl Tool for ReplyTool {
             thread_name = args.thread_name.as_deref(),
             "reply tool called"
         );
+        self.turn_action_tracker
+            .record_reply_preview(args.content.clone());
 
         // Extract source from conversation_id (format: "platform:id")
         let source = self.conversation_id.split(':').next().unwrap_or("unknown");
@@ -423,6 +429,8 @@ impl Tool for ReplyTool {
             &converted_content,
             Some(&self.agent_display_name),
         );
+        self.turn_action_tracker
+            .record_reply_preview(converted_content.clone());
 
         // Mark the turn as handled so handle_agent_result skips the fallback send.
         self.replied_flag.store(true, Ordering::Relaxed);

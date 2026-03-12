@@ -8,6 +8,7 @@
 use crate::WorkerId;
 use crate::agent::channel::ChannelState;
 use crate::agent::channel_dispatch::{spawn_opencode_worker_from_state, spawn_worker_from_state};
+use crate::tools::TurnActionTracker;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -20,12 +21,16 @@ use tracing::Instrument as _;
 #[derive(Debug, Clone)]
 pub struct SpawnWorkerTool {
     state: ChannelState,
+    turn_action_tracker: TurnActionTracker,
 }
 
 impl SpawnWorkerTool {
     /// Create a new spawn worker tool with access to channel state.
-    pub fn new(state: ChannelState) -> Self {
-        Self { state }
+    pub fn new(state: ChannelState, turn_action_tracker: TurnActionTracker) -> Self {
+        Self {
+            state,
+            turn_action_tracker,
+        }
     }
 }
 
@@ -234,6 +239,11 @@ impl Tool for SpawnWorkerTool {
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?
         };
+        self.turn_action_tracker.mark_action(if is_opencode {
+            "spawn_worker:opencode"
+        } else {
+            "spawn_worker:builtin"
+        });
 
         // Link the worker to project/worktree if specified (fire-and-forget update).
         if args.project_id.is_some() || args.worktree_id.is_some() {

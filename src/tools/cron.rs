@@ -2,6 +2,7 @@
 
 use crate::cron::scheduler::{CronConfig, Scheduler};
 use crate::cron::store::CronStore;
+use crate::tools::TurnActionTracker;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -21,6 +22,7 @@ pub struct CronTool {
     store: Arc<CronStore>,
     scheduler: Arc<Scheduler>,
     default_delivery_target: Option<String>,
+    turn_action_tracker: Option<TurnActionTracker>,
 }
 
 impl CronTool {
@@ -29,11 +31,17 @@ impl CronTool {
             store,
             scheduler,
             default_delivery_target: None,
+            turn_action_tracker: None,
         }
     }
 
     pub fn with_default_delivery_target(mut self, default_delivery_target: Option<String>) -> Self {
         self.default_delivery_target = default_delivery_target;
+        self
+    }
+
+    pub fn with_turn_action_tracker(mut self, turn_action_tracker: TurnActionTracker) -> Self {
+        self.turn_action_tracker = Some(turn_action_tracker);
         self
     }
 }
@@ -292,6 +300,9 @@ impl CronTool {
             .register(config)
             .await
             .map_err(|error| CronError(format!("failed to register: {error}")))?;
+        if let Some(turn_action_tracker) = &self.turn_action_tracker {
+            turn_action_tracker.mark_action("cron:create");
+        }
 
         let schedule_desc = cron_expr
             .as_deref()
@@ -374,6 +385,9 @@ impl CronTool {
             .delete(&id)
             .await
             .map_err(|error| CronError(format!("failed to delete: {error}")))?;
+        if let Some(turn_action_tracker) = &self.turn_action_tracker {
+            turn_action_tracker.mark_action("cron:delete");
+        }
 
         tracing::info!(cron_id = %id, "cron job deleted via tool");
 

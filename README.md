@@ -425,12 +425,17 @@ Read the full vision in the [roadmap](docs/content/docs/(deployment)/roadmap.mdx
 git clone https://github.com/spacedriveapp/spacebot
 cd spacebot
 
+# Install frontend deps so Cargo can embed the dashboard automatically
+cd interface && bun install && cd ..
+
 # Optional: build the OpenCode embedded UI (requires Node 22+ and bun)
 # Without this, OpenCode workers still work — the Workers tab shows a transcript view instead.
 # ./scripts/build-opencode-embed.sh
 
 cargo build --release
 ```
+
+`cargo build` now runs `bun run build` automatically and fails by default if the dashboard cannot be embedded. If you intentionally want an API-only binary, build with `SPACEBOT_ALLOW_API_ONLY_BUILD=1`.
 
 ### Minimal Config
 

@@ -7,7 +7,32 @@ use futures::StreamExt as _;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+const MAX_IDLE_OPENCODE_RESUME_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+fn idle_opencode_worker_is_stale(
+    worker: &spacebot::conversation::history::IdleWorkerRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if worker.worker_type != "opencode" {
+        return false;
+    }
+
+    let Ok(started_at) =
+        chrono::NaiveDateTime::parse_from_str(&worker.started_at, "%Y-%m-%d %H:%M:%S")
+    else {
+        return false;
+    };
+
+    let started_at =
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(started_at, chrono::Utc);
+    match now.signed_duration_since(started_at).to_std() {
+        Ok(age) => age > MAX_IDLE_OPENCODE_RESUME_AGE,
+        Err(_) => false,
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "spacebot", version)]
@@ -1945,6 +1970,7 @@ async fn run(
                 idle_count = idle_workers.len(),
                 "found idle interactive workers to resume"
             );
+            let now = chrono::Utc::now();
 
             // Group idle workers by channel_id
             let mut by_channel: HashMap<
@@ -1995,6 +2021,22 @@ async fn run(
                                 worker_id = %idle_worker.id,
                                 channel_id = %conversation_id,
                                 "retired idle opencode worker (no session metadata)"
+                            );
+                        } else if idle_opencode_worker_is_stale(idle_worker, now) {
+                            if let Err(error) = run_logger.retire_idle_worker(&idle_worker.id).await
+                            {
+                                tracing::warn!(
+                                    worker_id = %idle_worker.id,
+                                    %error,
+                                    "failed to retire stale idle OpenCode worker"
+                                );
+                            }
+                            tracing::info!(
+                                worker_id = %idle_worker.id,
+                                channel_id = %conversation_id,
+                                started_at = %idle_worker.started_at,
+                                max_age_secs = MAX_IDLE_OPENCODE_RESUME_AGE.as_secs(),
+                                "retired stale idle OpenCode worker before startup resume"
                             );
                         } else {
                             resumable.push(idle_worker);
@@ -3708,7 +3750,9 @@ async fn initialize_agents(
 
 #[cfg(test)]
 mod tests {
-    use super::wait_for_startup_warmup_tasks;
+    use super::{
+        MAX_IDLE_OPENCODE_RESUME_AGE, idle_opencode_worker_is_stale, wait_for_startup_warmup_tasks,
+    };
     use std::future::pending;
     use std::sync::Arc;
     use std::time::Duration;
@@ -3770,5 +3814,48 @@ mod tests {
             started.elapsed() < Duration::from_millis(80),
             "startup warmup timeout should return without waiting for non-cooperative task"
         );
+    }
+
+    #[test]
+    fn stale_opencode_resume_guard_flags_old_sessions() {
+        let now = chrono::Utc::now();
+        let worker = spacebot::conversation::history::IdleWorkerRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            task: "task".into(),
+            channel_id: Some("discord:test".into()),
+            worker_type: "opencode".into(),
+            started_at: (now
+                - chrono::Duration::seconds(MAX_IDLE_OPENCODE_RESUME_AGE.as_secs() as i64 + 60))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+            transcript: None,
+            tool_calls: 0,
+            opencode_session_id: Some("session".into()),
+            opencode_port: Some(1234),
+            directory: Some("/tmp".into()),
+        };
+
+        assert!(idle_opencode_worker_is_stale(&worker, now));
+    }
+
+    #[test]
+    fn stale_opencode_resume_guard_allows_recent_sessions() {
+        let now = chrono::Utc::now();
+        let worker = spacebot::conversation::history::IdleWorkerRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            task: "task".into(),
+            channel_id: Some("discord:test".into()),
+            worker_type: "opencode".into(),
+            started_at: (now - chrono::Duration::minutes(10))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            transcript: None,
+            tool_calls: 0,
+            opencode_session_id: Some("session".into()),
+            opencode_port: Some(1234),
+            directory: Some("/tmp".into()),
+        };
+
+        assert!(!idle_opencode_worker_is_stale(&worker, now));
     }
 }

@@ -2,6 +2,7 @@ use std::process::Command;
 
 fn main() {
     if std::env::var("SPACEBOT_SKIP_FRONTEND_BUILD").is_ok() {
+        ensure_dist_dir();
         return;
     }
     // Re-run if interface source files change
@@ -12,14 +13,21 @@ fn main() {
     println!("cargo:rerun-if-changed=interface/tailwind.config.ts");
 
     let interface_dir = std::path::Path::new("interface");
+    let allow_api_only_build = std::env::var("SPACEBOT_ALLOW_API_ONLY_BUILD").is_ok();
 
-    // Skip if bun isn't installed or node_modules is missing (CI without frontend deps)
+    // By default, local builds are expected to include the embedded dashboard.
+    // API-only builds must opt out explicitly.
     if !interface_dir.join("node_modules").exists() {
-        eprintln!(
-            "cargo:warning=interface/node_modules not found, skipping frontend build. Run `bun install` in interface/"
+        if allow_api_only_build {
+            eprintln!(
+                "cargo:warning=interface/node_modules not found; building API-only binary because SPACEBOT_ALLOW_API_ONLY_BUILD is set"
+            );
+            ensure_dist_dir();
+            return;
+        }
+        panic!(
+            "interface/node_modules not found. Run `cd interface && bun install`, or set SPACEBOT_ALLOW_API_ONLY_BUILD=1 to explicitly build without the dashboard."
         );
-        ensure_dist_dir();
-        return;
     }
 
     let status = Command::new("bun")
@@ -28,17 +36,43 @@ fn main() {
         .status();
 
     match status {
-        Ok(s) if s.success() => {}
+        Ok(s) if s.success() => {
+            if !interface_dir.join("dist/index.html").exists() {
+                if allow_api_only_build {
+                    eprintln!(
+                        "cargo:warning=frontend build finished without dist/index.html; continuing because SPACEBOT_ALLOW_API_ONLY_BUILD is set"
+                    );
+                    ensure_dist_dir();
+                    return;
+                }
+                panic!(
+                    "frontend build completed but interface/dist/index.html is missing. Set SPACEBOT_ALLOW_API_ONLY_BUILD=1 only if you intentionally want an API-only binary."
+                );
+            }
+        }
         Ok(s) => {
-            eprintln!(
-                "cargo:warning=frontend build exited with {s}, the binary will serve a stale or empty UI"
+            if allow_api_only_build {
+                eprintln!(
+                    "cargo:warning=frontend build exited with {s}; continuing with API-only binary because SPACEBOT_ALLOW_API_ONLY_BUILD is set"
+                );
+                ensure_dist_dir();
+                return;
+            }
+            panic!(
+                "frontend build failed with {s}. Fix the interface build, or set SPACEBOT_ALLOW_API_ONLY_BUILD=1 to explicitly build without the dashboard."
             );
         }
         Err(e) => {
-            eprintln!(
-                "cargo:warning=failed to run `bun run build`: {e}. Install bun to build the frontend."
+            if allow_api_only_build {
+                eprintln!(
+                    "cargo:warning=failed to run `bun run build`: {e}. Continuing with API-only binary because SPACEBOT_ALLOW_API_ONLY_BUILD is set."
+                );
+                ensure_dist_dir();
+                return;
+            }
+            panic!(
+                "failed to run `bun run build`: {e}. Install bun, or set SPACEBOT_ALLOW_API_ONLY_BUILD=1 to explicitly build without the dashboard."
             );
-            ensure_dist_dir();
         }
     }
 }

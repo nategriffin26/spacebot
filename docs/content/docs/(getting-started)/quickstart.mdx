@@ -55,7 +55,7 @@ You can also manage updates from **Settings → Updates** in the web UI.
 git clone https://github.com/spacedriveapp/spacebot.git
 cd spacebot
 
-# Optional: build the web UI (React + Vite, embedded into the binary)
+# Install frontend deps so Cargo can embed the dashboard automatically
 cd interface && bun install && cd ..
 
 # Optional: build the OpenCode embed (live coding UI in the Workers tab)
@@ -66,7 +66,7 @@ cd interface && bun install && cd ..
 cargo install --path .
 ```
 
-The `build.rs` script automatically runs `bun run build` during compilation if `interface/node_modules` exists. Without it, the binary still works — you just get an empty UI on the web dashboard.
+The `build.rs` script automatically runs `bun run build` during compilation. By default, source builds now fail if the dashboard cannot be built, so you don't accidentally produce an API-only binary. If you intentionally want an API-only build, set `SPACEBOT_ALLOW_API_ONLY_BUILD=1` before compiling.
 
 The OpenCode embed step (`build-opencode-embed.sh`) clones OpenCode at a pinned commit, builds the embeddable SPA, and places it in `interface/public/opencode-embed/`. This is optional — without it, OpenCode workers still function normally, but the Workers tab will show a transcript view instead of the live interactive OpenCode UI.
 

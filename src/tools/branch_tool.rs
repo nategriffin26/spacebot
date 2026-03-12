@@ -3,6 +3,7 @@
 use crate::BranchId;
 use crate::agent::channel::ChannelState;
 use crate::agent::channel_dispatch::spawn_branch_from_state;
+use crate::tools::TurnActionTracker;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -12,12 +13,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct BranchTool {
     state: ChannelState,
+    turn_action_tracker: TurnActionTracker,
 }
 
 impl BranchTool {
     /// Create a new branch tool with access to channel state.
-    pub fn new(state: ChannelState) -> Self {
-        Self { state }
+    pub fn new(state: ChannelState, turn_action_tracker: TurnActionTracker) -> Self {
+        Self {
+            state,
+            turn_action_tracker,
+        }
     }
 }
 
@@ -73,6 +78,7 @@ impl Tool for BranchTool {
         let branch_id = spawn_branch_from_state(&self.state, &args.description)
             .await
             .map_err(|e| BranchError(format!("{e}")))?;
+        self.turn_action_tracker.mark_action("branch");
 
         let readiness_note = if readiness.ready {
             String::new()

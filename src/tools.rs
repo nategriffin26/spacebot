@@ -180,6 +180,8 @@ use rig::tool::Tool as _;
 use rig::tool::server::{ToolServer, ToolServerHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone)]
@@ -339,6 +341,58 @@ pub fn should_block_user_visible_text(value: &str) -> bool {
     lower.starts_with("<system-reminder>") || lower.starts_with("<path>")
 }
 
+#[derive(Debug, Default)]
+struct TurnActionState {
+    action_taken: AtomicBool,
+    actions: Mutex<Vec<String>>,
+    reply_preview: Mutex<Option<String>>,
+}
+
+/// Per-turn tracker for whether the channel actually performed work.
+#[derive(Debug, Clone, Default)]
+pub struct TurnActionTracker {
+    state: Arc<TurnActionState>,
+}
+
+impl TurnActionTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_action(&self, action: impl Into<String>) {
+        self.state.action_taken.store(true, Ordering::Relaxed);
+        if let Ok(mut actions) = self.state.actions.lock() {
+            actions.push(action.into());
+        }
+    }
+
+    pub fn has_action(&self) -> bool {
+        self.state.action_taken.load(Ordering::Relaxed)
+    }
+
+    pub fn record_reply_preview(&self, reply: impl Into<String>) {
+        if let Ok(mut preview) = self.state.reply_preview.lock() {
+            *preview = Some(reply.into());
+        }
+    }
+
+    pub fn reply_preview(&self) -> Option<String> {
+        self.state
+            .reply_preview
+            .lock()
+            .ok()
+            .and_then(|preview| preview.clone())
+    }
+
+    pub fn action_summary(&self) -> String {
+        self.state
+            .actions
+            .lock()
+            .map(|actions| actions.join(", "))
+            .unwrap_or_default()
+    }
+}
+
 /// Add per-turn tools to a channel's ToolServer.
 ///
 /// Called when a conversation turn begins. These tools hold per-turn state
@@ -352,6 +406,7 @@ pub async fn add_channel_tools(
     conversation_id: impl Into<String>,
     skip_flag: SkipFlag,
     replied_flag: RepliedFlag,
+    turn_action_tracker: TurnActionTracker,
     cron_tool: Option<CronTool>,
     send_agent_message_tool: Option<SendAgentMessageTool>,
     allow_direct_reply: bool,
@@ -373,13 +428,23 @@ pub async fn add_channel_tools(
                 state.conversation_logger.clone(),
                 state.channel_id.clone(),
                 replied_flag.clone(),
+                turn_action_tracker.clone(),
                 agent_display_name,
             ))
             .await?;
     }
-    handle.add_tool(BranchTool::new(state.clone())).await?;
-    handle.add_tool(SpawnWorkerTool::new(state.clone())).await?;
-    handle.add_tool(RouteTool::new(state.clone())).await?;
+    handle
+        .add_tool(BranchTool::new(state.clone(), turn_action_tracker.clone()))
+        .await?;
+    handle
+        .add_tool(SpawnWorkerTool::new(
+            state.clone(),
+            turn_action_tracker.clone(),
+        ))
+        .await?;
+    handle
+        .add_tool(RouteTool::new(state.clone(), turn_action_tracker.clone()))
+        .await?;
     if let Some(messaging_manager) = &state.deps.messaging_manager {
         let send_message_display_name = state
             .deps
@@ -425,7 +490,9 @@ pub async fn add_channel_tools(
             ))
             .await?;
     }
-    handle.add_tool(CancelTool::new(state)).await?;
+    handle
+        .add_tool(CancelTool::new(state, turn_action_tracker.clone()))
+        .await?;
     handle
         .add_tool(SkipTool::new(skip_flag.clone(), response_tx.clone()))
         .await?;
@@ -434,6 +501,7 @@ pub async fn add_channel_tools(
         let cron_tool = cron_tool.with_default_delivery_target(
             default_delivery_target_for_conversation(&conversation_id),
         );
+        let cron_tool = cron_tool.with_turn_action_tracker(turn_action_tracker);
         handle.add_tool(cron_tool).await?;
     }
     if let Some(mut agent_msg) = send_agent_message_tool {
@@ -540,7 +608,7 @@ pub fn create_branch_tool_server(
     }
 
     if let Some(state) = state {
-        server = server.tool(SpawnWorkerTool::new(state));
+        server = server.tool(SpawnWorkerTool::new(state, TurnActionTracker::new()));
     }
 
     server.run()

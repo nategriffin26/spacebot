@@ -1,6 +1,7 @@
 //! Cancel tool for stopping workers or branches.
 
 use crate::agent::channel::ChannelState;
+use crate::tools::TurnActionTracker;
 use crate::{BranchId, WorkerId};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -11,12 +12,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct CancelTool {
     state: ChannelState,
+    turn_action_tracker: TurnActionTracker,
 }
 
 impl CancelTool {
     /// Create a new cancel tool with access to channel state.
-    pub fn new(state: ChannelState) -> Self {
-        Self { state }
+    pub fn new(state: ChannelState, turn_action_tracker: TurnActionTracker) -> Self {
+        Self {
+            state,
+            turn_action_tracker,
+        }
     }
 }
 
@@ -125,6 +130,7 @@ impl Tool for CancelTool {
         } else {
             format!("{} {} cancelled.", args.process_type, args.process_id)
         };
+        self.turn_action_tracker.mark_action("cancel");
 
         Ok(CancelOutput {
             cancelled: true,
