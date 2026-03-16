@@ -3,6 +3,8 @@ import {useQuery, useQueryClient} from "@tanstack/react-query";
 import {useNavigate, useSearch} from "@tanstack/react-router";
 import {motion} from "framer-motion";
 import {Markdown} from "@/components/Markdown";
+import {useTheme} from "@/hooks/useTheme";
+import {useIsMobile} from "@/hooks/useViewport";
 import {
 	api,
 	type WorkerRunInfo,
@@ -53,6 +55,7 @@ export function AgentWorkers({agentId}: {agentId: string}) {
 	const navigate = useNavigate();
 	const routeSearch = useSearch({strict: false}) as {worker?: string};
 	const selectedWorkerId = routeSearch.worker ?? null;
+	const isMobile = useIsMobile();
 	const {activeWorkers, workerEventVersion, liveTranscripts, liveOpenCodeParts} = useLiveContext();
 
 	// Invalidate worker queries when SSE events fire
@@ -195,7 +198,16 @@ export function AgentWorkers({agentId}: {agentId: string}) {
 	return (
 		<div className="flex h-full">
 			{/* Left column: worker list */}
-			<div className="flex w-[360px] flex-shrink-0 flex-col border-r border-app-line/50">
+			<div
+				className={cx(
+					"flex flex-col border-r border-app-line/50",
+					isMobile
+						? selectedWorkerId
+							? "hidden"
+							: "w-full"
+						: "w-[360px] flex-shrink-0",
+				)}
+			>
 				{/* Toolbar */}
 				<div className="flex items-center gap-3 border-b border-app-line/50 bg-app-darkBox/20 px-4 py-2.5">
 					<input
@@ -247,7 +259,23 @@ export function AgentWorkers({agentId}: {agentId: string}) {
 			</div>
 
 			{/* Right column: detail view */}
-			<div className="flex flex-1 flex-col overflow-hidden">
+			<div
+				className={cx(
+					"flex flex-1 flex-col overflow-hidden",
+					isMobile && !selectedWorkerId && "hidden",
+				)}
+			>
+				{isMobile && selectedWorkerId && (
+					<div className="border-b border-app-line/50 px-4 py-2">
+						<button
+							type="button"
+							onClick={() => selectWorker(null)}
+							className="rounded-md border border-app-line px-2 py-1 text-xs text-ink-faint hover:text-ink-dull"
+						>
+							Back to workers
+						</button>
+					</div>
+				)}
 				{selectedWorkerId && mergedDetail ? (
 					<WorkerDetail
 						detail={mergedDetail}
@@ -661,7 +689,11 @@ function OpenCodeDirectLink({
  * text are reused across mounts so we don't re-fetch on every tab switch.
  */
 let embedAssetsPromise: Promise<{
-	mountOpenCode: (el: HTMLElement, config: { serverUrl: string; initialRoute?: string }) => {
+	mountOpenCode: (el: HTMLElement, config: {
+		serverUrl: string;
+		initialRoute?: string;
+		colorScheme?: "light" | "dark" | "system";
+	}) => {
 		dispose: () => void;
 		navigate: (route: string) => void;
 	};
@@ -731,10 +763,12 @@ function OpenCodeEmbed({
 	sessionId: string;
 	directory: string | null;
 }) {
+	const {isLightMode} = useTheme();
 	const [state, setState] = useState<"loading" | "ready" | "error">("loading");
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const hostRef = useRef<HTMLDivElement>(null);
 	const handleRef = useRef<{ dispose: () => void; navigate: (route: string) => void } | null>(null);
+	const colorScheme = isLightMode ? "light" : "dark";
 
 	// Route through the Spacebot proxy so it works for hosted/Tailscale
 	// users, not just local dev. The proxy handles forwarding to the
@@ -921,6 +955,7 @@ function OpenCodeEmbed({
 				const handle = mountOpenCode(mountDiv, {
 					serverUrl,
 					initialRoute,
+					colorScheme,
 				});
 
 				handleRef.current = handle;
@@ -948,7 +983,7 @@ function OpenCodeEmbed({
 			const portalStyle = document.getElementById("opencode-portal-css");
 			if (portalStyle) portalStyle.remove();
 		};
-	}, [serverUrl, initialRoute]);
+	}, [serverUrl, initialRoute, colorScheme]);
 
 	// Navigate the embedded app when the route changes
 	useEffect(() => {
@@ -1085,5 +1120,4 @@ function OpenCodePartView({part}: {part: OpenCodePart}) {
 			return null;
 	}
 }
-
 

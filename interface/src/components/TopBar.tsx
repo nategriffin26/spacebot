@@ -1,6 +1,10 @@
-import { createContext, useContext, useRef, useCallback, useSyncExternalStore, type ReactNode, type MouseEvent } from "react";
+import { createContext, useContext, useRef, useCallback, useLayoutEffect, useSyncExternalStore, type ReactNode, type MouseEvent } from "react";
 import { Link } from "@tanstack/react-router";
+import { Menu01Icon, Moon02Icon, Sun03Icon } from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
 import { BASE_PATH, IS_TAURI } from "@/api/client";
+import { useTheme } from "@/hooks/useTheme";
+import { Toggle } from "@/ui";
 
 // ── Context ──────────────────────────────────────────────────────────────
 
@@ -58,14 +62,47 @@ export function useSetTopBar(node: ReactNode) {
 	const store = useContext(TopBarContext);
 	if (!store) throw new Error("useSetTopBar must be used within TopBarProvider");
 
-	// Update content synchronously during render (like useSyncExternalStore pattern).
-	// This avoids the useEffect loop entirely.
-	store.setContent(node);
+	useLayoutEffect(() => {
+		store.setContent(node);
+		return () => {
+			store.setContent(null);
+		};
+	}, [node, store]);
 }
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function TopBar() {
+function ThemeModeToggle() {
+	const { isLightMode, toggleLightMode } = useTheme();
+
+	return (
+		<div className="mr-2 flex items-center gap-2 rounded-full border border-app-line bg-app-box/80 px-2.5 py-1.5 md:mr-4 md:px-3">
+			<HugeiconsIcon
+				icon={isLightMode ? Sun03Icon : Moon02Icon}
+				className="h-3.5 w-3.5 text-ink-faint"
+			/>
+			<span className="hidden text-xs font-medium text-ink-dull sm:inline">
+				{isLightMode ? "Light" : "Dark"}
+			</span>
+			<Toggle
+				size="sm"
+				checked={isLightMode}
+				onCheckedChange={toggleLightMode}
+				aria-label="Toggle light mode"
+			/>
+		</div>
+	);
+}
+
+interface TopBarProps {
+	isMobile?: boolean;
+	onOpenMobileNav?: () => void;
+}
+
+export function TopBar({
+	isMobile = false,
+	onOpenMobileNav,
+}: TopBarProps) {
 	const store = useContext(TopBarContext);
 	if (!store) throw new Error("TopBar must be used within TopBarProvider");
 
@@ -87,31 +124,50 @@ export function TopBar() {
 
 	return (
 		<div
-			className={`flex h-12 w-full shrink-0 border-b border-app-line bg-app-darkBox/50${IS_TAURI ? " select-none" : ""}`}
+			className={`flex min-h-12 w-full shrink-0 border-b border-app-line bg-app-darkBox/50${IS_TAURI ? " select-none" : ""}`}
 			onMouseDown={handleMouseDown}
 		>
-			{/* Left corner block */}
 			{IS_TAURI ? (
-				/* Tauri: padding for macOS traffic lights */
-				<div className="w-[72px] shrink-0" />
+				<div className="flex w-[72px] shrink-0 items-center border-r border-sidebar-line bg-sidebar px-2">
+					{isMobile && (
+						<button
+							type="button"
+							onClick={onOpenMobileNav}
+							className="flex h-8 w-8 items-center justify-center rounded-md text-sidebar-inkDull hover:bg-sidebar-selected/50 hover:text-sidebar-ink"
+							aria-label="Open navigation"
+						>
+							<HugeiconsIcon icon={Menu01Icon} className="h-4 w-4" />
+						</button>
+					)}
+				</div>
+			) : isMobile ? (
+				<div className="flex shrink-0 items-center border-r border-sidebar-line bg-sidebar px-2">
+					<button
+						type="button"
+						onClick={onOpenMobileNav}
+						className="flex h-8 w-8 items-center justify-center rounded-md text-sidebar-inkDull hover:bg-sidebar-selected/50 hover:text-sidebar-ink"
+						aria-label="Open navigation"
+					>
+						<HugeiconsIcon icon={Menu01Icon} className="h-4 w-4" />
+					</button>
+				</div>
 			) : (
-				/* Web: ball icon block matching sidebar width + border */
 				<Link
 					to="/"
-					className="flex w-14 shrink-0 items-center justify-center border-r border-sidebar-line bg-sidebar"
+					className="flex w-12 shrink-0 items-center justify-center border-r border-sidebar-line bg-sidebar md:w-14"
 				>
 					<img
 						src={`${BASE_PATH}/ball.png`}
 						alt=""
-						className="h-6 w-6 transition-transform duration-150 ease-out hover:scale-110 active:scale-95"
+						className="h-5 w-5 transition-transform duration-150 ease-out hover:scale-110 active:scale-95 md:h-6 md:w-6"
 						draggable={false}
 					/>
 				</Link>
 			)}
 
-			{/* Route-controlled content area */}
-			<div className="flex min-w-0 flex-1 items-center">
-				{content}
+			<div className="flex min-w-0 flex-1 items-center overflow-hidden py-1">
+				<div className="min-w-0 flex-1">{content}</div>
+				<ThemeModeToggle />
 			</div>
 		</div>
 	);

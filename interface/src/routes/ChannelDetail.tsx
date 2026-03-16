@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { AnimatePresence, motion } from "framer-motion";
 import { api, type ChannelInfo, type TimelineItem, type TimelineBranchRun, type TimelineWorkerRun } from "@/api/client";
 import { isOpenCodeWorker, type ChannelLiveState, type ActiveWorker, type ActiveBranch } from "@/hooks/useChannelLiveState";
+import { useIsMobile } from "@/hooks/useViewport";
 import { CortexChatPanel } from "@/components/CortexChatPanel";
 import { LiveDuration } from "@/components/LiveDuration";
 import { Markdown } from "@/components/Markdown";
@@ -82,7 +82,7 @@ function LiveWorkerRunItem({ item, live, channelId, agentId }: { item: TimelineW
 			</span>
 			<div className="min-w-0 flex-1">
 				<div className={`w-full rounded-md px-3 py-2 transition-colors ${
-					oc ? "bg-zinc-500/10 hover:bg-zinc-500/15" : "bg-amber-500/10 hover:bg-amber-500/15"
+					oc ? "bg-app-selected/60 hover:bg-app-selected" : "bg-amber-500/10 hover:bg-amber-500/15"
 				}`}>
 					<div className="flex min-w-0 items-center gap-2 overflow-hidden">
 						<button
@@ -91,8 +91,8 @@ function LiveWorkerRunItem({ item, live, channelId, agentId }: { item: TimelineW
 							className="min-w-0 flex-1 text-left"
 						>
 							<div className="flex min-w-0 items-center gap-2 overflow-hidden">
-								<div className={`h-2 w-2 animate-pulse rounded-full ${oc ? "bg-zinc-400" : "bg-amber-400"}`} />
-								<span className={`text-sm font-medium ${oc ? "text-zinc-300" : "text-amber-300"}`}>Worker</span>
+								<div className={`h-2 w-2 animate-pulse rounded-full ${oc ? "bg-ink-faint" : "bg-amber-400"}`} />
+								<span className={`text-sm font-medium ${oc ? "text-ink" : "text-amber-300"}`}>Worker</span>
 								<span className={`min-w-0 flex-1 text-sm text-ink-dull ${
 									expanded ? "whitespace-normal break-words" : "truncate"
 								}`}>{item.task}</span>
@@ -107,7 +107,7 @@ function LiveWorkerRunItem({ item, live, channelId, agentId }: { item: TimelineW
 							search={{ worker: item.id }}
 							className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-tiny font-medium transition-colors ${
 								oc
-									? "border-zinc-400/30 text-zinc-300 hover:border-zinc-400/60 hover:bg-zinc-500/15"
+									? "border-app-line text-ink-dull hover:border-app-line/80 hover:bg-app-selected"
 									: "border-amber-400/30 text-amber-300 hover:border-amber-400/60 hover:bg-amber-500/15"
 							}`}
 						>
@@ -121,7 +121,7 @@ function LiveWorkerRunItem({ item, live, channelId, agentId }: { item: TimelineW
 						<LiveDuration startMs={live.startedAt} />
 						<span className="truncate">{live.status}</span>
 						{live.currentTool && (
-							<span className={`truncate ${oc ? "text-zinc-400/70" : "text-amber-400/70"}`}>{live.currentTool}</span>
+							<span className={`truncate ${oc ? "text-ink-faint" : "text-amber-400/70"}`}>{live.currentTool}</span>
 						)}
 						{live.toolCalls > 0 && (
 							<span>{live.toolCalls} tool calls</span>
@@ -188,7 +188,7 @@ function WorkerRunItem({ item, agentId }: { item: TimelineWorkerRun; agentId: st
 			</span>
 			<div className="min-w-0 flex-1">
 				<div className={`w-full rounded-md px-3 py-2 transition-colors ${
-					oc ? "bg-zinc-500/10 hover:bg-zinc-500/15" : "bg-amber-500/10 hover:bg-amber-500/15"
+					oc ? "bg-app-selected/60 hover:bg-app-selected" : "bg-amber-500/10 hover:bg-amber-500/15"
 				}`}>
 					<div className="flex min-w-0 items-center gap-2 overflow-hidden">
 						<button
@@ -199,8 +199,8 @@ function WorkerRunItem({ item, agentId }: { item: TimelineWorkerRun; agentId: st
 							className="min-w-0 flex-1 text-left"
 						>
 							<div className="flex min-w-0 items-center gap-2 overflow-hidden">
-								<div className={`h-2 w-2 rounded-full ${oc ? "bg-zinc-400/50" : "bg-amber-400/50"}`} />
-								<span className={`text-sm font-medium ${oc ? "text-zinc-300" : "text-amber-300"}`}>Worker</span>
+								<div className={`h-2 w-2 rounded-full ${oc ? "bg-ink-faint" : "bg-amber-400/50"}`} />
+								<span className={`text-sm font-medium ${oc ? "text-ink" : "text-amber-300"}`}>Worker</span>
 								<span className={`min-w-0 flex-1 text-sm text-ink-dull ${
 									expanded ? "whitespace-normal break-words" : "truncate"
 								}`}>{item.task}</span>
@@ -217,7 +217,7 @@ function WorkerRunItem({ item, agentId }: { item: TimelineWorkerRun; agentId: st
 							search={{ worker: item.id }}
 							className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-tiny font-medium transition-colors ${
 								oc
-									? "border-zinc-400/30 text-zinc-300 hover:border-zinc-400/60 hover:bg-zinc-500/15"
+									? "border-app-line text-ink-dull hover:border-app-line/80 hover:bg-app-selected"
 									: "border-amber-400/30 text-amber-300 hover:border-amber-400/60 hover:bg-amber-500/15"
 							}`}
 						>
@@ -227,7 +227,7 @@ function WorkerRunItem({ item, agentId }: { item: TimelineWorkerRun; agentId: st
 				</div>
 				{expanded && item.result && (
 					<div className={`mt-1 rounded-md border px-3 py-2 ${
-						oc ? "border-zinc-500/10 bg-zinc-500/5" : "border-amber-500/10 bg-amber-500/5"
+						oc ? "border-app-line/60 bg-app-box/60" : "border-amber-500/10 bg-amber-500/5"
 					}`}>
 						<div className="text-sm text-ink-dull">
 							<Markdown className="whitespace-pre-wrap break-words">{item.result}</Markdown>
@@ -292,8 +292,9 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 	const activeWorkerCount = Object.keys(workers).length;
 	const activeBranchCount = Object.keys(branches).length;
 	const hasActivity = activeWorkerCount > 0 || activeBranchCount > 0;
-	const [cortexOpen, setCortexOpen] = useState(true);
+	const [cortexOpen, setCortexOpen] = useState(false);
 	const [inspectOpen, setInspectOpen] = useState(false);
+	const isMobile = useIsMobile();
 
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const sentinelRef = useRef<HTMLDivElement>(null);
@@ -327,11 +328,13 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 	}, [handleIntersection]);
 
 	return (
-		<div className="flex h-full">
+		<div className="flex h-full min-h-0 min-w-0">
 			{/* Main channel content */}
-			<div className="flex flex-1 flex-col overflow-hidden">
+			<div
+				className={`flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden ${isMobile && cortexOpen ? "hidden" : ""}`}
+			>
 				{/* Channel sub-header */}
-				<div className="flex h-12 items-center gap-3 border-b border-app-line/50 bg-app-darkBox/20 px-6">
+				<div className="flex min-h-12 flex-wrap items-center gap-2 border-b border-app-line/50 bg-app-darkBox/20 px-3 py-2 sm:h-12 sm:flex-nowrap sm:gap-3 sm:px-6 sm:py-0">
 					<Link
 						to="/agents/$agentId/channels"
 						params={{ agentId }}
@@ -340,7 +343,7 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 						Channels
 					</Link>
 					<span className="text-ink-faint/50">/</span>
-					<span className="text-sm font-medium text-ink">
+					<span className="min-w-0 truncate text-sm font-medium text-ink">
 						{channel?.display_name ?? channelId}
 						{channel?.display_name && (
 							<span className="ml-2 font-normal text-ink-faint text-tiny">{channelId}</span>
@@ -353,9 +356,9 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 					)}
 
 					{/* Right side: activity indicators + typing + cortex toggle */}
-					<div className="ml-auto flex items-center gap-3">
+					<div className="ml-auto flex w-full items-center justify-end gap-2 sm:w-auto sm:gap-3">
 						{hasActivity && (
-							<div className="flex items-center gap-2">
+							<div className="hidden items-center gap-2 sm:flex">
 								{activeWorkerCount > 0 && (
 									<div className="flex items-center gap-1.5">
 										<div className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
@@ -406,8 +409,8 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 				</div>
 
 				{/* Timeline — flex-col-reverse keeps scroll pinned to bottom */}
-				<div ref={scrollRef} className="flex flex-1 flex-col-reverse overflow-y-auto">
-					<div className="flex flex-col gap-1 p-6">
+				<div ref={scrollRef} className="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto">
+					<div className="flex flex-col gap-1 px-3 py-4 sm:p-6">
 						{/* Sentinel for infinite scroll — sits above the oldest item */}
 						<div ref={sentinelRef} className="h-px" />
 						{loadingMore && (
@@ -454,25 +457,32 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 			<PromptInspectModal open={inspectOpen} onOpenChange={setInspectOpen} channelId={channelId} />
 
 			{/* Cortex chat panel */}
-			<AnimatePresence>
-				{cortexOpen && (
-					<motion.div
-						initial={{ width: 0, opacity: 0 }}
-						animate={{ width: 400, opacity: 1 }}
-						exit={{ width: 0, opacity: 0 }}
-						transition={{ type: "spring", stiffness: 400, damping: 30 }}
-						className="flex-shrink-0 overflow-hidden border-l border-app-line/50"
-					>
-						<div className="h-full w-[400px]">
-							<CortexChatPanel
-								agentId={agentId}
-								channelId={channelId}
-								onClose={() => setCortexOpen(false)}
-							/>
+			{cortexOpen && (
+				<div
+					className={`overflow-hidden border-l border-app-line/50 ${
+						isMobile ? "flex min-w-0 flex-1 flex-col" : "w-[400px] flex-shrink-0"
+					}`}
+				>
+					{isMobile && (
+						<div className="border-b border-app-line/50 px-4 py-2">
+							<button
+								type="button"
+								onClick={() => setCortexOpen(false)}
+								className="rounded-md border border-app-line px-2 py-1 text-xs text-ink-faint hover:text-ink-dull"
+							>
+								Back to channel
+							</button>
 						</div>
-					</motion.div>
-				)}
-			</AnimatePresence>
+					)}
+					<div className={isMobile ? "min-h-0 flex-1" : "h-full w-[400px]"}>
+						<CortexChatPanel
+							agentId={agentId}
+							channelId={channelId}
+							onClose={() => setCortexOpen(false)}
+						/>
+					</div>
+				</div>
+			)}
 		</div>
 	);
 }

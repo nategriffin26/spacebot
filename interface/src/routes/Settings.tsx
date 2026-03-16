@@ -11,6 +11,7 @@ import { faSearch } from "@fortawesome/free-solid-svg-icons";
 
 import { parse as parseToml } from "smol-toml";
 import { useTheme, THEMES, type ThemeId } from "@/hooks/useTheme";
+import { useIsMobile } from "@/hooks/useViewport";
 import { Markdown } from "@/components/Markdown";
 import { useSetTopBar } from "@/components/TopBar";
 
@@ -266,6 +267,7 @@ const CHATGPT_OAUTH_DEFAULT_MODEL = "openai-chatgpt/gpt-5.4";
 export function Settings() {
 	const queryClient = useQueryClient();
 	const navigate = useNavigate();
+	const isMobile = useIsMobile();
 	const search = useSearch({ from: "/settings" }) as { tab?: string };
 	const [activeSection, setActiveSection] = useState<SectionId>("providers");
 
@@ -576,8 +578,8 @@ export function Settings() {
 	const sectionLabel = SECTIONS.find((s) => s.id === activeSection)?.label;
 
 	useSetTopBar(
-		<div className="flex h-full items-center px-6">
-			<h1 className="font-plex text-sm font-medium text-ink">
+		<div className="flex h-full min-w-0 items-center px-3 sm:px-6">
+			<h1 className="truncate font-plex text-sm font-medium text-ink">
 				{sectionLabel ?? "Settings"}
 			</h1>
 		</div>,
@@ -585,28 +587,48 @@ export function Settings() {
 
 	return (
 		<div className="flex h-full min-h-0 overflow-hidden">
-			{/* Sidebar */}
-			<div className="flex min-h-0 w-52 flex-shrink-0 flex-col overflow-y-auto border-r border-app-line/50 bg-app-darkBox/20">
-				<div className="px-3 pb-1 pt-4">
-					<span className="text-tiny font-medium uppercase tracking-wider text-ink-faint">
-						Settings
-					</span>
+			{!isMobile && (
+				<div className="flex min-h-0 w-52 flex-shrink-0 flex-col overflow-y-auto border-r border-app-line/50 bg-app-darkBox/20">
+					<div className="px-3 pb-1 pt-4">
+						<span className="text-tiny font-medium uppercase tracking-wider text-ink-faint">
+							Settings
+						</span>
+					</div>
+					<div className="flex flex-col gap-0.5 px-2">
+						{SECTIONS.map((section) => (
+							<SettingSidebarButton
+								key={section.id}
+								onClick={() => handleSectionChange(section.id)}
+								active={activeSection === section.id}
+							>
+								<span className="flex-1">{section.label}</span>
+							</SettingSidebarButton>
+						))}
+					</div>
 				</div>
-				<div className="flex flex-col gap-0.5 px-2">
-					{SECTIONS.map((section) => (
-						<SettingSidebarButton
-							key={section.id}
-							onClick={() => handleSectionChange(section.id)}
-							active={activeSection === section.id}
-						>
-							<span className="flex-1">{section.label}</span>
-						</SettingSidebarButton>
-					))}
-				</div>
-			</div>
+			)}
 
-			{/* Content */}
 			<div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+				{isMobile && (
+					<div className="border-b border-app-line/50 bg-app-darkBox/20 px-3 py-2">
+						<label className="mb-1 block text-tiny uppercase tracking-wider text-ink-faint">
+							Section
+						</label>
+						<select
+							value={activeSection}
+							onChange={(event) =>
+								handleSectionChange(event.target.value as SectionId)
+							}
+							className="w-full rounded-md border border-app-line bg-app-input px-2.5 py-2 text-sm text-ink focus:border-accent/50 focus:outline-none"
+						>
+							{SECTIONS.map((section) => (
+								<option key={section.id} value={section.id}>
+									{section.label}
+								</option>
+							))}
+						</select>
+					</div>
+				)}
 				<div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
 					{activeSection === "appearance" ? (
 						<AppearanceSection />
@@ -925,7 +947,7 @@ function ChannelsSection() {
 					Loading channels...
 				</div>
 			) : (
-				<div className="grid grid-cols-[200px_1fr] gap-6">
+				<div className="grid grid-cols-1 gap-6 md:grid-cols-[200px_1fr]">
 					{/* Left column: Platform catalog */}
 					<div className="flex-shrink-0">
 						<PlatformCatalog onAddInstance={handleAddInstance} />
@@ -963,7 +985,7 @@ function ChannelsSection() {
 									No messaging platforms configured yet.
 								</p>
 								<p className="mt-1 text-sm text-ink-faint">
-									Click a platform on the left to get started.
+									Click a platform in the catalog to get started.
 								</p>
 							</div>
 						) : null}
@@ -1770,7 +1792,7 @@ function ServerSection({ settings, isLoading }: GlobalSettingsSectionProps) {
 	const queryClient = useQueryClient();
 	const [apiEnabled, setApiEnabled] = useState(settings?.api_enabled ?? true);
 	const [apiPort, setApiPort] = useState(settings?.api_port.toString() ?? "19898");
-	const [apiBind, setApiBind] = useState(settings?.api_bind ?? "127.0.0.1");
+	const [apiBind, setApiBind] = useState(settings?.api_bind ?? "0.0.0.0");
 	const [message, setMessage] = useState<{ text: string; type: "success" | "error"; requiresRestart?: boolean } | null>(null);
 
 	// Update form state when settings load
@@ -1862,13 +1884,13 @@ function ServerSection({ settings, isLoading }: GlobalSettingsSectionProps) {
 						<label className="block">
 							<span className="text-sm font-medium text-ink">Bind Address</span>
 							<p className="mt-0.5 text-sm text-ink-dull">
-								IP address to bind to (127.0.0.1 for local, 0.0.0.0 for all interfaces)
+								IP address to bind to (0.0.0.0 for Tailscale/LAN, 127.0.0.1 for local only)
 							</p>
 							<Input
 								type="text"
 								value={apiBind}
 								onChange={(e) => setApiBind(e.target.value)}
-								placeholder="127.0.0.1"
+								placeholder="0.0.0.0"
 								className="mt-2"
 							/>
 						</label>
