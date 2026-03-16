@@ -139,7 +139,7 @@ worker = "anthropic/claude-haiku-4.5-20250514"
 coding = "anthropic/claude-sonnet-4-20250514"
 ```
 
-When the worker spawns, Spacebot resolves the `coding` task override first and falls back to the normal worker model if no coding override is set. The resolved model string is then split into `provider_id/model_id` and passed to OpenCode's prompt API.
+When the worker spawns, Spacebot resolves the `coding` task override first and falls back to the normal worker model if no coding override is set. The resolved model string is then split into OpenCode's `model.providerID` / `model.modelID` request fields. Spacebot also normalizes its `openai-chatgpt/...` routing alias to OpenCode's native `openai/...` provider ID before sending the prompt.
 
 ## Full Configuration
 

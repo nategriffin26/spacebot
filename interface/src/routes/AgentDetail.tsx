@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { api, type CortexEvent, type CronJobInfo, MEMORY_TYPES } from "@/api/client";
+import { resolveThemeColor, useTheme } from "@/hooks/useTheme";
 import type { ChannelLiveState } from "@/hooks/useChannelLiveState";
 import { formatTimeAgo, formatCronSchedule } from "@/lib/format";
 import { DeleteAgentDialog } from "@/components/DeleteAgentDialog";
@@ -322,20 +323,28 @@ function BulletinSection({ bulletin }: { bulletin: string }) {
 // -- Charts --
 
 const CHART_COLORS = {
-	grid: "#2a2a3a",
-	axis: "#4a4a5a",
-	tick: "#8a8a9a",
 	accent: "#6366f1", // indigo
 	amber: "#f59e0b",
 	violet: "#8b5cf6",
 	green: "#10b981",
 	blue: "#3b82f6",
-	tooltip: {
-		bg: "#1a1a2e",
-		border: "#2a2a3a",
-		text: "#e0e0e0",
-	},
 };
+
+function useChartColors() {
+	const { theme } = useTheme();
+
+	return useMemo(() => ({
+		...CHART_COLORS,
+		grid: resolveThemeColor("--color-chart-grid", "#2a2a3a"),
+		axis: resolveThemeColor("--color-chart-axis", "#4a4a5a"),
+		tick: resolveThemeColor("--color-chart-tick", "#8a8a9a"),
+		tooltip: {
+			bg: resolveThemeColor("--color-chart-tooltip-bg", "#1a1a2e"),
+			border: resolveThemeColor("--color-chart-tooltip-border", "#2a2a3a"),
+			text: resolveThemeColor("--color-chart-tooltip-text", "#e0e0e0"),
+		},
+	}), [theme]);
+}
 
 const MEMORY_TYPE_COLORS = [
 	"#3b82f6", // fact - blue
@@ -349,6 +358,8 @@ const MEMORY_TYPE_COLORS = [
 ];
 
 function MemoryGrowthChart({ data }: { data: { date: string; count: number }[] }) {
+	const chartColors = useChartColors();
+
 	if (data.length === 0) {
 		return <div className="h-48 flex items-center justify-center text-ink-faint text-sm">No data</div>;
 	}
@@ -370,40 +381,40 @@ function MemoryGrowthChart({ data }: { data: { date: string; count: number }[] }
 				<AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
 					<defs>
 						<linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
-							<stop offset="5%" stopColor={CHART_COLORS.accent} stopOpacity={0.4} />
-							<stop offset="95%" stopColor={CHART_COLORS.accent} stopOpacity={0.05} />
+							<stop offset="5%" stopColor={chartColors.accent} stopOpacity={0.4} />
+							<stop offset="95%" stopColor={chartColors.accent} stopOpacity={0.05} />
 						</linearGradient>
 					</defs>
-					<CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" vertical={false} />
+					<CartesianGrid stroke={chartColors.grid} strokeDasharray="3 3" vertical={false} />
 					<XAxis
 						dataKey="date"
-						stroke={CHART_COLORS.axis}
-						tick={{ fill: CHART_COLORS.tick, fontSize: 11 }}
+						stroke={chartColors.axis}
+						tick={{ fill: chartColors.tick, fontSize: 11 }}
 						tickLine={false}
-						axisLine={{ stroke: CHART_COLORS.grid }}
+						axisLine={{ stroke: chartColors.grid }}
 						minTickGap={30}
 					/>
 					<YAxis
-						stroke={CHART_COLORS.axis}
-						tick={{ fill: CHART_COLORS.tick, fontSize: 11 }}
+						stroke={chartColors.axis}
+						tick={{ fill: chartColors.tick, fontSize: 11 }}
 						tickLine={false}
 						axisLine={false}
 					/>
 					<Tooltip
 						contentStyle={{
-							backgroundColor: CHART_COLORS.tooltip.bg,
-							border: `1px solid ${CHART_COLORS.tooltip.border}`,
+							backgroundColor: chartColors.tooltip.bg,
+							border: `1px solid ${chartColors.tooltip.border}`,
 							borderRadius: "6px",
 							fontSize: "12px",
 						}}
-						labelStyle={{ color: CHART_COLORS.tick }}
-						itemStyle={{ color: CHART_COLORS.tooltip.text }}
-						cursor={{ stroke: CHART_COLORS.axis }}
+						labelStyle={{ color: chartColors.tick }}
+						itemStyle={{ color: chartColors.tooltip.text }}
+						cursor={{ stroke: chartColors.axis }}
 					/>
 					<Area
 						type="monotone"
 						dataKey="total"
-						stroke={CHART_COLORS.accent}
+						stroke={chartColors.accent}
 						strokeWidth={2}
 						fill="url(#memoryGradient)"
 						fillOpacity={1}
@@ -415,6 +426,8 @@ function MemoryGrowthChart({ data }: { data: { date: string; count: number }[] }
 }
 
 function ProcessActivityChart({ data }: { data: { date: string; branches: number; workers: number }[] }) {
+	const chartColors = useChartColors();
+
 	if (data.length === 0) {
 		return <div className="h-48 flex items-center justify-center text-ink-faint text-sm">No activity</div>;
 	}
@@ -431,44 +444,44 @@ function ProcessActivityChart({ data }: { data: { date: string; branches: number
 				<AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
 					<defs>
 						<linearGradient id="branchGradient" x1="0" y1="0" x2="0" y2="1">
-							<stop offset="5%" stopColor={CHART_COLORS.violet} stopOpacity={0.4} />
-							<stop offset="95%" stopColor={CHART_COLORS.violet} stopOpacity={0.05} />
+							<stop offset="5%" stopColor={chartColors.violet} stopOpacity={0.4} />
+							<stop offset="95%" stopColor={chartColors.violet} stopOpacity={0.05} />
 						</linearGradient>
 						<linearGradient id="workerGradient" x1="0" y1="0" x2="0" y2="1">
-							<stop offset="5%" stopColor={CHART_COLORS.amber} stopOpacity={0.4} />
-							<stop offset="95%" stopColor={CHART_COLORS.amber} stopOpacity={0.05} />
+							<stop offset="5%" stopColor={chartColors.amber} stopOpacity={0.4} />
+							<stop offset="95%" stopColor={chartColors.amber} stopOpacity={0.05} />
 						</linearGradient>
 					</defs>
-					<CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" vertical={false} />
+					<CartesianGrid stroke={chartColors.grid} strokeDasharray="3 3" vertical={false} />
 					<XAxis
 						dataKey="date"
-						stroke={CHART_COLORS.axis}
-						tick={{ fill: CHART_COLORS.tick, fontSize: 11 }}
+						stroke={chartColors.axis}
+						tick={{ fill: chartColors.tick, fontSize: 11 }}
 						tickLine={false}
-						axisLine={{ stroke: CHART_COLORS.grid }}
+						axisLine={{ stroke: chartColors.grid }}
 						minTickGap={30}
 					/>
 					<YAxis
-						stroke={CHART_COLORS.axis}
-						tick={{ fill: CHART_COLORS.tick, fontSize: 11 }}
+						stroke={chartColors.axis}
+						tick={{ fill: chartColors.tick, fontSize: 11 }}
 						tickLine={false}
 						axisLine={false}
 					/>
 					<Tooltip
 						contentStyle={{
-							backgroundColor: CHART_COLORS.tooltip.bg,
-							border: `1px solid ${CHART_COLORS.tooltip.border}`,
+							backgroundColor: chartColors.tooltip.bg,
+							border: `1px solid ${chartColors.tooltip.border}`,
 							borderRadius: "6px",
 							fontSize: "12px",
 						}}
-						labelStyle={{ color: CHART_COLORS.tick }}
-						itemStyle={{ color: CHART_COLORS.tooltip.text }}
-						cursor={{ stroke: CHART_COLORS.axis }}
+						labelStyle={{ color: chartColors.tick }}
+						itemStyle={{ color: chartColors.tooltip.text }}
+						cursor={{ stroke: chartColors.axis }}
 					/>
 					<Area
 						type="monotone"
 						dataKey="branches"
-						stroke={CHART_COLORS.violet}
+						stroke={chartColors.violet}
 						strokeWidth={2}
 						fill="url(#branchGradient)"
 						fillOpacity={1}
@@ -476,7 +489,7 @@ function ProcessActivityChart({ data }: { data: { date: string; branches: number
 					<Area
 						type="monotone"
 						dataKey="workers"
-						stroke={CHART_COLORS.amber}
+						stroke={chartColors.amber}
 						strokeWidth={2}
 						fill="url(#workerGradient)"
 						fillOpacity={1}
@@ -539,6 +552,8 @@ function ActivityHeatmap({ data }: { data: { day: number; hour: number; count: n
 }
 
 function MemoryDonut({ counts }: { counts: Record<string, number> }) {
+	const chartColors = useChartColors();
+
 	const data = MEMORY_TYPES.map((type, idx) => ({
 		name: type,
 		value: counts[type] ?? 0,
@@ -551,7 +566,7 @@ function MemoryDonut({ counts }: { counts: Record<string, number> }) {
 	}
 
 	return (
-			<div>
+		<div>
 			<div className="relative h-40">
 				<ResponsiveContainer width="100%" height="100%">
 					<PieChart>
@@ -572,15 +587,15 @@ function MemoryDonut({ counts }: { counts: Record<string, number> }) {
 						</Pie>
 						<Tooltip
 							contentStyle={{
-								backgroundColor: CHART_COLORS.tooltip.bg,
-								border: `1px solid ${CHART_COLORS.tooltip.border}`,
+								backgroundColor: chartColors.tooltip.bg,
+								border: `1px solid ${chartColors.tooltip.border}`,
 								borderRadius: "6px",
 								fontSize: "12px",
 								padding: "4px 6px",
 							}}
 							wrapperStyle={{ zIndex: 20 }}
 							labelStyle={{ display: "none" }}
-							itemStyle={{ color: CHART_COLORS.tooltip.text, margin: 0, lineHeight: 1.2 }}
+							itemStyle={{ color: chartColors.tooltip.text, margin: 0, lineHeight: 1.2 }}
 						/>
 					</PieChart>
 				</ResponsiveContainer>

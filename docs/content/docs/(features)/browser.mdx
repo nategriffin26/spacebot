@@ -7,6 +7,8 @@ description: Headless Chrome automation for workers via CDP and the ref system.
 
 Browser automation for Spacebot workers via headless Chrome. Workers can navigate websites, interact with page elements, take screenshots, and extract content. Built on [chromiumoxide](https://github.com/mattsse/chromiumoxide), which drives Chrome over the DevTools Protocol (CDP).
 
+If you need Spacebot to attach to an already running Chrome session instead of launching its own browser process, use [MCP](/docs/mcp) with `chrome-devtools-mcp`. The built-in browser tool does not currently attach to a manually started Chrome instance.
+
 ## Why Worker-Only
 
 Browser use is restricted to workers. Channels never touch a browser. This follows the delegation model -- the channel spawns a worker with a task like "go to example.com, find the pricing table, and screenshot it." The worker launches Chrome, does the work, returns a summary. The channel stays responsive.

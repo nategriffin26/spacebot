@@ -12,6 +12,7 @@ import {
 	type MemoryType,
 	type RelationType,
 } from "@/api/client";
+import { resolveThemeColor, useTheme } from "@/hooks/useTheme";
 import { formatTimeAgo } from "@/lib/format";
 import { Button } from "@/ui";
 import { Target02Icon, PlusSignIcon, MinusSignIcon, RefreshIcon, Cancel01Icon } from "@hugeicons/core-free-icons";
@@ -39,7 +40,15 @@ const EDGE_COLORS: Record<RelationType, string> = {
 	part_of: "#60a5fa",
 };
 
-const FADED_NODE_COLOR = "#333333";
+function useGraphColors() {
+	const { theme } = useTheme();
+
+	return useMemo(() => ({
+		label: resolveThemeColor("--color-graph-label", "#999999"),
+		edge: resolveThemeColor("--color-graph-edge", "#444444"),
+		fadedNode: resolveThemeColor("--color-graph-faded-node", "#333333"),
+	}), [theme]);
+}
 
 interface MemoryGraphProps {
 	agentId: string;
@@ -54,6 +63,7 @@ interface NodeDetail {
 }
 
 export function MemoryGraph({ agentId, sort, typeFilter }: MemoryGraphProps) {
+	const graphColors = useGraphColors();
 	const containerRef = useRef<HTMLDivElement>(null);
 	const sigmaRef = useRef<Sigma | null>(null);
 	const graphRef = useRef<Graph | null>(null);
@@ -147,9 +157,9 @@ export function MemoryGraph({ agentId, sort, typeFilter }: MemoryGraphProps) {
 					renderLabels: true,
 					labelRenderedSizeThreshold: 12,
 					labelSize: 10,
-					labelColor: { color: "#999999" },
+					labelColor: { color: graphColors.label },
 					defaultEdgeType: "arrow",
-					defaultEdgeColor: "#444444",
+					defaultEdgeColor: graphColors.edge,
 					edgeLabelSize: 10,
 					edgeProgramClasses: {
 						arrow: EdgeArrowProgram,
@@ -159,7 +169,7 @@ export function MemoryGraph({ agentId, sort, typeFilter }: MemoryGraphProps) {
 						if (hoveredNode && hoveredNode !== node) {
 							const graph = graphRef.current;
 							if (graph && !graph.hasEdge(hoveredNode, node) && !graph.hasEdge(node, hoveredNode)) {
-								res.color = FADED_NODE_COLOR;
+									res.color = graphColors.fadedNode;
 								res.label = "";
 							}
 						}
@@ -208,7 +218,7 @@ export function MemoryGraph({ agentId, sort, typeFilter }: MemoryGraphProps) {
 			cancelled = true;
 			cleanup();
 		};
-	}, [queryKey, cleanup, agentId, sort, typeFilter]);
+	}, [queryKey, cleanup, agentId, sort, typeFilter, graphColors]);
 
 	// Register Sigma event handlers (separate from graph loading to avoid recreating)
 	useEffect(() => {

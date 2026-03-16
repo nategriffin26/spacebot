@@ -128,7 +128,7 @@ pub(super) async fn get_global_settings(
                 .get("api")
                 .and_then(|a| a.get("bind"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1")
+                .unwrap_or("0.0.0.0")
                 .to_string();
 
             let worker_log_mode = doc
@@ -204,7 +204,7 @@ pub(super) async fn get_global_settings(
                 None,
                 true,
                 19898,
-                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
                 "errors_only".to_string(),
                 OpenCodeSettingsResponse {
                     enabled: false,

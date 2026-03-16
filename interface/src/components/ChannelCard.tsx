@@ -13,12 +13,12 @@ function WorkerBadge({ worker }: { worker: ActiveWorker }) {
 	const oc = isOpenCodeWorker(worker);
 	return (
 		<div className={`flex items-center gap-2 rounded-md px-2.5 py-1.5 text-tiny ${
-			oc ? "bg-zinc-500/10" : "bg-amber-500/10"
+			oc ? "bg-app-selected/60" : "bg-amber-500/10"
 		}`}>
-			<div className={`h-1.5 w-1.5 animate-pulse rounded-full ${oc ? "bg-zinc-400" : "bg-amber-400"}`} />
+			<div className={`h-1.5 w-1.5 animate-pulse rounded-full ${oc ? "bg-ink-faint" : "bg-amber-400"}`} />
 			<div className="min-w-0 flex-1">
 				<div className="flex items-center gap-1.5">
-					<span className={`font-medium ${oc ? "text-zinc-300" : "text-amber-300"}`}>Worker</span>
+					<span className={`font-medium ${oc ? "text-ink" : "text-amber-300"}`}>Worker</span>
 					<span className="truncate text-ink-dull">{worker.task}</span>
 				</div>
 				<div className="mt-0.5 flex items-center gap-2 text-ink-faint">
@@ -26,7 +26,7 @@ function WorkerBadge({ worker }: { worker: ActiveWorker }) {
 					{worker.currentTool && (
 						<>
 							<span className="text-ink-faint/50">·</span>
-							<span className={oc ? "text-zinc-400/70" : "text-amber-400/70"}>{worker.currentTool}</span>
+							<span className={oc ? "text-ink-faint" : "text-amber-400/70"}>{worker.currentTool}</span>
 						</>
 					)}
 					{worker.toolCalls > 0 && (

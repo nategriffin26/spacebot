@@ -2,6 +2,16 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 
+function envList(name: string): string[] {
+	return (process.env[name] ?? "")
+		.split(",")
+		.map((value) => value.trim())
+		.filter(Boolean);
+}
+
+const devHost = process.env.SPACEBOT_VITE_HOST ?? "0.0.0.0";
+const allowedHosts = Array.from(new Set([".ts.net", ...envList("SPACEBOT_VITE_ALLOWED_HOSTS")]));
+
 export default defineConfig({
 	plugins: [react()],
 	resolve: {
@@ -10,6 +20,8 @@ export default defineConfig({
 		},
 	},
 	server: {
+		host: devHost,
+		allowedHosts,
 		port: 19840,
 		proxy: {
 			"/api": {
@@ -42,6 +54,10 @@ export default defineConfig({
 				},
 			},
 		},
+	},
+	preview: {
+		host: devHost,
+		allowedHosts,
 	},
 	build: {
 		outDir: "dist",

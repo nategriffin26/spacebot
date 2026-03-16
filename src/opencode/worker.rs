@@ -1053,7 +1053,37 @@ fn extract_sse_event(buffer: &mut String) -> Option<SseEvent> {
 fn parse_model_param(model: &str) -> Option<ModelParam> {
     let (provider, model_id) = model.split_once('/')?;
     Some(ModelParam {
-        provider_id: provider.to_string(),
+        provider_id: normalize_provider_for_opencode(provider).to_string(),
         model_id: model_id.to_string(),
     })
+}
+
+fn normalize_provider_for_opencode(provider: &str) -> &str {
+    match provider {
+        // Spacebot's OpenAI ChatGPT OAuth alias maps onto OpenCode's native
+        // OpenAI provider plugin.
+        "openai-chatgpt" => "openai",
+        _ => provider,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_model_param;
+
+    #[test]
+    fn parse_model_param_normalizes_openai_chatgpt_for_opencode() {
+        let model = parse_model_param("openai-chatgpt/gpt-5.4").expect("model should parse");
+
+        assert_eq!(model.provider_id, "openai");
+        assert_eq!(model.model_id, "gpt-5.4");
+    }
+
+    #[test]
+    fn parse_model_param_preserves_standard_provider_ids() {
+        let model = parse_model_param("anthropic/claude-sonnet-4").expect("model should parse");
+
+        assert_eq!(model.provider_id, "anthropic");
+        assert_eq!(model.model_id, "claude-sonnet-4");
+    }
 }

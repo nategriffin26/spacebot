@@ -145,7 +145,7 @@ impl Default for ApiConfig {
         Self {
             enabled: true,
             port: 19898,
-            bind: "127.0.0.1".into(),
+            bind: "0.0.0.0".into(),
             auth_token: None,
         }
     }

@@ -37,9 +37,10 @@ pub enum PartInput {
 
 /// Model selection for a prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ModelParam {
+    #[serde(rename = "providerID")]
     pub provider_id: String,
+    #[serde(rename = "modelID")]
     pub model_id: String,
 }
 
@@ -666,5 +667,30 @@ pub fn part_to_opencode_part(part: &Part) -> Option<OpenCodePart> {
             reason: reason.clone(),
         }),
         Part::Other => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelParam, SendPromptRequest};
+
+    #[test]
+    fn send_prompt_request_serializes_model_with_upstream_opencode_keys() {
+        let request = SendPromptRequest {
+            parts: vec![],
+            system: None,
+            model: Some(ModelParam {
+                provider_id: "openai".into(),
+                model_id: "gpt-5.4".into(),
+            }),
+            agent: None,
+        };
+
+        let value = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(value["model"]["providerID"], "openai");
+        assert_eq!(value["model"]["modelID"], "gpt-5.4");
+        assert!(value["model"].get("providerId").is_none());
+        assert!(value["model"].get("modelId").is_none());
     }
 }

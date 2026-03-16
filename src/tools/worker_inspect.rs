@@ -165,6 +165,18 @@ impl Tool for WorkerInspectTool {
             summary.push_str("\n*No transcript available for this worker.*\n");
         }
 
+        if detail.status == "failed"
+            && detail
+                .result
+                .as_deref()
+                .is_some_and(|result| result.contains("Spacebot restarted before completion"))
+        {
+            summary.push_str(&format!(
+                "\n### Recovery\n\nSuggested prompt:\n\n> Inspect worker `{}` and continue the interrupted task from the saved transcript instead of starting over.\n",
+                detail.id
+            ));
+        }
+
         Ok(WorkerInspectOutput {
             action: "inspect".to_string(),
             summary,

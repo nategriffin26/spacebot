@@ -1,6 +1,6 @@
 //! API handlers for MCP server management.
 //!
-//! CRUD endpoints for `[[mcp_servers]]` in config.toml, plus per-agent
+//! CRUD endpoints for `[[defaults.mcp]]` / `[[agents.mcp]]` in config.toml, plus per-agent
 //! connection status.
 
 use super::state::ApiState;
@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
 #[derive(Deserialize)]
 pub(super) struct CreateMcpServerRequest {
@@ -52,7 +53,49 @@ pub(super) struct MutationResponse {
     pub message: String,
 }
 
-/// GET /api/mcp/servers — list all configured MCP servers from config.toml.
+fn defaults_mcp_tables(doc: &DocumentMut) -> Option<&ArrayOfTables> {
+    doc.get("defaults")
+        .and_then(Item::as_table)
+        .and_then(|defaults| defaults.get("mcp"))
+        .and_then(Item::as_array_of_tables)
+}
+
+fn configured_mcp_tables(doc: &DocumentMut) -> Option<&ArrayOfTables> {
+    defaults_mcp_tables(doc).or_else(|| doc.get("mcp_servers").and_then(Item::as_array_of_tables))
+}
+
+fn configured_mcp_tables_mut(doc: &mut DocumentMut) -> Option<&mut ArrayOfTables> {
+    let has_defaults_mcp = defaults_mcp_tables(doc).is_some();
+    if has_defaults_mcp {
+        return doc
+            .get_mut("defaults")
+            .and_then(Item::as_table_mut)
+            .and_then(|defaults| defaults.get_mut("mcp"))
+            .and_then(Item::as_array_of_tables_mut);
+    }
+
+    doc.get_mut("mcp_servers")
+        .and_then(Item::as_array_of_tables_mut)
+}
+
+fn ensure_configured_mcp_tables_mut(doc: &mut DocumentMut) -> Option<&mut ArrayOfTables> {
+    if configured_mcp_tables(doc).is_some() {
+        return configured_mcp_tables_mut(doc);
+    }
+
+    if doc.get("defaults").is_none() {
+        doc.insert("defaults", Item::Table(Table::new()));
+    }
+
+    let defaults = doc.get_mut("defaults")?.as_table_mut()?;
+    if defaults.get("mcp").is_none() {
+        defaults.insert("mcp", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+
+    defaults.get_mut("mcp")?.as_array_of_tables_mut()
+}
+
+/// GET /api/mcp/servers — list configured MCP servers from config.toml.
 pub(super) async fn list_mcp_servers(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<McpServerInfo>>, StatusCode> {
@@ -71,7 +114,7 @@ pub(super) async fn list_mcp_servers(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let mut defs = Vec::new();
-        if let Some(arr) = doc.get("mcp_servers").and_then(|v| v.as_array_of_tables()) {
+        if let Some(arr) = configured_mcp_tables(&doc) {
             for table in arr.iter() {
                 let name = table
                     .get("name")
@@ -133,7 +176,7 @@ pub(super) async fn create_mcp_server(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check for duplicates
-    if let Some(arr) = doc.get("mcp_servers").and_then(|v| v.as_array_of_tables()) {
+    if let Some(arr) = configured_mcp_tables(&doc) {
         for table in arr.iter() {
             if table.get("name").and_then(|v| v.as_str()) == Some(&request.name) {
                 return Ok(Json(MutationResponse {
@@ -181,17 +224,7 @@ pub(super) async fn create_mcp_server(
         new_table["headers"] = toml_edit::value(headers_table);
     }
 
-    // Append to [[mcp_servers]] array
-    if doc.get("mcp_servers").is_none() {
-        doc.insert(
-            "mcp_servers",
-            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
-        );
-    }
-    if let Some(arr) = doc
-        .get_mut("mcp_servers")
-        .and_then(|v| v.as_array_of_tables_mut())
-    {
+    if let Some(arr) = ensure_configured_mcp_tables_mut(&mut doc) {
         arr.push(new_table);
     }
 
@@ -225,10 +258,7 @@ pub(super) async fn update_mcp_server(
         .parse()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let Some(arr) = doc
-        .get_mut("mcp_servers")
-        .and_then(|v| v.as_array_of_tables_mut())
-    else {
+    let Some(arr) = configured_mcp_tables_mut(&mut doc) else {
         return Ok(Json(MutationResponse {
             success: false,
             message: format!("MCP server '{}' not found", request.name),
@@ -305,10 +335,7 @@ pub(super) async fn delete_mcp_server(
         .parse()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let Some(arr) = doc
-        .get_mut("mcp_servers")
-        .and_then(|v| v.as_array_of_tables_mut())
-    else {
+    let Some(arr) = configured_mcp_tables_mut(&mut doc) else {
         return Ok(Json(MutationResponse {
             success: false,
             message: format!("MCP server '{}' not found", server_name),
@@ -419,4 +446,43 @@ async fn get_server_state(state: &ApiState, server_name: &str) -> String {
         }
     }
     "not_connected".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{configured_mcp_tables, ensure_configured_mcp_tables_mut};
+
+    #[test]
+    fn configured_mcp_tables_prefers_defaults_section() {
+        let doc = r#"
+[defaults]
+
+[[defaults.mcp]]
+name = "chrome_devtools"
+transport = "stdio"
+command = "npx"
+
+[[mcp_servers]]
+name = "legacy"
+transport = "stdio"
+command = "npx"
+"#
+        .parse()
+        .expect("config should parse");
+
+        let tables = configured_mcp_tables(&doc).expect("mcp tables should exist");
+        let first = tables.iter().next().expect("one mcp table should exist");
+
+        assert_eq!(tables.len(), 1);
+        assert_eq!(first["name"].as_str(), Some("chrome_devtools"));
+    }
+
+    #[test]
+    fn ensure_configured_mcp_tables_mut_creates_defaults_mcp_section() {
+        let mut doc = "[defaults]\n".parse().expect("config should parse");
+
+        let tables = ensure_configured_mcp_tables_mut(&mut doc).expect("mcp tables should exist");
+        assert!(tables.is_empty());
+        assert!(configured_mcp_tables(&doc).is_some());
+    }
 }

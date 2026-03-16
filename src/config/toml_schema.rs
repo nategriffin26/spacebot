@@ -108,7 +108,7 @@ pub(super) fn default_api_port() -> u16 {
     19898
 }
 pub(super) fn default_api_bind() -> String {
-    "127.0.0.1".into()
+    "0.0.0.0".into()
 }
 
 pub(super) fn hosted_api_bind(bind: String) -> String {

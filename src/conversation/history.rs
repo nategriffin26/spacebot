@@ -6,6 +6,17 @@ use serde::Serialize;
 use sqlx::{Row as _, SqlitePool};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InterruptedWorkerRow {
+    pub id: String,
+    pub channel_id: Option<String>,
+    pub task: String,
+    pub worker_type: String,
+    pub started_at: String,
+    pub directory: Option<String>,
+    pub transcript: Option<Vec<u8>>,
+}
+
 /// Persists conversation messages (user and assistant) to SQLite.
 ///
 /// All write methods are fire-and-forget — they spawn a tokio task and return
@@ -568,7 +579,21 @@ impl ProcessRunLogger {
         &self,
         agent_id: &str,
         failure_message: &str,
-    ) -> crate::error::Result<u64> {
+    ) -> crate::error::Result<Vec<InterruptedWorkerRow>> {
+        let interrupted_workers = sqlx::query_as::<_, InterruptedWorkerRow>(
+            "SELECT id, channel_id, task, worker_type, started_at, directory, transcript \
+             FROM worker_runs \
+             WHERE status = 'running' AND (agent_id = ? OR agent_id IS NULL)",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        if interrupted_workers.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let result = sqlx::query(
             "UPDATE worker_runs \
              SET status = 'failed', \
@@ -585,7 +610,17 @@ impl ProcessRunLogger {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(result.rows_affected())
+        let rows_affected = result.rows_affected() as usize;
+        if rows_affected < interrupted_workers.len() {
+            tracing::warn!(
+                agent_id,
+                rows_affected,
+                expected = interrupted_workers.len(),
+                "startup worker reconciliation updated fewer rows than expected"
+            );
+        }
+
+        Ok(interrupted_workers)
     }
 
     /// Load all idle interactive workers for an agent.

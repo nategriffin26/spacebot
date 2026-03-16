@@ -920,6 +920,39 @@ fn redact_token(token: &str) -> &str {
     &token[..prefix_len]
 }
 
+fn api_client_host(bind: &str) -> &str {
+    match bind.trim_matches(&['[', ']'][..]) {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+}
+
+fn interrupted_worker_recovery_message(
+    worker: &spacebot::conversation::history::InterruptedWorkerRow,
+) -> String {
+    let mut message = format!(
+        "Interrupted worker `{}` ({}) was marked failed because Spacebot restarted before it finished.\n\nTask: {}\nStarted: {}",
+        worker.id, worker.worker_type, worker.task, worker.started_at,
+    );
+
+    if let Some(directory) = &worker.directory {
+        message.push_str(&format!("\nDirectory: {directory}"));
+    }
+
+    let transcript_hint = if worker.transcript.is_some() {
+        "A transcript snapshot was saved."
+    } else {
+        "No transcript snapshot was available, so recovery may require a shorter recap."
+    };
+
+    message.push_str(&format!(
+        "\n\n{transcript_hint} To continue without starting over, ask Spacebot to inspect worker `{}` and resume from the last completed step. Suggested prompt:\n\nInspect worker `{}` and continue the interrupted task in place, resuming from the saved transcript instead of starting over.",
+        worker.id, worker.id,
+    ));
+
+    message
+}
+
 fn cmd_secrets(
     config_path: Option<std::path::PathBuf>,
     secrets_cmd: SecretsCommand,
@@ -928,7 +961,11 @@ fn cmd_secrets(
     bootstrap_secrets_store(&config_path);
 
     let config = load_config(&config_path)?;
-    let api_base = format!("http://{}:{}/api", config.api.bind, config.api.port);
+    let api_base = format!(
+        "http://{}:{}/api",
+        api_client_host(&config.api.bind),
+        config.api.port
+    );
     let auth_token = config.api.auth_token.clone();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1862,7 +1899,8 @@ async fn run(
             eprintln!("No LLM provider keys configured.");
             eprintln!(
                 "Please add a provider key via the web UI at http://{}:{}",
-                config.api.bind, config.api.port
+                api_client_host(&config.api.bind),
+                config.api.port
             );
         }
     }
@@ -2788,7 +2826,7 @@ async fn initialize_agents(
             })?;
 
         let run_logger = spacebot::conversation::ProcessRunLogger::new(db.sqlite.clone());
-        let orphaned_workers = run_logger
+        let interrupted_workers = run_logger
             .reconcile_running_workers_for_agent(
                 &agent_config.id,
                 "Worker interrupted: Spacebot restarted before completion.",
@@ -2800,12 +2838,21 @@ async fn initialize_agents(
                     agent_config.id
                 )
             })?;
-        if orphaned_workers > 0 {
+        if !interrupted_workers.is_empty() {
             tracing::warn!(
                 agent_id = %agent_config.id,
-                orphaned_workers,
+                orphaned_workers = interrupted_workers.len(),
                 "marked stale running workers as failed during startup"
             );
+
+            let conversation_logger =
+                spacebot::conversation::history::ConversationLogger::new(db.sqlite.clone());
+            for worker in &interrupted_workers {
+                if let Some(channel_id) = &worker.channel_id {
+                    let recovery_message = interrupted_worker_recovery_message(worker);
+                    conversation_logger.log_system_message(channel_id, &recovery_message);
+                }
+            }
         }
 
         // Per-agent settings store (redb-backed)
@@ -3685,7 +3732,8 @@ async fn initialize_agents(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_IDLE_OPENCODE_RESUME_AGE, idle_opencode_worker_is_stale, wait_for_startup_warmup_tasks,
+        MAX_IDLE_OPENCODE_RESUME_AGE, idle_opencode_worker_is_stale,
+        interrupted_worker_recovery_message, wait_for_startup_warmup_tasks,
     };
     use std::future::pending;
     use std::sync::Arc;
@@ -3791,5 +3839,25 @@ mod tests {
         };
 
         assert!(!idle_opencode_worker_is_stale(&worker, now));
+    }
+
+    #[test]
+    fn interrupted_worker_recovery_message_includes_resume_guidance() {
+        let worker = spacebot::conversation::history::InterruptedWorkerRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            channel_id: Some("discord:test".into()),
+            task: "finish wiring restart recovery".into(),
+            worker_type: "builtin".into(),
+            started_at: "2026-03-14 12:00:00".into(),
+            directory: Some("/tmp/spacebot".into()),
+            transcript: Some(vec![1, 2, 3]),
+        };
+
+        let message = interrupted_worker_recovery_message(&worker);
+
+        assert!(message.contains("Spacebot restarted before it finished"));
+        assert!(message.contains(&worker.id));
+        assert!(message.contains("saved transcript"));
+        assert!(message.contains("continue the interrupted task in place"));
     }
 }

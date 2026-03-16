@@ -38,6 +38,16 @@ Channel: "route: looks good, run the tests"
 
 Interactive workers stay alive until the input channel is dropped, a follow-up fails, or the channel cancels them.
 
+## Restart Recovery
+
+Interactive workers waiting for follow-up input persist their transcript to `worker_runs` and are resumed on Spacebot startup when possible.
+
+- idle interactive workers are restored into channel state on restart
+- running workers cannot safely continue mid-tool-call, so startup marks them failed
+- when a running worker is interrupted by restart, Spacebot now writes a system message into the channel with the worker ID and a suggested recovery prompt
+
+The practical recovery flow is: ask Spacebot to inspect the interrupted worker transcript and continue from the last completed step rather than starting from scratch.
+
 ## Tools
 
 Every worker gets a ToolServer with:

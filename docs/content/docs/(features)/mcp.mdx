@@ -1,0 +1,124 @@
+---
+title: MCP
+description: Connect Spacebot workers to external tool servers via the Model Context Protocol.
+---
+
+# MCP
+
+Spacebot can connect worker processes to external [MCP](https://modelcontextprotocol.io/) servers. Each connected MCP tool is registered on workers as a normal Rig tool with a namespaced name like `chrome_devtools_list_pages` or `sentry_get_issue`.
+
+## What Spacebot Supports
+
+- `stdio` transport for local subprocess servers
+- `http` transport for remote streamable HTTP servers
+- automatic retry and reconnect on startup failure
+- hot reload when `[[mcp_servers]]` changes in `config.toml`
+- worker-side tool registration only; channels and branches never call MCP tools directly
+
+## Configuration
+
+Define MCP servers under `[defaults]` so every agent inherits them, or under a specific `[[agents]]` block for per-agent MCP:
+
+```toml
+[defaults]
+
+[[defaults.mcp]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+
+[[defaults.mcp]]
+name = "sentry"
+transport = "http"
+url = "https://mcp.sentry.io"
+headers = { Authorization = "Bearer ${SENTRY_TOKEN}" }
+
+[[agents]]
+id = "browser-agent"
+
+[[agents.mcp]]
+name = "chrome_devtools"
+transport = "stdio"
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@latest", "--autoConnect", "--channel=stable"]
+```
+
+For `stdio`, Spacebot launches the subprocess with a sanitized environment and only the variables you pass in `env`. For `http`, headers are attached to the MCP connection itself.
+
+MCP string values support `${VAR_NAME}` interpolation at connection time. That works for `command`, `args`, `env`, `url`, and `headers`.
+
+## Chrome DevTools MCP
+
+If you want Spacebot to attach to a real running Chrome session instead of launching its built-in browser, use the official Chrome DevTools MCP server.
+
+### Attach to a running Chrome on macOS
+
+Add this to `config.toml`:
+
+```toml
+[[defaults.mcp]]
+name = "chrome_devtools"
+transport = "stdio"
+command = "npx"
+args = [
+  "-y",
+  "chrome-devtools-mcp@latest",
+  "--browser-url=http://127.0.0.1:9222",
+  "--no-usage-statistics",
+]
+```
+
+Then start Chrome yourself with remote debugging enabled and a separate profile:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/spacebot-chrome-mcp
+```
+
+After Spacebot reloads config or restarts, worker prompts can use the discovered tools directly. Example names include `chrome_devtools_list_pages`, `chrome_devtools_take_snapshot`, and `chrome_devtools_evaluate_script`.
+
+### Chrome 144+ auto-connect
+
+If Nate wants Chrome to keep the main user-visible session and approve attachment interactively, Chrome DevTools MCP also supports `--autoConnect`:
+
+```toml
+[[defaults.mcp]]
+name = "chrome_devtools"
+transport = "stdio"
+command = "npx"
+args = [
+  "-y",
+  "chrome-devtools-mcp@latest",
+  "--autoConnect",
+  "--no-usage-statistics",
+]
+```
+
+That requires Chrome 144+ and a one-time enablement flow in `chrome://inspect/#remote-debugging`.
+
+## When To Use Built-in Browser vs MCP
+
+- Use the built-in browser tool when Spacebot should launch and own its own Chrome instance.
+- Use Chrome DevTools MCP when Spacebot should attach to an already running Chrome session, share tabs with manual browsing, or rely on Chrome DevTools MCP's richer tool surface.
+
+## Verification
+
+Practical checks:
+
+1. Run `npx -y chrome-devtools-mcp@latest --help` to verify the server is installable on the machine.
+2. Start Chrome with the matching attach mode:
+   - `--browser-url=http://127.0.0.1:9222` if you launched Chrome with `--remote-debugging-port=9222`
+   - `--autoConnect` if you enabled Chrome's newer remote-debugging approval flow
+3. Reload Spacebot config or restart Spacebot.
+4. Confirm the server shows as connected in `GET /api/mcp/status` or the UI.
+5. Spawn a worker and ask it to call `chrome_devtools_list_pages`.
+
+For `--browser-url`, a direct `curl http://127.0.0.1:9222/json/version` check should work. For `--autoConnect`, the most reliable proof is that `chrome_devtools_list_pages` returns your real tabs.
+
+## Security Notes
+
+- Any connected MCP client can control the attached Chrome session.
+- Remote debugging should use a dedicated local profile unless you explicitly want to share your active browsing state.
+- When using `--browser-url`, keep the debugging port bound to localhost and close that Chrome instance when done.

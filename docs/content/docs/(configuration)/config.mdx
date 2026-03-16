@@ -125,6 +125,24 @@ close_policy = "close_browser"           # "close_browser", "close_tabs", or "de
 executable_path = "/path/to/chrome"      # optional, auto-detected
 screenshot_dir = "/path/to/screenshots"  # optional, defaults to data_dir/screenshots
 
+# External MCP servers for worker tool access.
+[[defaults.mcp]]
+name = "chrome_devtools"
+transport = "stdio"
+command = "npx"
+args = [
+  "-y",
+  "chrome-devtools-mcp@latest",
+  "--browser-url=http://127.0.0.1:9222",
+  "--no-usage-statistics",
+]
+
+[[defaults.mcp]]
+name = "sentry"
+transport = "http"
+url = "https://mcp.sentry.io"
+headers = { Authorization = "Bearer ${SENTRY_TOKEN}" }
+
 # --- Agents ---
 # At least one agent is required. First agent or the one with default = true
 # is the default.
@@ -206,6 +224,8 @@ groq_key = "gsk_abc123..."
 
 The `secret:` prefix resolves from the agent's secret store at config load time. If the secret doesn't exist, the value is treated as missing and implicit env fallbacks are tried.
 
+`[[defaults.mcp]]` and `[[agents.mcp]]` also support `${VAR_NAME}` interpolation inside `command`, `args`, `env`, `url`, and `headers`. That is the recommended way to pass tokens into MCP server definitions.
+
 LLM keys also have implicit env fallbacks — if no key is set in the TOML, Spacebot checks `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KILO_API_KEY`, and `OPENCODE_GO_API_KEY` automatically.
 
 Use `POST /api/secrets/migrate` to automatically move plaintext credentials from `config.toml` into the secret store and replace them with `secret:` references. See [Secret Store -- Migration](/docs/secrets#migration) for details.
@@ -262,6 +282,7 @@ Most config values are hot-reloaded when their files change. Spacebot watches `c
 | `context_window` | Yes | Next compaction/worker check uses new size |
 | `max_concurrent_branches` | Yes | Next branch spawn checks new limit |
 | Browser config | Yes | Next worker spawn uses new config |
+| `[[defaults.mcp]]` / `[[agents.mcp]]` | Yes | MCP connections reconcile live |
 | Warmup config | Yes | Next warmup pass uses new values |
 | Identity files (SOUL.md, etc.) | Yes | Next channel message renders new identity |
 | Skills (SKILL.md files) | Yes | Next message / worker spawn sees new skills |
