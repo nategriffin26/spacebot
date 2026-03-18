@@ -108,6 +108,63 @@ impl Tool for WorkerInspectTool {
             summary.push_str(&format!("\n### Result\n\n{result}\n"));
         }
 
+        if let Some(receipt_json) = &detail.outcome_receipt_json {
+            match serde_json::from_str::<crate::WorkerOutcomeReceipt>(receipt_json) {
+                Ok(receipt) => {
+                    summary.push_str("\n### Receipt\n\n");
+                    summary.push_str(&format!("**Summary:** {}\n\n", receipt.summary));
+                    if !receipt.sources_used.is_empty() {
+                        summary.push_str(&format!(
+                            "**Sources used:** {}\n\n",
+                            receipt.sources_used.join(", ")
+                        ));
+                    }
+                    if !receipt.artifacts_created.is_empty() {
+                        summary.push_str(&format!(
+                            "**Artifacts created:** {}\n\n",
+                            receipt.artifacts_created.join(", ")
+                        ));
+                    }
+                    if !receipt.commands_run.is_empty() {
+                        summary.push_str("**Commands run:**\n");
+                        for command in &receipt.commands_run {
+                            summary.push_str(&format!("- `{command}`\n"));
+                        }
+                        summary.push('\n');
+                    }
+                    if !receipt.verified_claims.is_empty() {
+                        summary.push_str("**Verified claims:**\n");
+                        for claim in &receipt.verified_claims {
+                            summary.push_str(&format!("- {claim}\n"));
+                        }
+                        summary.push('\n');
+                    }
+                    if !receipt.inferred_claims.is_empty() {
+                        summary.push_str("**Inferred claims:**\n");
+                        for claim in &receipt.inferred_claims {
+                            summary.push_str(&format!("- {claim}\n"));
+                        }
+                        summary.push('\n');
+                    }
+                    if !receipt.blockers.is_empty() {
+                        summary.push_str("**Blockers:**\n");
+                        for blocker in &receipt.blockers {
+                            summary.push_str(&format!("- {blocker}\n"));
+                        }
+                        summary.push('\n');
+                    }
+                    if receipt.wrong_source_detected {
+                        summary.push_str("**Wrong source detected:** yes\n\n");
+                    }
+                }
+                Err(error) => {
+                    summary.push_str(&format!(
+                        "\n*Outcome receipt could not be parsed: {error}*\n"
+                    ));
+                }
+            }
+        }
+
         if let Some(blob) = &detail.transcript_blob {
             match worker_transcript::deserialize_transcript(blob) {
                 Ok(steps) => {

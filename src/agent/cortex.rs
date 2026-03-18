@@ -2803,6 +2803,7 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
         None,
         task_prompt,
         worker_system_prompt,
+        None,
         deps.clone(),
         browser_config,
         screenshot_dir,

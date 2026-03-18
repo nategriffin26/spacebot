@@ -1,8 +1,11 @@
 //! Conversation message persistence (SQLite).
 
-use crate::{BranchId, ChannelId, WorkerId};
+use crate::{
+    BranchId, ChannelId, RequestGroupMode, RequestGroupState, SourceManifest, TaskClass, WorkerId,
+    WorkerOutcomeReceipt,
+};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{Row as _, SqlitePool};
 use std::collections::HashMap;
 
@@ -15,6 +18,36 @@ pub struct InterruptedWorkerRow {
     pub started_at: String,
     pub directory: Option<String>,
     pub transcript: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestGroupRecord {
+    pub id: String,
+    pub agent_id: String,
+    pub channel_id: String,
+    pub origin_message_id: Option<String>,
+    pub origin_user_text: String,
+    pub mode: String,
+    pub state: String,
+    pub task_class: Option<String>,
+    pub source_manifest_json: Option<String>,
+    pub required_receipts_json: Option<String>,
+    pub completion_policy_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OperatorPolicyRecord {
+    pub id: String,
+    pub agent_id: String,
+    pub policy_key: String,
+    pub content: String,
+    pub priority: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_reaffirmed_at: Option<String>,
+    pub source_channel_id: Option<String>,
 }
 
 /// Persists conversation messages (user and assistant) to SQLite.
@@ -296,6 +329,145 @@ impl ProcessRunLogger {
         Self { pool }
     }
 
+    /// Persist or reaffirm a durable operator policy for an agent. Fire-and-forget.
+    pub fn upsert_operator_policy(
+        &self,
+        agent_id: &str,
+        policy_key: &str,
+        content: &str,
+        priority: i64,
+        source_channel_id: Option<&ChannelId>,
+    ) {
+        let pool = self.pool.clone();
+        let id = uuid::Uuid::new_v4().to_string();
+        let agent_id = agent_id.to_string();
+        let policy_key = policy_key.to_string();
+        let content = content.to_string();
+        let source_channel_id = source_channel_id.map(ToString::to_string);
+
+        tokio::spawn(async move {
+            if let Err(error) = sqlx::query(
+                "INSERT INTO operator_policies \
+                 (id, agent_id, policy_key, content, priority, source_channel_id, last_reaffirmed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+                 ON CONFLICT(agent_id, policy_key) DO UPDATE SET \
+                    content = excluded.content, \
+                    priority = MAX(operator_policies.priority, excluded.priority), \
+                    updated_at = CURRENT_TIMESTAMP, \
+                    last_reaffirmed_at = CURRENT_TIMESTAMP, \
+                    source_channel_id = COALESCE(excluded.source_channel_id, operator_policies.source_channel_id)",
+            )
+            .bind(&id)
+            .bind(&agent_id)
+            .bind(&policy_key)
+            .bind(&content)
+            .bind(priority)
+            .bind(&source_channel_id)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%error, %agent_id, %policy_key, "failed to persist operator policy");
+            }
+        });
+    }
+
+    /// Load durable operator policies for an agent, ordered by precedence.
+    pub async fn list_operator_policies(
+        &self,
+        agent_id: &str,
+        limit: i64,
+    ) -> crate::error::Result<Vec<OperatorPolicyRecord>> {
+        let rows = sqlx::query_as::<_, OperatorPolicyRecord>(
+            "SELECT id, agent_id, policy_key, content, priority, created_at, updated_at, \
+                    last_reaffirmed_at, source_channel_id \
+             FROM operator_policies \
+             WHERE agent_id = ? \
+             ORDER BY priority DESC, updated_at DESC \
+             LIMIT ?",
+        )
+        .bind(agent_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(rows)
+    }
+
+    /// Persist a new request-group record. Fire-and-forget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_request_group_started(
+        &self,
+        request_group_id: &str,
+        agent_id: &str,
+        channel_id: &ChannelId,
+        origin_message_id: Option<&str>,
+        origin_user_text: &str,
+        mode: RequestGroupMode,
+        task_class: Option<TaskClass>,
+        source_manifest: &SourceManifest,
+    ) {
+        let pool = self.pool.clone();
+        let request_group_id = request_group_id.to_string();
+        let agent_id = agent_id.to_string();
+        let channel_id = channel_id.to_string();
+        let origin_message_id = origin_message_id.map(ToOwned::to_owned);
+        let origin_user_text = origin_user_text.to_string();
+        let mode = mode.as_str().to_string();
+        let task_class = task_class.map(|value| value.as_str().to_string());
+        let source_manifest_json = serde_json::to_string(source_manifest).ok();
+
+        tokio::spawn(async move {
+            if let Err(error) = sqlx::query(
+                "INSERT OR IGNORE INTO request_groups \
+                 (id, agent_id, channel_id, origin_message_id, origin_user_text, mode, state, task_class, source_manifest_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'planning', ?, ?)",
+            )
+            .bind(&request_group_id)
+            .bind(&agent_id)
+            .bind(&channel_id)
+            .bind(&origin_message_id)
+            .bind(&origin_user_text)
+            .bind(&mode)
+            .bind(&task_class)
+            .bind(&source_manifest_json)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%error, request_group_id, "failed to persist request group");
+            }
+        });
+    }
+
+    /// Update the durable state of a request group. Fire-and-forget.
+    pub fn log_request_group_state(
+        &self,
+        request_group_id: &str,
+        state: RequestGroupState,
+        required_receipts_json: Option<String>,
+        completion_policy_json: Option<String>,
+    ) {
+        let pool = self.pool.clone();
+        let request_group_id = request_group_id.to_string();
+        let state = state.as_str().to_string();
+
+        tokio::spawn(async move {
+            if let Err(error) = sqlx::query(
+                "UPDATE request_groups SET state = ?, required_receipts_json = COALESCE(?, required_receipts_json), \
+                 completion_policy_json = COALESCE(?, completion_policy_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(&state)
+            .bind(&required_receipts_json)
+            .bind(&completion_policy_json)
+            .bind(&request_group_id)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%error, request_group_id, "failed to update request group state");
+            }
+        });
+    }
+
     /// Record a branch starting. Fire-and-forget.
     pub fn log_branch_started(
         &self,
@@ -339,6 +511,25 @@ impl ProcessRunLogger {
             .await
             {
                 tracing::warn!(%error, branch_id = %id, "failed to persist branch completion");
+            }
+        });
+    }
+
+    /// Link an existing branch run to a request group. Fire-and-forget.
+    pub fn log_branch_request_group(&self, branch_id: BranchId, request_group_id: &str) {
+        let pool = self.pool.clone();
+        let branch_id = branch_id.to_string();
+        let request_group_id = request_group_id.to_string();
+
+        tokio::spawn(async move {
+            if let Err(error) =
+                sqlx::query("UPDATE branch_runs SET request_group_id = ? WHERE id = ?")
+                    .bind(&request_group_id)
+                    .bind(&branch_id)
+                    .execute(&pool)
+                    .await
+            {
+                tracing::warn!(%error, branch_id, request_group_id, "failed to link branch request group");
             }
         });
     }
@@ -431,6 +622,63 @@ impl ProcessRunLogger {
                 }
             }
             tracing::debug!(worker_id = %id, "worker_runs row not found after retries for project link");
+        });
+    }
+
+    /// Link a worker run to a request group and persist its task class/source manifest.
+    pub fn log_worker_request_group(
+        &self,
+        worker_id: WorkerId,
+        request_group_id: &str,
+        task_class: Option<TaskClass>,
+        source_manifest: Option<&SourceManifest>,
+    ) {
+        let pool = self.pool.clone();
+        let worker_id = worker_id.to_string();
+        let request_group_id = request_group_id.to_string();
+        let task_class = task_class.map(|value| value.as_str().to_string());
+        let source_manifest_json =
+            source_manifest.and_then(|value| serde_json::to_string(value).ok());
+
+        tokio::spawn(async move {
+            if let Err(error) = sqlx::query(
+                "UPDATE worker_runs SET request_group_id = ?, task_class = COALESCE(?, task_class), \
+                 source_manifest_json = COALESCE(?, source_manifest_json) WHERE id = ?",
+            )
+            .bind(&request_group_id)
+            .bind(&task_class)
+            .bind(&source_manifest_json)
+            .bind(&worker_id)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%error, worker_id, request_group_id, "failed to link worker request group");
+            }
+        });
+    }
+
+    /// Persist a structured worker completion receipt. Fire-and-forget.
+    pub fn log_worker_receipt(&self, worker_id: WorkerId, receipt: &WorkerOutcomeReceipt) {
+        let pool = self.pool.clone();
+        let worker_id = worker_id.to_string();
+        let receipt_json = match serde_json::to_string(receipt) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, worker_id, "failed to serialize worker receipt");
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            if let Err(error) =
+                sqlx::query("UPDATE worker_runs SET outcome_receipt_json = ? WHERE id = ?")
+                    .bind(&receipt_json)
+                    .bind(&worker_id)
+                    .execute(&pool)
+                    .await
+            {
+                tracing::warn!(%error, worker_id, "failed to persist worker receipt");
+            }
         });
     }
 
@@ -950,7 +1198,7 @@ impl ProcessRunLogger {
             "SELECT w.id, w.task, w.result, w.status, w.worker_type, w.channel_id, \
                     w.started_at, w.completed_at, w.transcript, w.tool_calls, \
                     w.opencode_session_id, w.opencode_port, w.interactive, w.directory, \
-                    c.display_name as channel_name \
+                    w.outcome_receipt_json, c.display_name as channel_name \
              FROM worker_runs w \
              LEFT JOIN channels c ON w.channel_id = c.id \
              WHERE w.agent_id = ? AND w.id = ?",
@@ -987,6 +1235,7 @@ impl ProcessRunLogger {
             directory: row
                 .try_get::<Option<String>, _>("directory")
                 .unwrap_or(None),
+            outcome_receipt_json: row.try_get("outcome_receipt_json").ok(),
         }))
     }
 }
@@ -1041,6 +1290,7 @@ pub struct WorkerDetailRow {
     pub opencode_port: Option<i32>,
     pub interactive: bool,
     pub directory: Option<String>,
+    pub outcome_receipt_json: Option<String>,
 }
 
 #[cfg(test)]

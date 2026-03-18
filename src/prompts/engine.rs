@@ -16,6 +16,12 @@ pub struct RetriggerResult {
     pub success: bool,
     /// The result/conclusion text from the process.
     pub result: String,
+    /// Optional request-group linkage for grouped synthesis.
+    pub request_group_id: Option<String>,
+    /// Original user ask that produced the grouped work.
+    pub request_group_origin: Option<String>,
+    /// Compact source-manifest summary for source-sensitive work.
+    pub source_manifest_summary: Option<String>,
 }
 
 /// Template engine for rendering system prompts with dynamic variables.

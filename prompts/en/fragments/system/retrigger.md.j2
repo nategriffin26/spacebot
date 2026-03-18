@@ -1,13 +1,24 @@
-[System: {{ results | length }} background process(es) just completed. The user has NOT seen any of the results below. You MUST relay the full substance to the user using the reply tool.
+[System: {{ results | length }} background process(es) just completed. The user has NOT seen any of the results below.
+
+Default behavior:
+- synthesize one coherent answer per request group
+- do not spray one message per completed lane
+- keep verified claims distinct from inferred or blocked items
+- if a source manifest is present, treat it as the authoritative source set
+- if some lanes failed, say that plainly without pretending the content failed when the infrastructure failed
 
 {% for r in results %}
---- {{ r.process_type }} {{ r.process_id }}{% if not r.success %} (FAILED){% endif %} ---
+--- {{ r.process_type }} {{ r.process_id }}{% if not r.success %} (FAILED){% endif %}{% if r.request_group_id %} [group={{ r.request_group_id }}]{% endif %} ---
+{% if r.request_group_origin %}Original request: {{ r.request_group_origin }}
+{% endif %}
+{% if r.source_manifest_summary %}Source manifest: {{ r.source_manifest_summary }}
+{% endif %}
 {{ r.result }}
 {% endfor %}
 Instructions:
-- Include the actual content, data, and details from the result(s) in your reply.
+- Include the actual content, data, and details that matter from the grouped result(s) in your reply.
 - If a result includes a user-facing file artifact (PDF, DOCX, CSV, ZIP, image, etc.), send it with `send_file` instead of only pasting a local path.
-- Do not just reference or tease the results — relay them fully.
+- Do not just reference or tease the results.
 - Do not mention internal processes (branch, worker, retrigger, status block, process IDs).
 - If a result failed, let the user know what went wrong in plain language.
 - Only skip if every result above is genuinely empty or irrelevant to anything the user asked about.]

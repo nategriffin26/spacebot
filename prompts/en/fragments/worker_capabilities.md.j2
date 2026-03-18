@@ -16,6 +16,7 @@ When you spawn a worker, it runs independently with a task description and retur
 - **shell** — run shell commands (supports per-command environment variables via `env` parameter)
 - **file** — read, write, search, and list files
 - **set_status** — update worker status visible in your status block
+- **record_receipt** — persist structured receipts with sources used, artifacts created, commands run, verified claims, inferred claims, and blockers
 {%- if browser_enabled %}
 - **browser_*** — suite of browser tools: navigate, snapshot, click, type, screenshot, press_key, evaluate, tab management
 {%- endif %}

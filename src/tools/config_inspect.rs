@@ -61,7 +61,7 @@ impl Tool for ConfigInspectTool {
                 "properties": {
                     "section": {
                         "type": "string",
-                        "description": "Optional subsection to return. Valid values: all, paths, routing, limits, compaction, memory_persistence, coalesce, ingestion, cortex, warmup, work_readiness, browser, sandbox, opencode, mcp_servers, brave_search, timezones, bulletin, secrets, binary_version, deployment"
+                        "description": "Optional subsection to return. Valid values: all, paths, routing, limits, compaction, memory_persistence, coalesce, ingestion, cortex, warmup, work_readiness, browser, sandbox, opencode, mcp_servers, brave_search, timezones, bulletin, secrets, verified_capabilities, binary_version, deployment"
                     }
                 }
             }),
@@ -119,6 +119,6 @@ fn select_section(
 
 fn unknown_section_error(section: &str) -> ConfigInspectError {
     ConfigInspectError(format!(
-        "unknown section '{section}'. valid sections: all, paths, routing, limits, compaction, memory_persistence, coalesce, ingestion, cortex, warmup, work_readiness, browser, sandbox, opencode, mcp_servers (or mcp), brave_search, timezones, bulletin, secrets, binary_version, deployment"
+        "unknown section '{section}'. valid sections: all, paths, routing, limits, compaction, memory_persistence, coalesce, ingestion, cortex, warmup, work_readiness, browser, sandbox, opencode, mcp_servers (or mcp), brave_search, timezones, bulletin, secrets, verified_capabilities, binary_version, deployment"
     ))
 }

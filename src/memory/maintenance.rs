@@ -1,7 +1,9 @@
 //! Memory maintenance: decay, prune, merge, reindex.
 
 use crate::error::Result;
-use crate::memory::{EmbeddingModel, EmbeddingTable, Memory, MemoryStore, MemoryType};
+use crate::memory::{
+    Association, EmbeddingModel, EmbeddingTable, Memory, MemoryStore, MemoryType, RelationType,
+};
 use anyhow::Context;
 
 use sqlx::Row;
@@ -77,6 +79,10 @@ pub async fn run_maintenance_with_cancel(
     // Fields are assigned sequentially because the values are async — can't use struct literal.
     #[allow(clippy::field_reassign_with_default)]
     {
+        let repair = repair_memory_contradictions(memory_store, &mut maintenance_cancel_rx).await?;
+        report.contradictions_repaired = repair.contradictions_repaired;
+        report.secret_rows_redacted = repair.secret_rows_redacted;
+        report.cleanup_records = repair.cleanup_records;
         report.decayed =
             apply_decay(memory_store, config.decay_rate, &mut maintenance_cancel_rx).await?;
         report.pruned = prune_memories(memory_store, config, &mut maintenance_cancel_rx).await?;
@@ -91,6 +97,206 @@ pub async fn run_maintenance_with_cancel(
     }
 
     Ok(report)
+}
+
+#[derive(Debug, Default)]
+struct ContradictionRepairReport {
+    contradictions_repaired: usize,
+    secret_rows_redacted: usize,
+    cleanup_records: usize,
+}
+
+async fn repair_memory_contradictions(
+    memory_store: &MemoryStore,
+    maintenance_cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<ContradictionRepairReport> {
+    check_maintenance_cancellation(maintenance_cancel_rx).await?;
+
+    let candidate_rows: Vec<SqliteRow> = maintenance_cancelable_op(
+        maintenance_cancel_rx,
+        sqlx::query(
+            "SELECT id FROM memories WHERE redacted_at IS NULL ORDER BY updated_at DESC, created_at DESC LIMIT 2000",
+        )
+        .fetch_all(memory_store.pool()),
+    )
+    .await?;
+
+    let mut memories = Vec::new();
+    for row in candidate_rows {
+        let id: String = row.try_get("id")?;
+        let Some(memory) =
+            maintenance_cancelable_op(maintenance_cancel_rx, memory_store.load(&id)).await?
+        else {
+            continue;
+        };
+        if memory
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("maintenance:"))
+        {
+            continue;
+        }
+        memories.push(memory);
+    }
+
+    let now = chrono::Utc::now();
+    let mut report = ContradictionRepairReport::default();
+
+    for memory in &mut memories {
+        if memory.redacted_at.is_some() || memory.forgotten {
+            continue;
+        }
+        if crate::secrets::scrub::scan_for_leaks(&memory.content).is_none() {
+            continue;
+        }
+
+        memory.content = "[REDACTED: secret-bearing memory removed by maintenance]".to_string();
+        memory.forgotten = true;
+        memory.redacted_at = Some(now);
+        memory.updated_at = now;
+        maintenance_cancelable_op(maintenance_cancel_rx, memory_store.update(memory)).await?;
+        report.secret_rows_redacted += 1;
+    }
+
+    let mut verified_by_key = std::collections::HashMap::<String, Memory>::new();
+    let mut stale_by_key = std::collections::HashMap::<String, Vec<Memory>>::new();
+
+    for memory in memories
+        .into_iter()
+        .filter(|memory| !memory.forgotten && memory.redacted_at.is_none())
+    {
+        let Some(capability_key) = memory_capability_key(&memory) else {
+            continue;
+        };
+        if memory_is_verified_capability(&memory) {
+            let replace_existing = verified_by_key
+                .get(&capability_key)
+                .map(|existing| capability_sort_key(&memory) > capability_sort_key(existing))
+                .unwrap_or(true);
+            if replace_existing {
+                verified_by_key.insert(capability_key, memory);
+            }
+        } else if memory_is_stale_capability_todo(&memory) {
+            stale_by_key.entry(capability_key).or_default().push(memory);
+        }
+    }
+
+    for (capability_key, verified) in verified_by_key {
+        let Some(stale_memories) = stale_by_key.get(&capability_key) else {
+            continue;
+        };
+        for stale in stale_memories {
+            if stale.verified_at.is_some()
+                && capability_sort_key(stale) >= capability_sort_key(&verified)
+            {
+                continue;
+            }
+            let mut updated = stale.clone();
+            updated.forgotten = true;
+            updated.superseded_by = Some(verified.id.clone());
+            updated.updated_at = now;
+            maintenance_cancelable_op(maintenance_cancel_rx, memory_store.update(&updated)).await?;
+
+            let updates = Association::new(&verified.id, &updated.id, RelationType::Updates);
+            let contradicts =
+                Association::new(&updated.id, &verified.id, RelationType::Contradicts);
+            let _ = maintenance_cancelable_op(
+                maintenance_cancel_rx,
+                memory_store.create_association(&updates),
+            )
+            .await;
+            let _ = maintenance_cancelable_op(
+                maintenance_cancel_rx,
+                memory_store.create_association(&contradicts),
+            )
+            .await;
+            report.contradictions_repaired += 1;
+        }
+    }
+
+    if report.secret_rows_redacted > 0 || report.contradictions_repaired > 0 {
+        let mut cleanup = Memory::new(
+            &format!(
+                "Maintenance repaired {} contradiction(s) and redacted {} secret-bearing memory row(s).",
+                report.contradictions_repaired, report.secret_rows_redacted
+            ),
+            MemoryType::Observation,
+        )
+        .with_source("maintenance:contradiction_repair");
+        cleanup.importance = 0.65;
+        cleanup.updated_at = now;
+        maintenance_cancelable_op(maintenance_cancel_rx, memory_store.save(&cleanup)).await?;
+        report.cleanup_records = 1;
+    }
+
+    #[cfg(feature = "metrics")]
+    if report.secret_rows_redacted > 0 || report.contradictions_repaired > 0 {
+        let agent_label = if memory_store.agent_id().is_empty() {
+            "unknown"
+        } else {
+            memory_store.agent_id()
+        };
+        crate::telemetry::Metrics::global()
+            .contradiction_repair_actions_total
+            .with_label_values(&[agent_label, "repaired"])
+            .inc_by(report.contradictions_repaired as u64);
+        crate::telemetry::Metrics::global()
+            .contradiction_repair_actions_total
+            .with_label_values(&[agent_label, "secret_redacted"])
+            .inc_by(report.secret_rows_redacted as u64);
+    }
+
+    Ok(report)
+}
+
+fn memory_capability_key(memory: &Memory) -> Option<String> {
+    let lower = memory.content.to_ascii_lowercase();
+    let candidates = [
+        ("gemini", "gemini"),
+        ("image generation", "image_generation"),
+        ("x api", "x_api"),
+        ("twitter api", "x_api"),
+        ("browser", "browser"),
+        ("chrome_devtools", "chrome_devtools"),
+    ];
+    for (needle, key) in candidates {
+        if lower.contains(needle) {
+            return Some(key.to_string());
+        }
+    }
+    None
+}
+
+fn memory_is_verified_capability(memory: &Memory) -> bool {
+    if memory.verified_at.is_some() {
+        return true;
+    }
+    let lower = memory.content.to_ascii_lowercase();
+    matches!(
+        memory.memory_type,
+        MemoryType::Fact | MemoryType::Observation | MemoryType::Decision
+    ) && (lower.contains("already working")
+        || lower.contains("is working")
+        || lower.contains("configured")
+        || lower.contains("verified")
+        || lower.contains("available"))
+}
+
+fn memory_is_stale_capability_todo(memory: &Memory) -> bool {
+    let lower = memory.content.to_ascii_lowercase();
+    matches!(
+        memory.memory_type,
+        MemoryType::Todo | MemoryType::Observation
+    ) && (lower.contains("set up")
+        || lower.contains("todo")
+        || lower.contains("blocked")
+        || lower.contains("unconfigured")
+        || lower.contains("not working")
+        || lower.contains("needs "))
+}
+
+fn capability_sort_key(memory: &Memory) -> chrono::DateTime<chrono::Utc> {
+    memory.verified_at.unwrap_or(memory.updated_at)
 }
 
 /// Apply importance decay based on recency and access patterns.
@@ -482,6 +688,9 @@ pub struct MaintenanceReport {
     pub decayed: usize,
     pub pruned: usize,
     pub merged: usize,
+    pub contradictions_repaired: usize,
+    pub secret_rows_redacted: usize,
+    pub cleanup_records: usize,
 }
 
 #[cfg(test)]
@@ -885,5 +1094,77 @@ mod tests {
                 .to_string()
                 .contains("min_age_days must be >= 0")
         );
+    }
+
+    #[tokio::test]
+    async fn repairs_capability_contradictions_and_redacts_secret_rows() {
+        let store = MemoryStore::connect_in_memory().await;
+        let dir = tempdir().expect("failed to create temp dir");
+        let lance_conn = lancedb::connect(dir.path().to_str().expect("temp path"))
+            .execute()
+            .await
+            .expect("failed to connect to lancedb");
+        let embedding_table = crate::memory::EmbeddingTable::open_or_create(&lance_conn)
+            .await
+            .expect("failed to create embedding table");
+
+        let verified = Memory::new(
+            "Gemini image generation is working and verified on this instance.",
+            MemoryType::Fact,
+        )
+        .with_verified_at(chrono::Utc::now(), "manual-check");
+        store.save(&verified).await.expect("save verified memory");
+
+        let stale = Memory::new(
+            "TODO: set up Gemini image generation because it is still blocked.",
+            MemoryType::Todo,
+        );
+        store.save(&stale).await.expect("save stale memory");
+
+        let secret = Memory::new(
+            "Gemini API key is AIzaSyThisShouldNeverStayInMemory1234567890",
+            MemoryType::Preference,
+        );
+        store.save(&secret).await.expect("save secret memory");
+
+        let embedding_model = shared_embedding_model();
+        let report = run_maintenance(
+            &store,
+            &embedding_table,
+            &embedding_model,
+            &MaintenanceConfig::default(),
+        )
+        .await
+        .expect("maintenance should succeed");
+
+        assert_eq!(report.contradictions_repaired, 1);
+        assert_eq!(report.secret_rows_redacted, 1);
+        assert_eq!(report.cleanup_records, 1);
+
+        let stale_after = store
+            .load(&stale.id)
+            .await
+            .expect("load stale memory")
+            .expect("stale memory should exist");
+        assert!(stale_after.forgotten, "stale todo should be tombstoned");
+        assert_eq!(
+            stale_after.superseded_by.as_deref(),
+            Some(verified.id.as_str())
+        );
+
+        let secret_after = store
+            .load(&secret.id)
+            .await
+            .expect("load secret memory")
+            .expect("secret memory should still exist");
+        assert!(
+            secret_after.forgotten,
+            "secret-bearing memory should be forgotten"
+        );
+        assert_eq!(
+            secret_after.content,
+            "[REDACTED: secret-bearing memory removed by maintenance]"
+        );
+        assert!(secret_after.redacted_at.is_some());
     }
 }

@@ -73,6 +73,19 @@ impl RoutingConfig {
             return override_model;
         }
 
+        if let Some(task) = task_type
+            && matches!(process_type, ProcessType::Worker | ProcessType::Branch)
+            && matches!(
+                task,
+                "source_verification"
+                    | "artifact_grounded_copy"
+                    | "capability_diagnosis"
+                    | "multi_lane_synthesis"
+            )
+        {
+            return &self.branch;
+        }
+
         match process_type {
             ProcessType::Channel => &self.channel,
             ProcessType::Branch => &self.branch,
@@ -135,6 +148,7 @@ pub fn is_retriable_error(error_message: &str) -> bool {
         || lower.contains("internal error")
         // Empty/malformed responses are transient provider issues
         || lower.contains("empty response")
+        || lower.contains("empty or unsupported response")
         || lower.contains("failed to read response body")
         || lower.contains("error decoding response body")
 }

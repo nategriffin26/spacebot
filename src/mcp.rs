@@ -608,6 +608,26 @@ impl McpManager {
         names
     }
 
+    /// Return the names of MCP servers that are currently connected.
+    pub async fn connected_server_names(&self) -> Vec<String> {
+        let connections = self
+            .connections
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut names = Vec::new();
+        for connection in connections {
+            if connection.is_connected().await {
+                names.push(connection.name().to_string());
+            }
+        }
+        names.sort();
+        names
+    }
+
     pub async fn reconnect(&self, name: &str) -> Result<()> {
         let config = self
             .configs

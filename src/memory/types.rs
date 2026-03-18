@@ -16,9 +16,14 @@ pub struct Memory {
     pub access_count: i64,
     pub source: Option<String>,
     pub channel_id: Option<crate::ChannelId>,
+    pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub stale_after_secs: Option<i64>,
+    pub superseded_by: Option<String>,
+    pub verification_source: Option<String>,
     /// Soft-delete flag. Forgotten memories are excluded from search and recall
     /// but remain in the database.
     pub forgotten: bool,
+    pub redacted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Memory {
@@ -39,7 +44,12 @@ impl Memory {
             access_count: 0,
             source: None,
             channel_id: None,
+            verified_at: None,
+            stale_after_secs: None,
+            superseded_by: None,
+            verification_source: None,
             forgotten: false,
+            redacted_at: None,
         }
     }
 
@@ -58,6 +68,29 @@ impl Memory {
     /// Set the channel ID.
     pub fn with_channel_id(mut self, channel_id: crate::ChannelId) -> Self {
         self.channel_id = Some(channel_id);
+        self
+    }
+
+    /// Mark the memory as verified with a provenance note.
+    pub fn with_verified_at(
+        mut self,
+        verified_at: chrono::DateTime<chrono::Utc>,
+        verification_source: impl Into<String>,
+    ) -> Self {
+        self.verified_at = Some(verified_at);
+        self.verification_source = Some(verification_source.into());
+        self
+    }
+
+    /// Set the freshness horizon for this memory.
+    pub fn with_stale_after_secs(mut self, stale_after_secs: i64) -> Self {
+        self.stale_after_secs = Some(stale_after_secs.max(0));
+        self
+    }
+
+    /// Mark this memory as superseded by another memory row.
+    pub fn with_superseded_by(mut self, memory_id: impl Into<String>) -> Self {
+        self.superseded_by = Some(memory_id.into());
         self
     }
 

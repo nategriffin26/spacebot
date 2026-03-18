@@ -457,6 +457,7 @@ impl Tool for DetachedSpawnWorkerTool {
             None, // no parent channel
             &args.task,
             worker_system_prompt,
+            None,
             self.deps.clone(),
             browser_config,
             self.screenshot_dir.clone(),

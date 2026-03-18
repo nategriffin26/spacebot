@@ -85,6 +85,14 @@ pub struct MemorySaveArgs {
     pub source: Option<String>,
     /// Optional channel ID to associate this memory with the conversation it came from.
     pub channel_id: Option<String>,
+    /// Optional RFC3339 timestamp describing when the fact was last verified.
+    pub verified_at: Option<String>,
+    /// Optional freshness window in seconds before the fact should be treated as stale.
+    pub stale_after_secs: Option<i64>,
+    /// Optional provenance note for the verification event.
+    pub verification_source: Option<String>,
+    /// Optional memory ID this row supersedes.
+    pub superseded_by: Option<String>,
     /// Optional associations to create with other memories.
     #[serde(default)]
     pub associations: Vec<AssociationInput>,
@@ -166,6 +174,22 @@ impl Tool for MemorySaveTool {
                         "type": "string",
                         "description": "Optional channel ID to associate this memory with the conversation it came from"
                     },
+                    "verified_at": {
+                        "type": "string",
+                        "description": "Optional RFC3339 timestamp for when this memory was actually verified"
+                    },
+                    "stale_after_secs": {
+                        "type": "integer",
+                        "description": "Optional freshness window in seconds before this memory should be treated as stale"
+                    },
+                    "verification_source": {
+                        "type": "string",
+                        "description": "Optional note describing how the fact was verified"
+                    },
+                    "superseded_by": {
+                        "type": "string",
+                        "description": "Optional memory ID that supersedes this row"
+                    },
                     "associations": {
                         "type": "array",
                         "description": "Optional associations to link this memory to other memories",
@@ -209,6 +233,27 @@ impl Tool for MemorySaveTool {
             )));
         }
 
+        if let Some(leak) = crate::secrets::scrub::scan_for_leaks(&args.content) {
+            let leak_kind = if leak.starts_with("url-encoded:") {
+                "url-encoded"
+            } else if leak.starts_with("base64-encoded:") {
+                "base64-encoded"
+            } else if leak.starts_with("hex-encoded:") {
+                "hex-encoded"
+            } else {
+                "plaintext"
+            };
+            tracing::warn!(leak_kind, "blocked secret-bearing memory_save content");
+            #[cfg(feature = "metrics")]
+            crate::telemetry::Metrics::global()
+                .blocked_memory_secret_saves_total
+                .with_label_values(&[self.memory_search.store().agent_id()])
+                .inc();
+            return Err(MemorySaveError(
+                "memory content contained a secret and was blocked before persistence".into(),
+            ));
+        }
+
         if let Some(importance) = args.importance
             && !(0.0..=1.0).contains(&importance)
         {
@@ -242,6 +287,29 @@ impl Tool for MemorySaveTool {
 
         if let Some(channel_id) = args.channel_id {
             memory = memory.with_channel_id(Arc::from(channel_id.as_str()));
+        }
+
+        if let Some(verified_at) = args.verified_at {
+            let parsed = chrono::DateTime::parse_from_rfc3339(&verified_at)
+                .map_err(|error| {
+                    MemorySaveError(format!("invalid verified_at timestamp: {error}"))
+                })?
+                .with_timezone(&chrono::Utc);
+            let verification_source = args
+                .verification_source
+                .clone()
+                .unwrap_or_else(|| "unspecified".to_string());
+            memory = memory.with_verified_at(parsed, verification_source);
+        } else if let Some(verification_source) = args.verification_source.clone() {
+            memory.verification_source = Some(verification_source);
+        }
+
+        if let Some(stale_after_secs) = args.stale_after_secs {
+            memory = memory.with_stale_after_secs(stale_after_secs);
+        }
+
+        if let Some(superseded_by) = args.superseded_by.clone() {
+            memory = memory.with_superseded_by(superseded_by);
         }
 
         // Save to SQLite database
@@ -442,6 +510,10 @@ pub async fn save_fact(
         importance: None,
         source: None,
         channel_id: channel_id.map(|id| id.to_string()),
+        verified_at: None,
+        stale_after_secs: None,
+        verification_source: None,
+        superseded_by: None,
         associations: vec![],
     };
 

@@ -69,8 +69,10 @@ impl MemoryStore {
         sqlx::query(
             r#"
             INSERT INTO memories (id, content, memory_type, importance, created_at, updated_at,
-                                 last_accessed_at, access_count, source, channel_id, forgotten)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 last_accessed_at, access_count, source, channel_id, verified_at,
+                                 stale_after_secs, superseded_by, verification_source, forgotten,
+                                 redacted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&memory.id)
@@ -83,7 +85,12 @@ impl MemoryStore {
         .bind(memory.access_count)
         .bind(&memory.source)
         .bind(memory.channel_id.as_ref().map(|id| id.as_ref()))
+        .bind(memory.verified_at)
+        .bind(memory.stale_after_secs)
+        .bind(&memory.superseded_by)
+        .bind(&memory.verification_source)
         .bind(memory.forgotten)
+        .bind(memory.redacted_at)
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save memory {}", memory.id))?;
@@ -114,7 +121,9 @@ impl MemoryStore {
         let row = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, verified_at,
+                   stale_after_secs, superseded_by, verification_source, forgotten,
+                   redacted_at
             FROM memories
             WHERE id = ?
             "#,
@@ -148,7 +157,8 @@ impl MemoryStore {
             UPDATE memories
             SET content = ?, memory_type = ?, importance = ?, updated_at = ?,
                 last_accessed_at = ?, access_count = ?, source = ?, channel_id = ?,
-                forgotten = ?
+                verified_at = ?, stale_after_secs = ?, superseded_by = ?,
+                verification_source = ?, forgotten = ?, redacted_at = ?
             WHERE id = ?
             "#,
         )
@@ -160,7 +170,12 @@ impl MemoryStore {
         .bind(memory.access_count)
         .bind(&memory.source)
         .bind(memory.channel_id.as_ref().map(|id| id.as_ref()))
+        .bind(memory.verified_at)
+        .bind(memory.stale_after_secs)
+        .bind(&memory.superseded_by)
+        .bind(&memory.verification_source)
         .bind(memory.forgotten)
+        .bind(memory.redacted_at)
         .bind(&memory.id)
         .execute(&self.pool)
         .await
@@ -695,7 +710,12 @@ fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> Memory {
         access_count: row.try_get("access_count").unwrap_or(0),
         source: row.try_get("source").ok(),
         channel_id: channel_id.map(|id| Arc::from(id) as crate::ChannelId),
+        verified_at: row.try_get("verified_at").ok(),
+        stale_after_secs: row.try_get("stale_after_secs").ok(),
+        superseded_by: row.try_get("superseded_by").ok(),
+        verification_source: row.try_get("verification_source").ok(),
         forgotten: row.try_get::<bool, _>("forgotten").unwrap_or(false),
+        redacted_at: row.try_get("redacted_at").ok(),
     }
 }
 

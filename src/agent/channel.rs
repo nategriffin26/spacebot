@@ -57,6 +57,55 @@ struct PendingResult {
     result: String,
     /// Whether the process completed successfully.
     success: bool,
+    request_group_id: Option<String>,
+    request_group_origin: Option<String>,
+    source_manifest_summary: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CurrentRequestContext {
+    pub origin_message_id: Option<String>,
+    pub origin_user_text: String,
+    pub mode: crate::RequestGroupMode,
+    pub task_class: Option<crate::TaskClass>,
+    pub source_manifest: crate::SourceManifest,
+    pub request_group_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestGroupRuntimeState {
+    pub request_group_id: String,
+    pub origin_user_text: String,
+    pub mode: crate::RequestGroupMode,
+    pub task_class: Option<crate::TaskClass>,
+    pub source_manifest: crate::SourceManifest,
+    pub expected_process_ids: HashSet<String>,
+    pub completed_process_ids: HashSet<String>,
+    pub first_completed_at: Option<tokio::time::Instant>,
+    pub updated_at: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PromotedOperatorPolicy {
+    policy_key: &'static str,
+    content: &'static str,
+    priority: i64,
+}
+
+impl RequestGroupRuntimeState {
+    fn new(context: &CurrentRequestContext, request_group_id: &str) -> Self {
+        Self {
+            request_group_id: request_group_id.to_string(),
+            origin_user_text: context.origin_user_text.clone(),
+            mode: context.mode,
+            task_class: context.task_class,
+            source_manifest: context.source_manifest.clone(),
+            expected_process_ids: HashSet::new(),
+            completed_process_ids: HashSet::new(),
+            first_completed_at: None,
+            updated_at: tokio::time::Instant::now(),
+        }
+    }
 }
 
 const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
@@ -113,6 +162,191 @@ fn reply_looks_like_deferred_action(reply: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.starts_with(needle) || normalized.contains(needle))
+}
+
+#[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+fn reply_is_low_substance(reply: &str) -> bool {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if reply_looks_like_deferred_action(trimmed) {
+        return true;
+    }
+    trimmed.len() <= 120 && trimmed.lines().count() <= 2 && trimmed.split_whitespace().count() <= 20
+}
+
+fn infer_request_group_mode(user_text: &str) -> crate::RequestGroupMode {
+    let lower = user_text.to_ascii_lowercase();
+    if lower.contains("keep me updated")
+        || lower.contains("updates along the way")
+        || lower.contains("stream progress")
+    {
+        crate::RequestGroupMode::UpdatesOk
+    } else {
+        crate::RequestGroupMode::SingleReply
+    }
+}
+
+fn infer_task_class(
+    user_text: &str,
+    source_manifest: &crate::SourceManifest,
+) -> Option<crate::TaskClass> {
+    let lower = user_text.to_ascii_lowercase();
+    if lower.contains("code")
+        || lower.contains("rust")
+        || lower.contains("typescript")
+        || lower.contains("compile")
+        || lower.contains("test")
+    {
+        return Some(crate::TaskClass::Coding);
+    }
+    if lower.contains("capability")
+        || lower.contains("configured")
+        || lower.contains("why can't")
+        || lower.contains("why did")
+    {
+        return Some(crate::TaskClass::CapabilityDiagnosis);
+    }
+    if source_manifest.has_explicit_sources()
+        && (lower.contains("summarize")
+            || lower.contains("review")
+            || lower.contains("inspect")
+            || lower.contains("read")
+            || lower.contains("pdf")
+            || lower.contains("look at"))
+    {
+        return Some(crate::TaskClass::SourceVerification);
+    }
+    if source_manifest.has_explicit_sources()
+        && (lower.contains("copy")
+            || lower.contains("marketing")
+            || lower.contains("landing")
+            || lower.contains("gumroad"))
+    {
+        return Some(crate::TaskClass::ArtifactGroundedCopy);
+    }
+    None
+}
+
+fn detect_operator_policy_promotions(user_text: &str) -> Vec<PromotedOperatorPolicy> {
+    let lower = user_text.to_ascii_lowercase();
+    let mut promotions = Vec::new();
+
+    if (lower.contains("many workers") || lower.contains("multiple workers"))
+        && (lower.contains("large task")
+            || lower.contains("large project")
+            || lower.contains("independent")
+            || lower.contains("parallel"))
+    {
+        promotions.push(PromotedOperatorPolicy {
+            policy_key: "planning.parallel_independent_work",
+            content: "For large tasks with independent lanes, proactively fan out across multiple workers or branches and synthesize one answer by default.",
+            priority: 240,
+        });
+    }
+
+    if lower.contains("use x api first")
+        || lower.contains("prefer x api first")
+        || lower.contains("use twitter api first")
+        || lower.contains("prefer twitter api first")
+    {
+        promotions.push(PromotedOperatorPolicy {
+            policy_key: "tool_priority.x_api_first",
+            content: "For X or Twitter research, prefer healthy X API tooling before generic web fallbacks.",
+            priority: 220,
+        });
+    }
+
+    if lower.contains("do not claim completion before artifact")
+        || lower.contains("don't claim completion before artifact")
+        || lower.contains("do not claim completion before file")
+        || lower.contains("don't claim completion before file")
+        || lower.contains("do not claim execution before artifact")
+        || lower.contains("don't claim execution before artifact")
+    {
+        promotions.push(PromotedOperatorPolicy {
+            policy_key: "truth.artifact_receipts_required",
+            content: "Do not imply execution is complete until an artifact or structured receipt exists for the work.",
+            priority: 260,
+        });
+    }
+
+    promotions
+}
+
+fn summarize_source_manifest(source_manifest: &crate::SourceManifest) -> Option<String> {
+    if !source_manifest.has_explicit_sources() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if !source_manifest.explicit_paths.is_empty() {
+        lines.push(format!(
+            "paths={}",
+            source_manifest.explicit_paths.join(", ")
+        ));
+    }
+    if !source_manifest.explicit_files.is_empty() {
+        lines.push(format!(
+            "files={}",
+            source_manifest.explicit_files.join(", ")
+        ));
+    }
+    if !source_manifest.explicit_urls.is_empty() {
+        lines.push(format!("urls={}", source_manifest.explicit_urls.join(", ")));
+    }
+    if !source_manifest.user_named_artifacts.is_empty() {
+        lines.push(format!(
+            "artifacts={}",
+            source_manifest.user_named_artifacts.join(", ")
+        ));
+    }
+
+    Some(lines.join(" | "))
+}
+
+fn extract_source_manifest(user_text: &str) -> crate::SourceManifest {
+    let mut manifest = crate::SourceManifest::default();
+
+    for token in user_text.split_whitespace() {
+        let trimmed = token.trim_matches(|char: char| {
+            matches!(char, '"' | '\'' | ',' | ')' | '(' | '[' | ']' | ';')
+        });
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            manifest.explicit_urls.push(trimmed.to_string());
+            continue;
+        }
+        if trimmed.starts_with("~/") || trimmed.starts_with('/') {
+            manifest.explicit_paths.push(trimmed.to_string());
+            if trimmed.contains('.') {
+                manifest.explicit_files.push(trimmed.to_string());
+            }
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if [
+            ".pdf", ".md", ".docx", ".csv", ".zip", ".png", ".jpg", ".jpeg",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+        {
+            manifest.user_named_artifacts.push(trimmed.to_string());
+            if trimmed.contains('/') {
+                manifest.explicit_files.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if manifest.has_explicit_sources() {
+        manifest.forbidden_fallback_sources = vec![
+            "workspace residue".to_string(),
+            "old drafts".to_string(),
+            "unrelated artifacts".to_string(),
+        ];
+    }
+
+    manifest
 }
 
 fn streaming_error_to_prompt_result(
@@ -450,6 +684,9 @@ pub struct ChannelState {
     pub deps: AgentDeps,
     pub conversation_logger: ConversationLogger,
     pub process_run_logger: ProcessRunLogger,
+    pub current_request_context: Arc<RwLock<Option<CurrentRequestContext>>>,
+    pub request_group_runtime: Arc<RwLock<HashMap<String, RequestGroupRuntimeState>>>,
+    pub process_request_groups: Arc<RwLock<HashMap<String, String>>>,
     /// Discord message ID to reply to for work spawned in the current turn.
     pub reply_target_message_id: Arc<RwLock<Option<String>>>,
     pub channel_store: ChannelStore,
@@ -469,6 +706,93 @@ pub struct ChannelState {
 }
 
 impl ChannelState {
+    pub async fn set_current_request_context(&self, context: Option<CurrentRequestContext>) {
+        *self.current_request_context.write().await = context;
+    }
+
+    pub async fn current_request_context(&self) -> Option<CurrentRequestContext> {
+        self.current_request_context.read().await.clone()
+    }
+
+    pub async fn ensure_request_group(&self) -> Option<String> {
+        let mut context_guard = self.current_request_context.write().await;
+        let context = context_guard.as_mut()?;
+        if let Some(existing) = &context.request_group_id {
+            return Some(existing.clone());
+        }
+
+        let request_group_id = uuid::Uuid::new_v4().to_string();
+        self.process_run_logger.log_request_group_started(
+            &request_group_id,
+            &self.deps.agent_id,
+            &self.channel_id,
+            context.origin_message_id.as_deref(),
+            &context.origin_user_text,
+            context.mode,
+            context.task_class,
+            &context.source_manifest,
+        );
+        self.process_run_logger.log_request_group_state(
+            &request_group_id,
+            crate::RequestGroupState::Running,
+            Some("{\"required\":true}".to_string()),
+            Some("{\"default\":\"all_lanes_then_synthesize\"}".to_string()),
+        );
+
+        self.request_group_runtime.write().await.insert(
+            request_group_id.clone(),
+            RequestGroupRuntimeState::new(context, &request_group_id),
+        );
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .request_groups_total
+            .with_label_values(&[&self.deps.agent_id, "created"])
+            .inc();
+        context.request_group_id = Some(request_group_id.clone());
+        Some(request_group_id)
+    }
+
+    pub async fn register_request_group_process(
+        &self,
+        request_group_id: &str,
+        process_id: &str,
+        is_branch: bool,
+        task_class: Option<crate::TaskClass>,
+    ) {
+        self.process_request_groups
+            .write()
+            .await
+            .insert(process_id.to_string(), request_group_id.to_string());
+        if let Some(runtime) = self
+            .request_group_runtime
+            .write()
+            .await
+            .get_mut(request_group_id)
+        {
+            runtime.expected_process_ids.insert(process_id.to_string());
+            runtime.updated_at = tokio::time::Instant::now();
+        }
+        if is_branch {
+            self.process_run_logger.log_branch_request_group(
+                uuid::Uuid::parse_str(process_id).unwrap_or_else(|_| uuid::Uuid::nil()),
+                request_group_id,
+            );
+        } else if let Ok(worker_id) = uuid::Uuid::parse_str(process_id) {
+            let source_manifest = self
+                .current_request_context
+                .read()
+                .await
+                .as_ref()
+                .map(|value| value.source_manifest.clone());
+            self.process_run_logger.log_worker_request_group(
+                worker_id,
+                request_group_id,
+                task_class,
+                source_manifest.as_ref(),
+            );
+        }
+    }
+
     /// Cancel a running worker by aborting its tokio task and cleaning up state.
     /// Returns an error message if the worker is not found.
     pub async fn cancel_worker(&self, worker_id: WorkerId) -> std::result::Result<(), String> {
@@ -851,6 +1175,9 @@ impl Channel {
         let conversation_logger = ConversationLogger::new(deps.sqlite_pool.clone());
         let process_run_logger = ProcessRunLogger::new(deps.sqlite_pool.clone());
         let channel_store = ChannelStore::new(deps.sqlite_pool.clone());
+        let current_request_context = Arc::new(RwLock::new(None));
+        let request_group_runtime = Arc::new(RwLock::new(HashMap::new()));
+        let process_request_groups = Arc::new(RwLock::new(HashMap::new()));
 
         let compactor = Compactor::new(id.clone(), deps.clone(), history.clone());
 
@@ -867,6 +1194,9 @@ impl Channel {
             deps: deps.clone(),
             conversation_logger,
             process_run_logger,
+            current_request_context,
+            request_group_runtime,
+            process_request_groups,
             reply_target_message_id: Arc::new(RwLock::new(None)),
             channel_store: channel_store.clone(),
             screenshot_dir,
@@ -1153,14 +1483,7 @@ impl Channel {
     async fn send_builtin_text(&mut self, text: String, log_label: &str) {
         match self.send_routed(OutboundResponse::Text(text.clone())).await {
             Ok(()) => {
-                #[cfg(feature = "metrics")]
-                {
-                    let channel_type = self.current_adapter().unwrap_or("unknown");
-                    crate::telemetry::Metrics::global()
-                        .messages_sent_total
-                        .with_label_values(&[&self.deps.agent_id, channel_type])
-                        .inc();
-                }
+                self.record_assistant_reply_metrics(Some(&text), "builtin");
                 self.state.conversation_logger.log_bot_message_with_name(
                     &self.state.channel_id,
                     &text,
@@ -1177,6 +1500,28 @@ impl Channel {
                         .inc();
                 }
                 tracing::error!(%error, channel_id = %self.id, %log_label, "failed to send built-in reply");
+            }
+        }
+    }
+
+    fn record_assistant_reply_metrics(&self, _text: Option<&str>, _kind: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            let channel_type = self.current_adapter().unwrap_or("unknown");
+            let metrics = crate::telemetry::Metrics::global();
+            metrics
+                .messages_sent_total
+                .with_label_values(&[&self.deps.agent_id, channel_type])
+                .inc();
+            metrics
+                .assistant_replies_total
+                .with_label_values(&[&self.deps.agent_id, _kind])
+                .inc();
+            if _text.is_some_and(reply_is_low_substance) {
+                metrics
+                    .assistant_replies_total
+                    .with_label_values(&[&self.deps.agent_id, "low_substance"])
+                    .inc();
             }
         }
     }
@@ -1803,6 +2148,19 @@ impl Channel {
         // metadata (e.g. Slack thread_ts) for outbound responses.
         if let Some(last_real) = messages.iter().rev().find(|m| m.source != "system") {
             self.current_inbound = Some(last_real.clone());
+            let source_manifest = extract_source_manifest(&combined_text);
+            self.state
+                .set_current_request_context(Some(CurrentRequestContext {
+                    origin_message_id: extract_message_id(last_real),
+                    origin_user_text: combined_text.clone(),
+                    mode: infer_request_group_mode(&combined_text),
+                    task_class: infer_task_class(&combined_text, &source_manifest),
+                    source_manifest,
+                    request_group_id: None,
+                }))
+                .await;
+            self.promote_operator_policies_from_user_text(&combined_text)
+                .await;
         }
 
         // Run agent turn with any image/audio attachments preserved
@@ -1948,6 +2306,20 @@ impl Channel {
         // System retrigger messages keep the previous inbound target.
         if message.source != "system" {
             self.current_inbound = Some(message.clone());
+            let origin_user_text = message.content.to_string();
+            let source_manifest = extract_source_manifest(&origin_user_text);
+            self.state
+                .set_current_request_context(Some(CurrentRequestContext {
+                    origin_message_id: Some(message.id.clone()),
+                    origin_user_text: origin_user_text.clone(),
+                    mode: infer_request_group_mode(&origin_user_text),
+                    task_class: infer_task_class(&origin_user_text, &source_manifest),
+                    source_manifest,
+                    request_group_id: None,
+                }))
+                .await;
+            self.promote_operator_policies_from_user_text(&origin_user_text)
+                .await;
         }
 
         tracing::info!(
@@ -2518,6 +2890,25 @@ impl Channel {
     async fn build_system_info(&self) -> SystemInfo {
         let runtime_config = &self.deps.runtime_config;
         let mut info = SystemInfo::from_runtime_config(runtime_config, &self.deps.sandbox);
+        let connected_mcp_servers = self.deps.mcp_manager.connected_server_names().await;
+        let verified_capabilities = crate::self_awareness::refresh_verified_capabilities(
+            &self.deps.agent_id,
+            runtime_config,
+            &connected_mcp_servers,
+        );
+        info.verified_capabilities = verified_capabilities
+            .into_iter()
+            .map(|entry| format!("{}({})", entry.capability_name, entry.health_state))
+            .collect();
+        info.operator_policies = self
+            .state
+            .process_run_logger
+            .list_operator_policies(&self.deps.agent_id, 6)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|policy| policy.content)
+            .collect();
 
         // Add async-only fields that the base constructor can't populate
         let cron_job_count = {
@@ -2530,6 +2921,23 @@ impl Channel {
         info.cron_job_count = cron_job_count;
 
         info
+    }
+
+    async fn promote_operator_policies_from_user_text(&self, user_text: &str) {
+        let promotions = detect_operator_policy_promotions(user_text);
+        if promotions.is_empty() {
+            return;
+        }
+
+        for policy in promotions {
+            self.state.process_run_logger.upsert_operator_policy(
+                &self.deps.agent_id,
+                policy.policy_key,
+                policy.content,
+                policy.priority,
+                Some(&self.state.channel_id),
+            );
+        }
     }
 
     /// Assemble the full system prompt using the PromptEngine.
@@ -2909,16 +3317,9 @@ impl Channel {
 
     /// Send outbound text and record send metrics.
     async fn send_outbound_text(&self, text: String, error_context: &str) {
-        match self.send_routed(OutboundResponse::Text(text)).await {
+        match self.send_routed(OutboundResponse::Text(text.clone())).await {
             Ok(()) => {
-                #[cfg(feature = "metrics")]
-                {
-                    let channel_type = self.current_adapter().unwrap_or("unknown");
-                    crate::telemetry::Metrics::global()
-                        .messages_sent_total
-                        .with_label_values(&[&self.deps.agent_id, channel_type])
-                        .inc();
-                }
+                self.record_assistant_reply_metrics(Some(&text), "text");
             }
             Err(error) => {
                 #[cfg(feature = "metrics")]
@@ -3025,11 +3426,7 @@ impl Channel {
                 } else if skipped {
                     tracing::debug!(channel_id = %self.id, "channel turn skipped (no response)");
                 } else if replied {
-                    #[cfg(feature = "metrics")]
-                    metrics
-                        .messages_sent_total
-                        .with_label_values(&[metrics_agent_id, metrics_channel_type])
-                        .inc();
+                    self.record_assistant_reply_metrics(None, "tool_reply");
                     tracing::debug!(channel_id = %self.id, "channel turn replied via tool (fallback suppressed)");
                 } else if is_retrigger {
                     // On retrigger turns the LLM should use the reply tool, but
@@ -3148,11 +3545,7 @@ impl Channel {
             }
             Err(rig::completion::PromptError::PromptCancelled { reason, .. }) => {
                 if reason == "reply delivered" {
-                    #[cfg(feature = "metrics")]
-                    metrics
-                        .messages_sent_total
-                        .with_label_values(&[metrics_agent_id, metrics_channel_type])
-                        .inc();
+                    self.record_assistant_reply_metrics(None, "tool_reply");
                     tracing::debug!(channel_id = %self.id, "channel turn completed via reply tool");
                 } else if reason == "skip" {
                     tracing::debug!(channel_id = %self.id, "channel turn skipped via tool");
@@ -3219,6 +3612,30 @@ impl Channel {
                 conclusion,
                 ..
             } => {
+                let process_id_text = branch_id.to_string();
+                let request_group_id = self
+                    .state
+                    .process_request_groups
+                    .read()
+                    .await
+                    .get(&process_id_text)
+                    .cloned();
+                let request_group_summary = if let Some(request_group_id) = &request_group_id {
+                    let mut runtime = self.state.request_group_runtime.write().await;
+                    if let Some(group) = runtime.get_mut(request_group_id) {
+                        group.completed_process_ids.insert(process_id_text.clone());
+                        group.updated_at = tokio::time::Instant::now();
+                        group.first_completed_at.get_or_insert(group.updated_at);
+                        Some((
+                            group.origin_user_text.clone(),
+                            summarize_source_manifest(&group.source_manifest),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let reply_target_message_id = self.branch_reply_targets.get(branch_id).cloned();
                 let was_active = self
                     .state
@@ -3261,6 +3678,13 @@ impl Channel {
                         process_id: branch_id.to_string(),
                         result: conclusion.clone(),
                         success: true,
+                        request_group_id,
+                        request_group_origin: request_group_summary
+                            .as_ref()
+                            .map(|value| value.0.clone()),
+                        source_manifest_summary: request_group_summary
+                            .as_ref()
+                            .and_then(|value| value.1.clone()),
                     });
                     should_retrigger = true;
 
@@ -3309,6 +3733,30 @@ impl Channel {
                 success,
                 ..
             } => {
+                let process_id_text = worker_id.to_string();
+                let request_group_id = self
+                    .state
+                    .process_request_groups
+                    .read()
+                    .await
+                    .get(&process_id_text)
+                    .cloned();
+                let request_group_summary = if let Some(request_group_id) = &request_group_id {
+                    let mut runtime = self.state.request_group_runtime.write().await;
+                    if let Some(group) = runtime.get_mut(request_group_id) {
+                        group.completed_process_ids.insert(process_id_text.clone());
+                        group.updated_at = tokio::time::Instant::now();
+                        group.first_completed_at.get_or_insert(group.updated_at);
+                        Some((
+                            group.origin_user_text.clone(),
+                            summarize_source_manifest(&group.source_manifest),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // Use worker_handles as the source of truth for active workers.
                 // (active_workers is never populated because Worker is consumed by .run())
                 if self
@@ -3336,6 +3784,13 @@ impl Channel {
                         process_id: worker_id.to_string(),
                         result: result.clone(),
                         success: *success,
+                        request_group_id,
+                        request_group_origin: request_group_summary
+                            .as_ref()
+                            .map(|value| value.0.clone()),
+                        source_manifest_summary: request_group_summary
+                            .as_ref()
+                            .and_then(|value| value.1.clone()),
                     });
                     should_retrigger = true;
                 }
@@ -3353,6 +3808,30 @@ impl Channel {
             ProcessEvent::WorkerInitialResult {
                 worker_id, result, ..
             } => {
+                let process_id_text = worker_id.to_string();
+                let request_group_id = self
+                    .state
+                    .process_request_groups
+                    .read()
+                    .await
+                    .get(&process_id_text)
+                    .cloned();
+                let request_group_summary = if let Some(request_group_id) = &request_group_id {
+                    let mut runtime = self.state.request_group_runtime.write().await;
+                    if let Some(group) = runtime.get_mut(request_group_id) {
+                        group.completed_process_ids.insert(process_id_text.clone());
+                        group.updated_at = tokio::time::Instant::now();
+                        group.first_completed_at.get_or_insert(group.updated_at);
+                        Some((
+                            group.origin_user_text.clone(),
+                            summarize_source_manifest(&group.source_manifest),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // Interactive worker completed a task (initial or follow-up)
                 // but stays alive for more input. Deliver the result to the
                 // channel without removing the worker from the active set.
@@ -3361,6 +3840,13 @@ impl Channel {
                     process_id: worker_id.to_string(),
                     result: result.clone(),
                     success: true,
+                    request_group_id,
+                    request_group_origin: request_group_summary
+                        .as_ref()
+                        .map(|value| value.0.clone()),
+                    source_manifest_summary: request_group_summary
+                        .as_ref()
+                        .and_then(|value| value.1.clone()),
                 });
                 should_retrigger = true;
                 tracing::info!(
@@ -3458,17 +3944,60 @@ impl Channel {
             return;
         }
 
-        let result_count = self.pending_results.len();
+        let mut ready_results = Vec::new();
+        let mut deferred_results = Vec::new();
+        {
+            let runtime = self.state.request_group_runtime.read().await;
+            for result in self.pending_results.drain(..) {
+                let is_ready = match result
+                    .request_group_id
+                    .as_ref()
+                    .and_then(|id| runtime.get(id))
+                {
+                    Some(group) if matches!(group.mode, crate::RequestGroupMode::UpdatesOk) => true,
+                    Some(group) => {
+                        group.completed_process_ids.len() >= group.expected_process_ids.len()
+                            || group.first_completed_at.is_some_and(|started| {
+                                started.elapsed() >= std::time::Duration::from_secs(15)
+                            })
+                    }
+                    None => true,
+                };
+                if is_ready {
+                    ready_results.push(result);
+                } else {
+                    deferred_results.push(result);
+                }
+            }
+        }
+
+        if ready_results.is_empty() {
+            self.pending_results = deferred_results;
+            self.retrigger_deadline = Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(RETRIGGER_DEBOUNCE_MS),
+            );
+            tracing::debug!(
+                channel_id = %self.id,
+                deferred = self.pending_results.len(),
+                "request-group barrier kept retrigger pending"
+            );
+            return;
+        }
+
+        let result_count = ready_results.len();
 
         // Build per-result summaries for the template.
-        let result_items: Vec<_> = self
-            .pending_results
+        let result_items: Vec<_> = ready_results
             .iter()
             .map(|r| crate::prompts::engine::RetriggerResult {
                 process_type: r.process_type.to_string(),
                 process_id: r.process_id.clone(),
                 success: r.success,
                 result: r.result.clone(),
+                request_group_id: r.request_group_id.clone(),
+                request_group_origin: r.request_group_origin.clone(),
+                source_manifest_summary: r.source_manifest_summary.clone(),
             })
             .collect();
 
@@ -3486,6 +4015,8 @@ impl Channel {
                     %error,
                     "failed to render retrigger message, retrying"
                 );
+                self.pending_results = deferred_results;
+                self.pending_results.extend(ready_results);
                 self.retrigger_deadline = Some(
                     tokio::time::Instant::now()
                         + std::time::Duration::from_millis(RETRIGGER_DEBOUNCE_MS),
@@ -3497,8 +4028,7 @@ impl Channel {
         // Build a compact summary of the results to inject into history after
         // a successful relay. This goes into metadata so handle_message can
         // pull it out without re-parsing the template.
-        let result_summary = self
-            .pending_results
+        let result_summary = ready_results
             .iter()
             .map(|r| {
                 let status = if r.success { "completed" } else { "failed" };
@@ -3520,11 +4050,8 @@ impl Channel {
 
         // Collect the process IDs so we can mark them as relayed in the
         // status block after the retrigger turn completes successfully.
-        let retrigger_process_ids: Vec<String> = self
-            .pending_results
-            .iter()
-            .map(|r| r.process_id.clone())
-            .collect();
+        let retrigger_process_ids: Vec<String> =
+            ready_results.iter().map(|r| r.process_id.clone()).collect();
 
         let mut metadata = self.pending_retrigger_metadata.clone();
         metadata.insert(
@@ -3550,6 +4077,41 @@ impl Channel {
         };
         match self.self_tx.try_send(synthetic) {
             Ok(()) => {
+                let relayed_group_ids: Vec<String> = ready_results
+                    .iter()
+                    .filter_map(|result| result.request_group_id.clone())
+                    .collect();
+                if !relayed_group_ids.is_empty() {
+                    let _unique_group_ids: std::collections::HashSet<String> =
+                        relayed_group_ids.iter().cloned().collect();
+                    let mut runtime = self.state.request_group_runtime.write().await;
+                    for request_group_id in relayed_group_ids {
+                        if let Some(group) = runtime.get_mut(&request_group_id)
+                            && group.completed_process_ids.len() >= group.expected_process_ids.len()
+                        {
+                            self.state.process_run_logger.log_request_group_state(
+                                &request_group_id,
+                                crate::RequestGroupState::Complete,
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    #[cfg(feature = "metrics")]
+                    for request_group_id in _unique_group_ids {
+                        let outcome = if deferred_results.iter().any(|result| {
+                            result.request_group_id.as_deref() == Some(request_group_id.as_str())
+                        }) {
+                            "sprayed"
+                        } else {
+                            "synthesized"
+                        };
+                        crate::telemetry::Metrics::global()
+                            .request_groups_total
+                            .with_label_values(&[&self.deps.agent_id, outcome])
+                            .inc();
+                    }
+                }
                 self.retrigger_count += 1;
                 tracing::info!(
                     channel_id = %self.id,
@@ -3559,9 +4121,15 @@ impl Channel {
                     result_count,
                 );
 
-                self.pending_retrigger = false;
+                self.pending_retrigger = !deferred_results.is_empty();
                 self.pending_retrigger_metadata.clear();
-                self.pending_results.clear();
+                self.pending_results = deferred_results;
+                if self.pending_retrigger {
+                    self.retrigger_deadline = Some(
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(RETRIGGER_DEBOUNCE_MS),
+                    );
+                }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(
@@ -3569,6 +4137,8 @@ impl Channel {
                     result_count,
                     "channel self queue is full, retrying retrigger"
                 );
+                self.pending_results = deferred_results;
+                self.pending_results.extend(ready_results);
                 self.retrigger_deadline = Some(
                     tokio::time::Instant::now()
                         + std::time::Duration::from_millis(RETRIGGER_DEBOUNCE_MS),
@@ -3581,7 +4151,7 @@ impl Channel {
                 );
                 self.pending_retrigger = false;
                 self.pending_retrigger_metadata.clear();
-                self.pending_results.clear();
+                self.pending_results = deferred_results;
             }
         }
     }
@@ -3867,10 +4437,11 @@ fn should_send_quiet_mode_fallback(
 mod tests {
     use super::{
         ChannelStreamingHook, QuietModeFallbackState, StreamForwardingState,
-        compute_listen_mode_invocation, missing_stream_final_response_error, recv_channel_event,
-        reply_looks_like_deferred_action, should_forward_stream_delta,
-        should_process_event_for_channel, should_send_discord_quiet_mode_ping_ack,
-        should_send_quiet_mode_fallback, streaming_error_to_prompt_result,
+        compute_listen_mode_invocation, detect_operator_policy_promotions,
+        missing_stream_final_response_error, recv_channel_event, reply_looks_like_deferred_action,
+        should_forward_stream_delta, should_process_event_for_channel,
+        should_send_discord_quiet_mode_ping_ack, should_send_quiet_mode_fallback,
+        streaming_error_to_prompt_result,
     };
     use crate::hooks::SpacebotHook;
     use crate::llm::SpacebotModel;
@@ -4002,6 +4573,18 @@ mod tests {
         };
 
         assert!(should_process_event_for_channel(&event, &channel_id));
+    }
+
+    #[test]
+    fn operator_policy_detection_promotes_parallel_worker_rule() {
+        let promotions = detect_operator_policy_promotions(
+            "For large independent tasks, use many workers in parallel and synthesize once.",
+        );
+        assert!(
+            promotions
+                .iter()
+                .any(|policy| policy.policy_key == "planning.parallel_independent_work")
+        );
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub struct SystemInfo {
     pub capabilities: Vec<String>,
     /// Names of connected MCP servers.
     pub mcp_servers: Vec<String>,
+    /// Compact verified capability labels with health state.
+    pub verified_capabilities: Vec<String>,
+    /// Durable operator policies that override generic planning defaults.
+    pub operator_policies: Vec<String>,
     /// Whether sandbox containment is active.
     pub sandbox_active: bool,
     /// Warmup state label (e.g. "warm", "cold", "degraded").
@@ -106,6 +110,8 @@ impl SystemInfo {
             max_branches: **rc.max_concurrent_branches.load(),
             capabilities,
             mcp_servers,
+            verified_capabilities: Vec::new(),
+            operator_policies: Vec::new(),
             sandbox_active: sandbox.containment_active(),
             warmup_state,
             embedding_ready: warmup_status.embedding_ready,
@@ -123,6 +129,12 @@ impl SystemInfo {
         output.push_str(&format!("Time: {current_time_line}\n"));
         output.push_str(&format!("Model: {}\n", self.worker_model));
         output.push_str(&format!("Context: {} tokens\n", self.context_window));
+        if !self.operator_policies.is_empty() {
+            output.push_str(&format!(
+                "Operator policies: {}\n",
+                self.operator_policies.join(" | ")
+            ));
+        }
         output
     }
 }
@@ -588,6 +600,20 @@ fn render_system_info(info: &SystemInfo, current_time_line: Option<&str>) -> Str
         ));
     }
 
+    if !info.verified_capabilities.is_empty() {
+        output.push_str(&format!(
+            "Verified capabilities: {}\n",
+            info.verified_capabilities.join(", ")
+        ));
+    }
+
+    if !info.operator_policies.is_empty() {
+        output.push_str(&format!(
+            "Operator policies: {}\n",
+            info.operator_policies.join(" | ")
+        ));
+    }
+
     // Warmup / readiness
     let mut warmup_parts = vec![info.warmup_state.as_str()];
     let embedding_label = if info.embedding_ready {
@@ -713,6 +739,8 @@ mod tests {
             max_branches: 3,
             capabilities: vec!["browser".into(), "web_search".into()],
             mcp_servers: vec!["github".into(), "linear".into()],
+            verified_capabilities: vec!["browser(verified)".into()],
+            operator_policies: vec![],
             sandbox_active: true,
             warmup_state: "warm".into(),
             embedding_ready: true,

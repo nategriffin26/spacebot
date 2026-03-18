@@ -311,6 +311,109 @@ pub enum ProcessEvent {
     },
 }
 
+/// Request-group relay mode for a user request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestGroupMode {
+    SingleReply,
+    UpdatesOk,
+    SilentBackground,
+}
+
+impl RequestGroupMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleReply => "single_reply",
+            Self::UpdatesOk => "updates_ok",
+            Self::SilentBackground => "silent_background",
+        }
+    }
+}
+
+/// Durable lifecycle state for a grouped user request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestGroupState {
+    Planning,
+    Running,
+    Synthesizing,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl RequestGroupState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Running => "running",
+            Self::Synthesizing => "synthesizing",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Task-class labels used for routing and observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClass {
+    SourceVerification,
+    ArtifactGroundedCopy,
+    CapabilityDiagnosis,
+    MultiLaneSynthesis,
+    SimpleBoundedExecution,
+    Coding,
+}
+
+impl TaskClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceVerification => "source_verification",
+            Self::ArtifactGroundedCopy => "artifact_grounded_copy",
+            Self::CapabilityDiagnosis => "capability_diagnosis",
+            Self::MultiLaneSynthesis => "multi_lane_synthesis",
+            Self::SimpleBoundedExecution => "simple_bounded_execution",
+            Self::Coding => "coding",
+        }
+    }
+}
+
+/// Explicit user-named sources that must outrank workspace residue.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourceManifest {
+    pub explicit_paths: Vec<String>,
+    pub explicit_files: Vec<String>,
+    pub explicit_urls: Vec<String>,
+    pub explicit_repo_roots: Vec<String>,
+    pub user_named_artifacts: Vec<String>,
+    pub forbidden_fallback_sources: Vec<String>,
+}
+
+impl SourceManifest {
+    pub fn has_explicit_sources(&self) -> bool {
+        !self.explicit_paths.is_empty()
+            || !self.explicit_files.is_empty()
+            || !self.explicit_urls.is_empty()
+            || !self.explicit_repo_roots.is_empty()
+            || !self.user_named_artifacts.is_empty()
+    }
+}
+
+/// Structured worker completion receipt used for post-hoc audits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerOutcomeReceipt {
+    pub summary: String,
+    pub sources_used: Vec<String>,
+    pub artifacts_created: Vec<String>,
+    pub commands_run: Vec<String>,
+    pub verified_claims: Vec<String>,
+    pub inferred_claims: Vec<String>,
+    pub blockers: Vec<String>,
+    pub wrong_source_detected: bool,
+}
+
 /// Default broadcast capacity for the per-agent control event bus.
 pub const CONTROL_EVENT_BUS_CAPACITY: usize = 256;
 

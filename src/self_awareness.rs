@@ -7,7 +7,7 @@
 
 use crate::config::{McpTransport, RuntimeConfig};
 use rust_embed::Embed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -39,6 +39,253 @@ pub struct EmbeddedDocSummary {
 pub struct EmbeddedDoc {
     pub summary: EmbeddedDocSummary,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedCapability {
+    pub capability_name: String,
+    pub category: String,
+    pub invocation_path: String,
+    pub required_secrets_present: bool,
+    pub health_state: String,
+    pub last_verified_at: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub failure_reason: Option<String>,
+    pub note: Option<String>,
+}
+
+pub fn refresh_verified_capabilities(
+    agent_id: &str,
+    runtime_config: &RuntimeConfig,
+    connected_mcp_servers: &[String],
+) -> Vec<VerifiedCapability> {
+    let registry_path = capability_registry_path(agent_id, runtime_config);
+    if let Some(parent) = registry_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let previous_entries = load_verified_capabilities(agent_id, runtime_config).unwrap_or_default();
+    let previous = previous_entries
+        .into_iter()
+        .map(|entry| (entry.capability_name.clone(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut entries = Vec::new();
+    let browser = runtime_config.browser_config.load();
+    if browser.enabled {
+        entries.push(merge_capability_entry(
+            previous.get("browser"),
+            VerifiedCapability {
+                capability_name: "browser".to_string(),
+                category: "tool".to_string(),
+                invocation_path: "browser_*".to_string(),
+                required_secrets_present: true,
+                health_state: "verified".to_string(),
+                last_verified_at: Some(now.clone()),
+                last_failure_at: None,
+                failure_reason: None,
+                note: Some("builtin browser tools enabled".to_string()),
+            },
+        ));
+    }
+
+    let brave_configured = runtime_config.brave_search_key.load().is_some();
+    if brave_configured {
+        entries.push(merge_capability_entry(
+            previous.get("web_search"),
+            VerifiedCapability {
+                capability_name: "web_search".to_string(),
+                category: "tool".to_string(),
+                invocation_path: "web_search".to_string(),
+                required_secrets_present: true,
+                health_state: "verified".to_string(),
+                last_verified_at: Some(now.clone()),
+                last_failure_at: None,
+                failure_reason: None,
+                note: Some("Brave Search key configured".to_string()),
+            },
+        ));
+    }
+
+    let opencode = runtime_config.opencode.load();
+    if opencode.enabled {
+        entries.push(merge_capability_entry(
+            previous.get("opencode"),
+            VerifiedCapability {
+                capability_name: "opencode".to_string(),
+                category: "worker".to_string(),
+                invocation_path: "spawn_worker(worker_type=opencode)".to_string(),
+                required_secrets_present: true,
+                health_state: "verified".to_string(),
+                last_verified_at: Some(now.clone()),
+                last_failure_at: None,
+                failure_reason: None,
+                note: Some(format!("path={}", opencode.path)),
+            },
+        ));
+    }
+
+    for server in runtime_config
+        .mcp
+        .load()
+        .iter()
+        .filter(|server| server.enabled)
+    {
+        let connected = connected_mcp_servers
+            .iter()
+            .any(|name| name == &server.name);
+        entries.push(merge_capability_entry(
+            previous.get(server.name.as_str()),
+            VerifiedCapability {
+                capability_name: server.name.clone(),
+                category: "mcp".to_string(),
+                invocation_path: format!("mcp:{}", server.name),
+                required_secrets_present: true,
+                health_state: if connected {
+                    "verified".to_string()
+                } else {
+                    "degraded".to_string()
+                },
+                last_verified_at: connected.then(|| now.clone()),
+                last_failure_at: (!connected).then(|| now.clone()),
+                failure_reason: (!connected).then(|| "configured but not connected".to_string()),
+                note: Some(format!("transport={}", server.transport.kind())),
+            },
+        ));
+        #[cfg(feature = "metrics")]
+        if !connected {
+            crate::telemetry::Metrics::global()
+                .mcp_degraded_incidence_total
+                .with_label_values(&[agent_id, &server.name])
+                .inc();
+        }
+    }
+
+    if let Some(image_generation) = read_image_generation_config(&runtime_config.instance_dir) {
+        entries.push(merge_capability_entry(
+            previous.get("image_generation"),
+            VerifiedCapability {
+                capability_name: "image_generation".to_string(),
+                category: "tool".to_string(),
+                invocation_path: "tools.image_generation".to_string(),
+                required_secrets_present: image_generation.api_key_present,
+                health_state: if image_generation.enabled && image_generation.api_key_present {
+                    "verified".to_string()
+                } else if image_generation.enabled {
+                    "degraded".to_string()
+                } else {
+                    "unavailable".to_string()
+                },
+                last_verified_at: (image_generation.enabled && image_generation.api_key_present)
+                    .then(|| now.clone()),
+                last_failure_at: (image_generation.enabled && !image_generation.api_key_present)
+                    .then(|| now.clone()),
+                failure_reason: (image_generation.enabled && !image_generation.api_key_present)
+                    .then(|| "enabled but API key missing".to_string()),
+                note: Some(format!(
+                    "provider={} model={}",
+                    image_generation.provider, image_generation.default_model
+                )),
+            },
+        ));
+    }
+
+    persist_verified_capabilities(&registry_path, &entries);
+
+    entries
+}
+
+pub fn load_verified_capabilities(
+    agent_id: &str,
+    runtime_config: &RuntimeConfig,
+) -> Option<Vec<VerifiedCapability>> {
+    let registry_path = capability_registry_path(agent_id, runtime_config);
+    std::fs::read_to_string(registry_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Vec<VerifiedCapability>>(&content).ok())
+}
+
+fn persist_verified_capabilities(registry_path: &std::path::Path, entries: &[VerifiedCapability]) {
+    let _ = std::fs::write(
+        registry_path,
+        serde_json::to_string_pretty(entries).unwrap_or_else(|_| "[]".to_string()),
+    );
+}
+
+fn capability_registry_path(agent_id: &str, runtime_config: &RuntimeConfig) -> std::path::PathBuf {
+    runtime_config
+        .instance_dir
+        .join("agents")
+        .join(agent_id)
+        .join("data")
+        .join("capabilities_registry.json")
+}
+
+fn merge_capability_entry(
+    previous: Option<&VerifiedCapability>,
+    mut current: VerifiedCapability,
+) -> VerifiedCapability {
+    if current.health_state == "verified" {
+        current.last_failure_at = previous.and_then(|entry| entry.last_failure_at.clone());
+    } else if current.last_failure_at.is_none() {
+        current.last_failure_at = previous.and_then(|entry| entry.last_failure_at.clone());
+    }
+    current
+}
+
+#[derive(Debug)]
+struct RawImageGenerationConfig {
+    enabled: bool,
+    provider: String,
+    default_model: String,
+    api_key_present: bool,
+}
+
+fn read_image_generation_config(
+    instance_dir: &std::path::Path,
+) -> Option<RawImageGenerationConfig> {
+    let config_path = instance_dir.join("config.toml");
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let parsed = content.parse::<toml::Table>().ok()?;
+    let tools = parsed.get("tools")?.as_table()?;
+    let image_generation = tools.get("image_generation")?.as_table()?;
+    Some(RawImageGenerationConfig {
+        enabled: image_generation
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        provider: image_generation
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        default_model: image_generation
+            .get("default_model")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        api_key_present: image_generation
+            .get("api_key")
+            .and_then(|value| value.as_str())
+            .is_some_and(has_resolved_secret_value),
+    })
+}
+
+fn has_resolved_secret_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(secret_name) = trimmed.strip_prefix("secret:") {
+        return crate::config::resolve_env_value(&format!("secret:{secret_name}")).is_some();
+    }
+    if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
+        let secret_name = &trimmed[2..trimmed.len() - 1];
+        return crate::config::resolve_env_value(&format!("secret:{secret_name}")).is_some()
+            || std::env::var(secret_name).ok().is_some();
+    }
+    true
 }
 
 /// Full embedded `AGENTS.md` content.
@@ -136,6 +383,8 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
 
     let readiness = runtime_config.work_readiness();
     let memory_bulletin = runtime_config.memory_bulletin.load();
+    let verified_capabilities = load_verified_capabilities(agent_id, runtime_config)
+        .unwrap_or_else(|| refresh_verified_capabilities(agent_id, runtime_config, &[]));
     let secrets = runtime_config.secrets.load();
     let secrets_snapshot = if let Some(store) = secrets.as_ref() {
         match store.status(false) {
@@ -281,6 +530,7 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
             "char_count": memory_bulletin.len(),
         },
         "secrets": secrets_snapshot,
+        "verified_capabilities": verified_capabilities,
     })
 }
 

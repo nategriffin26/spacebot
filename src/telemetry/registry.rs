@@ -204,6 +204,30 @@ pub struct Metrics {
     /// Ingestion files processed.
     /// Labels: agent_id, result.
     pub ingestion_files_processed_total: IntCounterVec,
+
+    /// Assistant replies emitted by the channel.
+    /// Labels: agent_id, kind.
+    pub assistant_replies_total: IntCounterVec,
+
+    /// Request-group lifecycle counters.
+    /// Labels: agent_id, outcome.
+    pub request_groups_total: IntCounterVec,
+
+    /// Secret-bearing memory-save attempts blocked before persistence.
+    /// Labels: agent_id.
+    pub blocked_memory_secret_saves_total: IntCounterVec,
+
+    /// Contradiction-repair actions applied during maintenance.
+    /// Labels: agent_id, action.
+    pub contradiction_repair_actions_total: IntCounterVec,
+
+    /// Task-class routing distribution.
+    /// Labels: agent_id, process_type, task_class.
+    pub task_class_routing_total: IntCounterVec,
+
+    /// Configured-but-degraded MCP capability incidence.
+    /// Labels: agent_id, server_name.
+    pub mcp_degraded_incidence_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -594,6 +618,60 @@ impl Metrics {
         )
         .expect("hardcoded metric descriptor");
 
+        let assistant_replies_total = IntCounterVec::new(
+            Opts::new(
+                "spacebot_assistant_replies_total",
+                "Assistant replies emitted by the channel",
+            ),
+            &["agent_id", "kind"],
+        )
+        .expect("hardcoded metric descriptor");
+
+        let request_groups_total = IntCounterVec::new(
+            Opts::new(
+                "spacebot_request_groups_total",
+                "Request-group lifecycle counters",
+            ),
+            &["agent_id", "outcome"],
+        )
+        .expect("hardcoded metric descriptor");
+
+        let blocked_memory_secret_saves_total = IntCounterVec::new(
+            Opts::new(
+                "spacebot_blocked_memory_secret_saves_total",
+                "Secret-bearing memory-save attempts blocked before persistence",
+            ),
+            &["agent_id"],
+        )
+        .expect("hardcoded metric descriptor");
+
+        let contradiction_repair_actions_total = IntCounterVec::new(
+            Opts::new(
+                "spacebot_contradiction_repair_actions_total",
+                "Contradiction-repair actions applied during maintenance",
+            ),
+            &["agent_id", "action"],
+        )
+        .expect("hardcoded metric descriptor");
+
+        let task_class_routing_total = IntCounterVec::new(
+            Opts::new(
+                "spacebot_task_class_routing_total",
+                "Task-class routing distribution",
+            ),
+            &["agent_id", "process_type", "task_class"],
+        )
+        .expect("hardcoded metric descriptor");
+
+        let mcp_degraded_incidence_total = IntCounterVec::new(
+            Opts::new(
+                "spacebot_mcp_degraded_incidence_total",
+                "Configured but degraded MCP capability incidence",
+            ),
+            &["agent_id", "server_name"],
+        )
+        .expect("hardcoded metric descriptor");
+
         // === Register all metrics ===
 
         // Existing (upgraded)
@@ -742,6 +820,24 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_files_processed_total.clone()))
             .expect("hardcoded metric");
+        registry
+            .register(Box::new(assistant_replies_total.clone()))
+            .expect("hardcoded metric");
+        registry
+            .register(Box::new(request_groups_total.clone()))
+            .expect("hardcoded metric");
+        registry
+            .register(Box::new(blocked_memory_secret_saves_total.clone()))
+            .expect("hardcoded metric");
+        registry
+            .register(Box::new(contradiction_repair_actions_total.clone()))
+            .expect("hardcoded metric");
+        registry
+            .register(Box::new(task_class_routing_total.clone()))
+            .expect("hardcoded metric");
+        registry
+            .register(Box::new(mcp_degraded_incidence_total.clone()))
+            .expect("hardcoded metric");
 
         Self {
             registry,
@@ -789,6 +885,12 @@ impl Metrics {
             worker_cost_dollars,
             cron_executions_total,
             ingestion_files_processed_total,
+            assistant_replies_total,
+            request_groups_total,
+            blocked_memory_secret_saves_total,
+            contradiction_repair_actions_total,
+            task_class_routing_total,
+            mcp_degraded_incidence_total,
         }
     }
 

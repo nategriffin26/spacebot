@@ -6,8 +6,8 @@
 
 use super::state::ApiState;
 use crate::config::{
-    DefaultsConfig, DiscordConfig, EmailConfig, LlmConfig, SlackConfig, TelegramConfig,
-    TwitchConfig,
+    DefaultsConfig, DiscordConfig, EmailConfig, LlmConfig, SignalConfig, SlackConfig,
+    TelegramConfig, TwitchConfig,
 };
 use crate::secrets::store::{
     ExportData, SecretCategory, SecretsStore, StoreState, SystemSecrets, auto_categorize,
@@ -458,6 +458,10 @@ pub async fn migrate_secrets(State(state): State<Arc<ApiState>>) -> impl IntoRes
     migrate_section_secrets::<TelegramConfig>(&store, &mut doc, &mut migrated);
     migrate_section_secrets::<TwitchConfig>(&store, &mut doc, &mut migrated);
     migrate_section_secrets::<EmailConfig>(&store, &mut doc, &mut migrated);
+    migrate_section_secrets::<SignalConfig>(&store, &mut doc, &mut migrated);
+    migrate_defaults_mcp_secrets(&store, &mut doc, &mut migrated);
+    migrate_agent_mcp_secrets(&store, &mut doc, &mut migrated);
+    migrate_image_generation_secret(&store, &mut doc, &mut migrated);
 
     // Write updated config.toml if any migrations were made.
     if !migrated.is_empty()
@@ -756,5 +760,374 @@ fn set_instance_toml_value(
     };
     if let Some(instance) = instances.get_mut(index) {
         instance[key] = toml_edit::value(value);
+    }
+}
+
+fn migrate_defaults_mcp_secrets(
+    store: &SecretsStore,
+    doc: &mut toml_edit::DocumentMut,
+    migrated: &mut Vec<MigrationItem>,
+) {
+    let Some(servers) = doc
+        .get_mut("defaults")
+        .and_then(|defaults| defaults.get_mut("mcp"))
+        .and_then(|mcp| mcp.as_array_of_tables_mut())
+    else {
+        return;
+    };
+
+    for (index, server) in servers.iter_mut().enumerate() {
+        migrate_mcp_server_secrets(store, server, &format!("defaults.mcp[{index}]"), migrated);
+    }
+}
+
+fn migrate_agent_mcp_secrets(
+    store: &SecretsStore,
+    doc: &mut toml_edit::DocumentMut,
+    migrated: &mut Vec<MigrationItem>,
+) {
+    let Some(agents) = doc
+        .get_mut("agents")
+        .and_then(|value| value.as_array_of_tables_mut())
+    else {
+        return;
+    };
+
+    for (agent_index, agent) in agents.iter_mut().enumerate() {
+        let Some(servers) = agent
+            .get_mut("mcp")
+            .and_then(|value| value.as_array_of_tables_mut())
+        else {
+            continue;
+        };
+        for (mcp_index, server) in servers.iter_mut().enumerate() {
+            migrate_mcp_server_secrets(
+                store,
+                server,
+                &format!("agents[{agent_index}].mcp[{mcp_index}]"),
+                migrated,
+            );
+        }
+    }
+}
+
+fn migrate_mcp_server_secrets(
+    store: &SecretsStore,
+    server: &mut toml_edit::Table,
+    config_prefix: &str,
+    migrated: &mut Vec<MigrationItem>,
+) {
+    let server_name = server
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(normalize_secret_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "MCP".to_string());
+    migrate_flattened_mcp_env_secrets(store, server, &server_name, config_prefix, migrated);
+
+    if let Some(env) = server
+        .get_mut("env")
+        .and_then(|value| value.as_inline_table_mut())
+    {
+        let keys: Vec<String> = env.iter().map(|(key, _)| key.to_string()).collect();
+        for key in keys {
+            let Some(raw_value) = env.get(&key).and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !is_plaintext_secret_candidate(raw_value) {
+                continue;
+            }
+
+            let secret_name = if key
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+            {
+                key.clone()
+            } else {
+                format!("MCP_{server_name}_{}", normalize_secret_component(&key))
+            };
+
+            if store
+                .set(&secret_name, raw_value, auto_categorize(&secret_name))
+                .is_err()
+            {
+                continue;
+            }
+
+            env.insert(&key, toml_edit::Value::from(format!("${{{secret_name}}}")));
+            let category = auto_categorize(&secret_name);
+            migrated.push(MigrationItem {
+                config_key: format!("{config_prefix}.env.{key}"),
+                secret_name,
+                category,
+            });
+        }
+    }
+
+    if let Some(headers) = server
+        .get_mut("headers")
+        .and_then(|value| value.as_inline_table_mut())
+    {
+        let keys: Vec<String> = headers.iter().map(|(key, _)| key.to_string()).collect();
+        for key in keys {
+            let Some(raw_value) = headers.get(&key).and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !is_plaintext_secret_candidate(raw_value) {
+                continue;
+            }
+
+            let secret_name = format!("MCP_{server_name}_{}", normalize_secret_component(&key));
+            let category = auto_categorize(&secret_name);
+            if store.set(&secret_name, raw_value, category).is_err() {
+                continue;
+            }
+
+            headers.insert(
+                &key,
+                toml_edit::Value::from(mcp_header_placeholder(raw_value, &secret_name)),
+            );
+            migrated.push(MigrationItem {
+                config_key: format!("{config_prefix}.headers.{key}"),
+                secret_name,
+                category,
+            });
+        }
+    }
+}
+
+fn migrate_flattened_mcp_env_secrets(
+    store: &SecretsStore,
+    server: &mut toml_edit::Table,
+    server_name: &str,
+    config_prefix: &str,
+    migrated: &mut Vec<MigrationItem>,
+) {
+    const RESERVED_KEYS: &[&str] = &[
+        "name",
+        "transport",
+        "enabled",
+        "command",
+        "args",
+        "env",
+        "url",
+        "headers",
+    ];
+
+    let flattened_keys: Vec<String> = server
+        .iter()
+        .filter_map(|(key, value)| {
+            let key_str = key.to_string();
+            let looks_like_env = key_str
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+            if RESERVED_KEYS.contains(&key_str.as_str())
+                || !looks_like_env
+                || value.as_str().is_none()
+            {
+                None
+            } else {
+                Some(key_str)
+            }
+        })
+        .collect();
+
+    if flattened_keys.is_empty() {
+        return;
+    }
+
+    if !server.contains_key("env") {
+        server["env"] =
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()));
+    }
+
+    let mut replacements = Vec::new();
+    for key in flattened_keys {
+        let Some(raw_value) = server.get(&key).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !is_plaintext_secret_candidate(raw_value) {
+            continue;
+        }
+
+        let secret_name = if key
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        {
+            key.clone()
+        } else {
+            format!("MCP_{server_name}_{}", normalize_secret_component(&key))
+        };
+        let category = auto_categorize(&secret_name);
+        if store.set(&secret_name, raw_value, category).is_err() {
+            continue;
+        }
+
+        replacements.push((key.clone(), secret_name.clone(), category));
+        migrated.push(MigrationItem {
+            config_key: format!("{config_prefix}.{key}"),
+            secret_name,
+            category,
+        });
+    }
+
+    if let Some(env) = server
+        .get_mut("env")
+        .and_then(|value| value.as_inline_table_mut())
+    {
+        for (key, secret_name, _) in &replacements {
+            env.insert(key, toml_edit::Value::from(format!("${{{secret_name}}}")));
+        }
+    }
+    for (key, _, _) in replacements {
+        server.remove(&key);
+    }
+}
+
+fn migrate_image_generation_secret(
+    store: &SecretsStore,
+    doc: &mut toml_edit::DocumentMut,
+    migrated: &mut Vec<MigrationItem>,
+) {
+    let Some(image_generation) = doc
+        .get_mut("tools")
+        .and_then(|tools| tools.get_mut("image_generation"))
+        .and_then(|value| value.as_table_mut())
+    else {
+        return;
+    };
+
+    let Some(raw_value) = image_generation
+        .get("api_key")
+        .and_then(|value| value.as_str())
+    else {
+        return;
+    };
+    if !is_plaintext_secret_candidate(raw_value) {
+        return;
+    }
+
+    let secret_name = "IMAGE_GENERATION_API_KEY";
+    let category = auto_categorize(secret_name);
+    if store.set(secret_name, raw_value, category).is_err() {
+        return;
+    }
+
+    image_generation["api_key"] = toml_edit::value(format!("secret:{secret_name}"));
+    migrated.push(MigrationItem {
+        config_key: "tools.image_generation.api_key".to_string(),
+        secret_name: secret_name.to_string(),
+        category,
+    });
+}
+
+fn is_plaintext_secret_candidate(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with("env:")
+        && !trimmed.starts_with("secret:")
+        && !(trimmed.starts_with("${") && trimmed.ends_with('}'))
+}
+
+fn normalize_secret_component(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_uppercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    while normalized.contains("__") {
+        normalized = normalized.replace("__", "_");
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn mcp_header_placeholder(original: &str, secret_name: &str) -> String {
+    let trimmed = original.trim();
+    if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        format!("Bearer ${{{secret_name}}}")
+    } else {
+        format!("${{{secret_name}}}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn migrates_defaults_mcp_env_and_image_generation_secrets() {
+        let tempdir = tempdir().expect("tempdir");
+        let store = SecretsStore::new(tempdir.path().join("secrets.redb")).expect("store");
+        let mut migrated = Vec::new();
+        let mut doc = r#"
+[defaults]
+
+[[defaults.mcp]]
+name = "gemini"
+transport = "stdio"
+command = "node"
+env = { GEMINI_API_KEY = "literal-gemini-key" }
+
+[[defaults.mcp]]
+name = "twitter"
+transport = "stdio"
+command = "node"
+X_API_KEY = "literal-x-key"
+
+[tools.image_generation]
+enabled = true
+api_key = "literal-image-key"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse config");
+
+        migrate_defaults_mcp_secrets(&store, &mut doc, &mut migrated);
+        migrate_image_generation_secret(&store, &mut doc, &mut migrated);
+
+        let env_value = doc["defaults"]["mcp"][0]["env"]["GEMINI_API_KEY"]
+            .as_str()
+            .expect("env placeholder");
+        assert_eq!(env_value, "${GEMINI_API_KEY}");
+
+        let flattened_value = doc["defaults"]["mcp"][1]["env"]["X_API_KEY"]
+            .as_str()
+            .expect("flattened env placeholder");
+        assert_eq!(flattened_value, "${X_API_KEY}");
+        assert!(
+            doc["defaults"]["mcp"][1].get("X_API_KEY").is_none(),
+            "legacy flattened env key should be removed"
+        );
+
+        let image_value = doc["tools"]["image_generation"]["api_key"]
+            .as_str()
+            .expect("image secret ref");
+        assert_eq!(image_value, "secret:IMAGE_GENERATION_API_KEY");
+
+        assert!(
+            migrated
+                .iter()
+                .any(|item| item.config_key == "defaults.mcp[0].env.GEMINI_API_KEY")
+        );
+        assert!(
+            migrated
+                .iter()
+                .any(|item| item.config_key == "tools.image_generation.api_key")
+        );
+    }
+
+    #[test]
+    fn bearer_headers_preserve_scheme_when_migrated() {
+        assert_eq!(
+            mcp_header_placeholder("Bearer abc123", "MCP_TOKEN"),
+            "Bearer ${MCP_TOKEN}"
+        );
+        assert_eq!(
+            mcp_header_placeholder("abc123", "MCP_TOKEN"),
+            "${MCP_TOKEN}"
+        );
     }
 }

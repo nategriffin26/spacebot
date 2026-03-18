@@ -122,6 +122,36 @@ fn resolve_opencode_model(routing: &crate::llm::routing::RoutingConfig) -> Strin
     routing.resolve(ProcessType::Worker, None).to_string()
 }
 
+fn classify_request_task(
+    task: &str,
+    context: Option<&crate::agent::channel::CurrentRequestContext>,
+    default_task_class: Option<crate::TaskClass>,
+) -> Option<crate::TaskClass> {
+    if let Some(task_class) = default_task_class {
+        return Some(task_class);
+    }
+    if let Some(context) = context
+        && let Some(task_class) = context.task_class
+    {
+        return Some(task_class);
+    }
+
+    let lower = task.to_ascii_lowercase();
+    if lower.contains("code") || lower.contains("test") || lower.contains("build") {
+        return Some(crate::TaskClass::Coding);
+    }
+    if lower.contains("config") || lower.contains("capability") || lower.contains("why") {
+        return Some(crate::TaskClass::CapabilityDiagnosis);
+    }
+    if let Some(context) = context
+        && context.source_manifest.has_explicit_sources()
+    {
+        return Some(crate::TaskClass::SourceVerification);
+    }
+
+    Some(crate::TaskClass::SimpleBoundedExecution)
+}
+
 #[derive(Debug, Clone)]
 struct BranchSpawnOptions {
     profile: BranchToolProfile,
@@ -292,6 +322,7 @@ async fn spawn_branch(
 
     let branch_id = branch.id;
     let prompt = prompt.to_owned();
+    let request_group_id = state.ensure_request_group().await;
 
     // Capture what the spawned task needs to notify the channel on failure.
     // branch.run() only sends BranchResult on the success path, so the
@@ -336,6 +367,12 @@ async fn spawn_branch(
     {
         let mut branches = state.active_branches.write().await;
         branches.insert(branch_id, handle);
+    }
+
+    if let Some(request_group_id) = &request_group_id {
+        state
+            .register_request_group_process(request_group_id, &branch_id.to_string(), true, None)
+            .await;
     }
 
     {
@@ -465,12 +502,32 @@ async fn spawn_worker_inner(
 ) -> std::result::Result<WorkerId, AgentError> {
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
+    let request_context = state.current_request_context().await;
+    let request_group_id = state.ensure_request_group().await;
+    let task_class = classify_request_task(task, request_context.as_ref(), None);
+    #[cfg(feature = "metrics")]
+    if let Some(task_class_value) = task_class {
+        crate::telemetry::Metrics::global()
+            .task_class_routing_total
+            .with_label_values(&[&state.deps.agent_id, "worker", task_class_value.as_str()])
+            .inc();
+    }
 
     let worker_status_text = build_worker_status_text(rc.as_ref(), &state.deps.sandbox);
     let temporal_context = TemporalContext::from_runtime(rc.as_ref());
     let mut worker_task =
         build_worker_task_with_temporal_context(task, &temporal_context, &prompt_engine)
             .map_err(|error| AgentError::Other(anyhow::anyhow!("{error}")))?;
+
+    if let Some(context) = request_context.as_ref()
+        && context.source_manifest.has_explicit_sources()
+    {
+        let manifest_json = serde_json::to_string_pretty(&context.source_manifest)
+            .unwrap_or_else(|_| "{}".to_string());
+        worker_task = format!(
+            "## Source Manifest\n\n{manifest_json}\n\nRules:\n- Inventory these explicit sources first.\n- Do not silently substitute old drafts, unrelated artifacts, or workspace residue.\n- If any named source is missing, say so explicitly.\n- Record the sources you actually used in record_receipt.\n\n---\n\n{worker_task}"
+        );
+    }
 
     // Inject topic context if topic_ids were provided.
     if !topic_ids.is_empty() {
@@ -534,6 +591,7 @@ async fn spawn_worker_inner(
             Some(state.channel_id.clone()),
             &worker_task,
             &system_prompt,
+            task_class,
             state.deps.clone(),
             browser_config.clone(),
             state.screenshot_dir.clone(),
@@ -557,6 +615,7 @@ async fn spawn_worker_inner(
             Some(state.channel_id.clone()),
             &worker_task,
             &system_prompt,
+            task_class,
             state.deps.clone(),
             browser_config,
             state.screenshot_dir.clone(),
@@ -590,6 +649,17 @@ async fn spawn_worker_inner(
     );
 
     state.worker_handles.write().await.insert(worker_id, handle);
+
+    if let Some(request_group_id) = &request_group_id {
+        state
+            .register_request_group_process(
+                request_group_id,
+                &worker_id.to_string(),
+                false,
+                task_class,
+            )
+            .await;
+    }
 
     {
         let mut status = state.status_block.write().await;
@@ -653,6 +723,16 @@ async fn spawn_opencode_worker_inner(
     directory: &str,
     interactive: bool,
 ) -> std::result::Result<crate::WorkerId, AgentError> {
+    let request_group_id = state.ensure_request_group().await;
+    #[cfg(feature = "metrics")]
+    crate::telemetry::Metrics::global()
+        .task_class_routing_total
+        .with_label_values(&[
+            &state.deps.agent_id,
+            "worker",
+            crate::TaskClass::Coding.as_str(),
+        ])
+        .inc();
     let directory = expand_tilde(directory);
 
     let rc = &state.deps.runtime_config;
@@ -785,6 +865,17 @@ async fn spawn_opencode_worker_inner(
     );
 
     state.worker_handles.write().await.insert(worker_id, handle);
+
+    if let Some(request_group_id) = &request_group_id {
+        state
+            .register_request_group_process(
+                request_group_id,
+                &worker_id.to_string(),
+                false,
+                Some(crate::TaskClass::Coding),
+            )
+            .await;
+    }
 
     let opencode_task = format!("[opencode] {task}");
     {
@@ -1103,6 +1194,7 @@ pub async fn resume_idle_worker_into_state(
                 Some(state.channel_id.clone()),
                 &idle_worker.task,
                 &system_prompt,
+                None,
                 state.deps.clone(),
                 browser_config,
                 state.screenshot_dir.clone(),

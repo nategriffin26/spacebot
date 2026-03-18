@@ -711,6 +711,19 @@ where
         _internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
+        if tool_name == "memory_save"
+            && let Some(leak) = self.scan_for_leaks(args)
+        {
+            tracing::error!(
+                process_id = %self.process_id,
+                leak_prefix = %&leak[..leak.len().min(8)],
+                "blocked secret-bearing memory_save call before persistence"
+            );
+            return ToolCallHookAction::Skip {
+                reason: "memory_save blocked because the content contained a secret".into(),
+            };
+        }
+
         // Leak blocking is enforced at channel egress (`reply`). Worker and
         // branch tool calls may legitimately handle secrets internally.
         if self.process_type == ProcessType::Channel

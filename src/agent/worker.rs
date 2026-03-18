@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::hooks::{SpacebotHook, ToolNudgePolicy};
 use crate::llm::SpacebotModel;
 use crate::llm::routing::is_context_overflow_error;
-use crate::{AgentDeps, ChannelId, ProcessId, ProcessType, WorkerId};
+use crate::{AgentDeps, ChannelId, ProcessId, ProcessType, TaskClass, WorkerId};
 use rig::agent::AgentBuilder;
 use rig::completion::CompletionModel;
 use std::collections::HashSet;
@@ -67,6 +67,8 @@ pub struct Worker {
     pub status_rx: watch::Receiver<String>,
     /// Prior conversation history for resumed workers (set by `resume_interactive`).
     pub prior_history: Option<Vec<rig::message::Message>>,
+    /// Optional task class used for routing escalation.
+    pub task_class: Option<TaskClass>,
 }
 
 impl Worker {
@@ -75,6 +77,7 @@ impl Worker {
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
         system_prompt: impl Into<String>,
+        task_class: Option<TaskClass>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -112,6 +115,7 @@ impl Worker {
                 status_tx,
                 status_rx,
                 prior_history: None,
+                task_class,
             },
             inject_tx,
         )
@@ -123,6 +127,7 @@ impl Worker {
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
         system_prompt: impl Into<String>,
+        task_class: Option<TaskClass>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -133,6 +138,7 @@ impl Worker {
             channel_id,
             task,
             system_prompt,
+            task_class,
             deps,
             browser_config,
             screenshot_dir,
@@ -148,6 +154,7 @@ impl Worker {
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
         system_prompt: impl Into<String>,
+        task_class: Option<TaskClass>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -159,6 +166,7 @@ impl Worker {
             channel_id,
             task,
             system_prompt,
+            task_class,
             deps,
             browser_config,
             screenshot_dir,
@@ -181,6 +189,7 @@ impl Worker {
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
         system_prompt: impl Into<String>,
+        task_class: Option<TaskClass>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -193,6 +202,7 @@ impl Worker {
             channel_id,
             task,
             system_prompt,
+            task_class,
             deps,
             browser_config,
             screenshot_dir,
@@ -293,6 +303,7 @@ impl Worker {
             self.id,
             self.channel_id.clone(),
             self.deps.task_store.clone(),
+            crate::conversation::history::ProcessRunLogger::new(self.deps.sqlite_pool.clone()),
             self.deps.event_tx.clone(),
             self.browser_config.clone(),
             self.screenshot_dir.clone(),
@@ -304,7 +315,12 @@ impl Worker {
         );
 
         let routing = self.deps.runtime_config.routing.load();
-        let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+        let model_name = routing
+            .resolve(
+                ProcessType::Worker,
+                self.task_class.map(|value| value.as_str()),
+            )
+            .to_string();
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(&*self.deps.agent_id, "worker")
             .with_rig_alignment((**self.deps.runtime_config.rig_alignment.load()).clone())

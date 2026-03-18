@@ -46,6 +46,7 @@ pub mod memory_save;
 pub mod project_manage;
 pub mod react;
 pub mod read_skill;
+pub mod record_receipt;
 pub mod reply;
 pub mod route;
 pub mod secret_set;
@@ -116,6 +117,9 @@ pub use project_manage::{
 };
 pub use react::{ReactArgs, ReactError, ReactOutput, ReactTool};
 pub use read_skill::{ReadSkillArgs, ReadSkillError, ReadSkillOutput, ReadSkillTool};
+pub use record_receipt::{
+    RecordReceiptArgs, RecordReceiptError, RecordReceiptOutput, RecordReceiptTool,
+};
 pub use reply::{RepliedFlag, ReplyArgs, ReplyError, ReplyOutput, ReplyTool, new_replied_flag};
 pub use route::{RouteArgs, RouteError, RouteOutput, RouteTool};
 pub use secret_set::{SecretSetArgs, SecretSetError, SecretSetOutput, SecretSetTool};
@@ -641,6 +645,7 @@ pub fn create_worker_tool_server(
     worker_id: WorkerId,
     channel_id: Option<ChannelId>,
     task_store: Arc<TaskStore>,
+    run_logger: crate::conversation::history::ProcessRunLogger,
     event_tx: broadcast::Sender<ProcessEvent>,
     browser_config: BrowserConfig,
     screenshot_dir: PathBuf,
@@ -664,6 +669,7 @@ pub fn create_worker_tool_server(
             }
             status_tool
         })
+        .tool(RecordReceiptTool::new(worker_id, run_logger))
         .tool(ReadSkillTool::new(runtime_config.clone()));
 
     server = register_file_tools(server, workspace, sandbox);
@@ -705,6 +711,7 @@ pub fn list_worker_tool_names(
         FileListTool::NAME.to_string(),
         TaskUpdateTool::NAME.to_string(),
         SetStatusTool::NAME.to_string(),
+        RecordReceiptTool::NAME.to_string(),
         ReadSkillTool::NAME.to_string(),
     ];
 
