@@ -3562,6 +3562,7 @@ mod tests {
             minimax_cn_key: (provider == "minimax-cn").then(|| credential.to_string()),
             moonshot_key: (provider == "moonshot").then(|| credential.to_string()),
             zai_coding_plan_key: (provider == "zai-coding-plan").then(|| credential.to_string()),
+            github_copilot_key: (provider == "github-copilot").then(|| credential.to_string()),
             providers,
         }
     }

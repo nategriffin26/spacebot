@@ -81,35 +81,40 @@ impl Worker {
         brave_search_key: Option<String>,
         logs_dir: PathBuf,
         input_rx: Option<mpsc::Receiver<String>>,
-    ) -> Self {
+    ) -> (Self, mpsc::Sender<String>) {
         let id = Uuid::new_v4();
         let process_id = ProcessId::Worker(id);
+        let (inject_tx, inject_rx) = mpsc::channel(8);
         let hook = SpacebotHook::new(
             deps.agent_id.clone(),
             process_id,
             ProcessType::Worker,
             channel_id.clone(),
             deps.event_tx.clone(),
-        );
+        )
+        .with_inject_rx(inject_rx);
         let (status_tx, status_rx) = watch::channel("starting".to_string());
 
-        Self {
-            id,
-            channel_id,
-            task: task.into(),
-            state: WorkerState::Running,
-            deps,
-            hook,
-            system_prompt: system_prompt.into(),
-            input_rx,
-            browser_config,
-            screenshot_dir,
-            brave_search_key,
-            logs_dir,
-            status_tx,
-            status_rx,
-            prior_history: None,
-        }
+        (
+            Self {
+                id,
+                channel_id,
+                task: task.into(),
+                state: WorkerState::Running,
+                deps,
+                hook,
+                system_prompt: system_prompt.into(),
+                input_rx,
+                browser_config,
+                screenshot_dir,
+                brave_search_key,
+                logs_dir,
+                status_tx,
+                status_rx,
+                prior_history: None,
+            },
+            inject_tx,
+        )
     }
 
     /// Create a new fire-and-forget worker.
@@ -123,7 +128,7 @@ impl Worker {
         screenshot_dir: PathBuf,
         brave_search_key: Option<String>,
         logs_dir: PathBuf,
-    ) -> Self {
+    ) -> (Self, mpsc::Sender<String>) {
         Self::build(
             channel_id,
             task,
@@ -148,9 +153,9 @@ impl Worker {
         screenshot_dir: PathBuf,
         brave_search_key: Option<String>,
         logs_dir: PathBuf,
-    ) -> (Self, mpsc::Sender<String>) {
+    ) -> (Self, mpsc::Sender<String>, mpsc::Sender<String>) {
         let (input_tx, input_rx) = mpsc::channel(32);
-        let worker = Self::build(
+        let (worker, inject_tx) = Self::build(
             channel_id,
             task,
             system_prompt,
@@ -162,7 +167,7 @@ impl Worker {
             Some(input_rx),
         );
 
-        (worker, input_tx)
+        (worker, input_tx, inject_tx)
     }
 
     /// Resume an interactive worker that was idle at shutdown.
@@ -182,9 +187,9 @@ impl Worker {
         brave_search_key: Option<String>,
         logs_dir: PathBuf,
         prior_history: Vec<rig::message::Message>,
-    ) -> (Self, mpsc::Sender<String>) {
+    ) -> (Self, mpsc::Sender<String>, mpsc::Sender<String>) {
         let (input_tx, input_rx) = mpsc::channel(32);
-        let mut worker = Self::build(
+        let (mut worker, _inject_tx) = Self::build(
             channel_id,
             task,
             system_prompt,
@@ -200,17 +205,19 @@ impl Worker {
         // Rebuild the hook so it publishes events under the correct worker ID
         // (Self::build creates it with a fresh random ID).
         let process_id = ProcessId::Worker(existing_id);
+        let (replacement_inject_tx, replacement_inject_rx) = mpsc::channel(8);
         worker.hook = SpacebotHook::new(
             worker.deps.agent_id.clone(),
             process_id,
             ProcessType::Worker,
             worker.channel_id.clone(),
             worker.deps.event_tx.clone(),
-        );
+        )
+        .with_inject_rx(replacement_inject_rx);
         worker.state = WorkerState::WaitingForInput;
         // Stash the prior history so `run_follow_up_loop()` can pick it up.
         worker.prior_history = Some(prior_history);
-        (worker, input_tx)
+        (worker, input_tx, replacement_inject_tx)
     }
 
     /// Check if the worker can transition to a new state.

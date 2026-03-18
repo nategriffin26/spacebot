@@ -453,7 +453,7 @@ impl Tool for DetachedSpawnWorkerTool {
 
         let brave_search_key = (**rc.brave_search_key.load()).clone();
 
-        let worker = crate::agent::worker::Worker::new(
+        let (worker, _inject_tx) = crate::agent::worker::Worker::new(
             None, // no parent channel
             &args.task,
             worker_system_prompt,
@@ -464,7 +464,6 @@ impl Tool for DetachedSpawnWorkerTool {
             self.logs_dir.clone(),
         );
 
-        let (worker, _input_tx) = worker;
         let worker_id = worker.id;
 
         // Emit WorkerStarted event so the UI can track it.

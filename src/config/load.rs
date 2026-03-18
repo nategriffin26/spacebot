@@ -14,10 +14,11 @@ use super::{
     CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig, DiscordConfig,
     DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef, IngestionConfig,
     LinkDef, LlmConfig, McpServerConfig, McpTransport, MemoryPersistenceConfig, MessagingConfig,
-    MetricsConfig, OpenCodeConfig, ProviderConfig, RigAlignmentConfig, RigSemanticsMode,
-    SlackCommandConfig, SlackConfig, SlackInstanceConfig, TelegramConfig, TelegramInstanceConfig,
-    TelemetryConfig, TwitchConfig, TwitchInstanceConfig, WarmupConfig, WebhookConfig,
-    normalize_adapter, validate_named_messaging_adapters,
+    MetricsConfig, OpenCodeConfig, ProjectsConfig, ProviderConfig, RigAlignmentConfig,
+    RigSemanticsMode, SignalConfig, SignalInstanceConfig, SlackCommandConfig, SlackConfig,
+    SlackInstanceConfig, TelegramConfig, TelegramInstanceConfig, TelemetryConfig, TwitchConfig,
+    TwitchInstanceConfig, WarmupConfig, WebhookConfig, normalize_adapter,
+    validate_named_messaging_adapters,
 };
 use crate::error::{ConfigError, Result};
 
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
 /// - `secret:NAME` — look up from the secrets store (if available).
 /// - `env:VAR_NAME` — read from system environment variable.
 /// - Anything else — literal value.
-pub(super) fn resolve_env_value(value: &str) -> Option<String> {
+pub(crate) fn resolve_env_value(value: &str) -> Option<String> {
     if let Some(alias) = value.strip_prefix("secret:") {
         let guard = RESOLVE_SECRETS_STORE.load();
         match (*guard).as_ref() {
@@ -189,9 +190,37 @@ fn resolve_rig_alignment(
     }
 }
 
+fn resolve_projects_config(
+    overrides: Option<TomlProjectsConfig>,
+    defaults: &ProjectsConfig,
+) -> ProjectsConfig {
+    let Some(overrides) = overrides else {
+        return defaults.clone();
+    };
+
+    ProjectsConfig {
+        use_worktrees: overrides.use_worktrees.unwrap_or(defaults.use_worktrees),
+        worktree_name_template: overrides
+            .worktree_name_template
+            .unwrap_or_else(|| defaults.worktree_name_template.clone()),
+        auto_create_worktrees: overrides
+            .auto_create_worktrees
+            .unwrap_or(defaults.auto_create_worktrees),
+        auto_discover_repos: overrides
+            .auto_discover_repos
+            .unwrap_or(defaults.auto_discover_repos),
+        auto_discover_worktrees: overrides
+            .auto_discover_worktrees
+            .unwrap_or(defaults.auto_discover_worktrees),
+        disk_usage_warning_threshold: overrides
+            .disk_usage_warning_threshold
+            .unwrap_or(defaults.disk_usage_warning_threshold),
+    }
+}
+
 impl CortexConfig {
-    fn resolve(overrides: TomlCortexConfig, defaults: CortexConfig) -> CortexConfig {
-        CortexConfig {
+    fn resolve(overrides: TomlCortexConfig, defaults: CortexConfig) -> Result<CortexConfig> {
+        let config = CortexConfig {
             tick_interval_secs: overrides
                 .tick_interval_secs
                 .unwrap_or(defaults.tick_interval_secs),
@@ -222,6 +251,21 @@ impl CortexConfig {
             bulletin_max_turns: overrides
                 .bulletin_max_turns
                 .unwrap_or(defaults.bulletin_max_turns),
+            maintenance_interval_secs: overrides
+                .maintenance_interval_secs
+                .unwrap_or(defaults.maintenance_interval_secs),
+            maintenance_decay_rate: overrides
+                .maintenance_decay_rate
+                .unwrap_or(defaults.maintenance_decay_rate),
+            maintenance_prune_threshold: overrides
+                .maintenance_prune_threshold
+                .unwrap_or(defaults.maintenance_prune_threshold),
+            maintenance_min_age_days: overrides
+                .maintenance_min_age_days
+                .unwrap_or(defaults.maintenance_min_age_days),
+            maintenance_merge_similarity_threshold: overrides
+                .maintenance_merge_similarity_threshold
+                .unwrap_or(defaults.maintenance_merge_similarity_threshold),
             association_interval_secs: overrides
                 .association_interval_secs
                 .unwrap_or(defaults.association_interval_secs),
@@ -234,7 +278,9 @@ impl CortexConfig {
             association_max_per_pass: overrides
                 .association_max_per_pass
                 .unwrap_or(defaults.association_max_per_pass),
-        }
+        };
+        config.validate_maintenance_bounds()?;
+        Ok(config)
     }
 }
 
@@ -457,6 +503,7 @@ impl Config {
             minimax_cn_key: std::env::var("MINIMAX_CN_API_KEY").ok(),
             moonshot_key: std::env::var("MOONSHOT_API_KEY").ok(),
             zai_coding_plan_key: std::env::var("ZAI_CODING_PLAN_API_KEY").ok(),
+            github_copilot_key: std::env::var("GITHUB_COPILOT_API_KEY").ok(),
             providers: HashMap::new(),
         };
 
@@ -844,6 +891,8 @@ impl Config {
             default: true,
             display_name: None,
             role: None,
+            gradient_start: None,
+            gradient_end: None,
             workspace: None,
             routing: Some(routing),
             max_concurrent_branches: None,
@@ -865,6 +914,7 @@ impl Config {
             cron_timezone: None,
             user_timezone: None,
             sandbox: None,
+            projects: None,
             cron: Vec::new(),
         }];
 
@@ -886,6 +936,11 @@ impl Config {
                 display_name: None,
                 role: None,
                 bio: None,
+                description: None,
+                discord_id: None,
+                telegram_id: None,
+                slack_id: None,
+                email: None,
             }],
             messaging: MessagingConfig::default(),
             bindings: Vec::new(),
@@ -1075,6 +1130,12 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("ZAI_CODING_PLAN_API_KEY").ok()),
+            github_copilot_key: toml
+                .llm
+                .github_copilot_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("GITHUB_COPILOT_API_KEY").ok()),
             providers: toml
                 .llm
                 .providers
@@ -1462,6 +1523,7 @@ impl Config {
                 .defaults
                 .cortex
                 .map(|c| CortexConfig::resolve(c, base_defaults.cortex))
+                .transpose()?
                 .unwrap_or(base_defaults.cortex),
             warmup: toml
                 .defaults
@@ -1512,6 +1574,9 @@ impl Config {
                     listen_only_mode: channel_config
                         .listen_only_mode
                         .unwrap_or(base_defaults.channel.listen_only_mode),
+                    save_attachments: channel_config
+                        .save_attachments
+                        .unwrap_or(base_defaults.channel.save_attachments),
                 })
                 .unwrap_or(base_defaults.channel),
             mcp: default_mcp,
@@ -1570,6 +1635,7 @@ impl Config {
                 .as_deref()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(base_defaults.worker_log_mode),
+            projects: resolve_projects_config(toml.defaults.projects, &base_defaults.projects),
         };
 
         let mut agents: Vec<AgentConfig> = toml
@@ -1605,6 +1671,8 @@ impl Config {
                     default: a.default,
                     display_name: a.display_name,
                     role: a.role,
+                    gradient_start: a.gradient_start,
+                    gradient_end: a.gradient_end,
                     workspace: a.workspace.map(PathBuf::from),
                     routing: agent_routing,
                     max_concurrent_branches: a.max_concurrent_branches,
@@ -1645,7 +1713,10 @@ impl Config {
                             .unwrap_or(defaults.ingestion.poll_interval_secs),
                         chunk_size: ig.chunk_size.unwrap_or(defaults.ingestion.chunk_size),
                     }),
-                    cortex: a.cortex.map(|c| CortexConfig::resolve(c, defaults.cortex)),
+                    cortex: a
+                        .cortex
+                        .map(|c| CortexConfig::resolve(c, defaults.cortex))
+                        .transpose()?,
                     warmup: a.warmup.map(|w| WarmupConfig {
                         enabled: w.enabled.unwrap_or(defaults.warmup.enabled),
                         eager_embedding_load: w
@@ -1676,10 +1747,13 @@ impl Config {
                             .unwrap_or(defaults.browser.close_policy),
                         chrome_cache_dir: defaults.browser.chrome_cache_dir.clone(),
                     }),
-                    channel: a.channel.and_then(|channel_config| {
-                        channel_config
+                    channel: a.channel.map(|channel_config| ChannelConfig {
+                        listen_only_mode: channel_config
                             .listen_only_mode
-                            .map(|listen_only_mode| ChannelConfig { listen_only_mode })
+                            .unwrap_or(defaults.channel.listen_only_mode),
+                        save_attachments: channel_config
+                            .save_attachments
+                            .unwrap_or(defaults.channel.save_attachments),
                     }),
                     rig_alignment: a.rig_alignment.map(|rig_alignment| {
                         resolve_rig_alignment(Some(rig_alignment), defaults.rig_alignment.clone())
@@ -1697,6 +1771,9 @@ impl Config {
                     cron_timezone: a.cron_timezone.as_deref().and_then(resolve_env_value),
                     user_timezone: a.user_timezone.as_deref().and_then(resolve_env_value),
                     sandbox: a.sandbox,
+                    projects: a.projects.map(|projects| {
+                        resolve_projects_config(Some(projects), &defaults.projects)
+                    }),
                     cron,
                 })
             })
@@ -1708,6 +1785,8 @@ impl Config {
                 default: true,
                 display_name: None,
                 role: None,
+                gradient_start: None,
+                gradient_end: None,
                 workspace: None,
                 routing: None,
                 max_concurrent_branches: None,
@@ -1729,6 +1808,7 @@ impl Config {
                 cron_timezone: None,
                 user_timezone: None,
                 sandbox: None,
+                projects: None,
                 cron: Vec::new(),
             });
         }
@@ -2104,6 +2184,57 @@ impl Config {
                     trigger_prefix: t.trigger_prefix,
                 })
             }),
+            signal: toml.messaging.signal.and_then(|s| {
+                let instances = s
+                    .instances
+                    .into_iter()
+                    .map(|instance| {
+                        let http_url = instance.http_url.as_deref().and_then(resolve_env_value);
+                        let account = instance.account.as_deref().and_then(resolve_env_value);
+                        if instance.enabled && (http_url.is_none() || account.is_none()) {
+                            tracing::warn!(
+                                adapter = %instance.name,
+                                "signal instance is enabled but http_url or account is missing/unresolvable — disabling"
+                            );
+                        }
+                        let has_credentials = http_url.is_some() && account.is_some();
+                        SignalInstanceConfig {
+                            name: instance.name,
+                            enabled: instance.enabled && has_credentials,
+                            http_url: http_url.unwrap_or_default(),
+                            account: account.unwrap_or_default(),
+                            dm_allowed_users: instance.dm_allowed_users,
+                            group_ids: instance.group_ids,
+                            group_allowed_users: instance.group_allowed_users,
+                            ignore_stories: instance.ignore_stories,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                let http_url = std::env::var("SIGNAL_HTTP_URL")
+                    .ok()
+                    .or_else(|| s.http_url.as_deref().and_then(resolve_env_value));
+                let account = std::env::var("SIGNAL_ACCOUNT")
+                    .ok()
+                    .or_else(|| s.account.as_deref().and_then(resolve_env_value));
+
+                if (http_url.is_none() || account.is_none())
+                    && !instances.iter().any(|instance| instance.enabled)
+                {
+                    return None;
+                }
+
+                Some(SignalConfig {
+                    enabled: s.enabled,
+                    http_url: http_url.unwrap_or_default(),
+                    account: account.unwrap_or_default(),
+                    instances,
+                    dm_allowed_users: s.dm_allowed_users,
+                    group_ids: s.group_ids,
+                    group_allowed_users: s.group_allowed_users,
+                    ignore_stories: s.ignore_stories,
+                })
+            }),
         };
 
         let bindings: Vec<Binding> = toml
@@ -2197,6 +2328,11 @@ impl Config {
                 display_name: h.display_name,
                 role: h.role,
                 bio: h.bio,
+                description: None,
+                discord_id: h.discord_id,
+                telegram_id: h.telegram_id,
+                slack_id: h.slack_id,
+                email: h.email,
             })
             .collect();
 
@@ -2207,6 +2343,11 @@ impl Config {
                 display_name: None,
                 role: None,
                 bio: None,
+                description: None,
+                discord_id: None,
+                telegram_id: None,
+                slack_id: None,
+                email: None,
             });
         }
 

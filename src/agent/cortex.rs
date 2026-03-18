@@ -897,15 +897,14 @@ impl Cortex {
         let is_memory_saved = matches!(&event, ProcessEvent::MemorySaved { .. });
         self.observe_health_event(&event).await;
         let Some(signal) = signal_from_event(event) else {
-            if is_memory_saved {
-                if let Err(error) = self
+            if is_memory_saved
+                && let Err(error) = self
                     .deps
                     .topic_store
                     .mark_all_stale(&self.deps.agent_id)
                     .await
-                {
-                    tracing::warn!(%error, "failed to mark topics stale after memory save");
-                }
+            {
+                tracing::warn!(%error, "failed to mark topics stale after memory save");
             }
             return;
         };
@@ -917,15 +916,14 @@ impl Cortex {
 
         tracing::trace!(buffer_len, "cortex received signal");
 
-        if is_memory_saved {
-            if let Err(error) = self
+        if is_memory_saved
+            && let Err(error) = self
                 .deps
                 .topic_store
                 .mark_all_stale(&self.deps.agent_id)
                 .await
-            {
-                tracing::warn!(%error, "failed to mark topics stale after memory save");
-            }
+        {
+            tracing::warn!(%error, "failed to mark topics stale after memory save");
         }
     }
 
@@ -936,6 +934,7 @@ impl Cortex {
             .cortex
             .load()
             .circuit_breaker_threshold;
+        let is_memory_saved = matches!(event, ProcessEvent::MemorySaved { .. });
         let mut state = self.health_runtime_state.write().await;
 
         match event {

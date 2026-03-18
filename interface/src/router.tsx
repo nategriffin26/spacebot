@@ -285,7 +285,7 @@ const agentTopicsRoute = createRoute({
 		const {agentId} = agentTopicsRoute.useParams();
 		return (
 			<div className="flex h-full flex-col">
-				<AgentHeader agentId={agentId} />
+				<AgentTopBar agentId={agentId} />
 				<div className="flex-1 overflow-hidden">
 					<AgentTopics agentId={agentId} />
 				</div>

@@ -698,19 +698,38 @@ pub fn list_worker_tool_names(
     mcp_tools: &[McpToolAdapter],
 ) -> Vec<String> {
     let mut names = vec![
-        <ShellTool as rig::tool::Tool>::NAME.to_string(),
-        <FileTool as rig::tool::Tool>::NAME.to_string(),
-        <ExecTool as rig::tool::Tool>::NAME.to_string(),
-        <TaskUpdateTool as rig::tool::Tool>::NAME.to_string(),
-        <SetStatusTool as rig::tool::Tool>::NAME.to_string(),
-        <ReadSkillTool as rig::tool::Tool>::NAME.to_string(),
+        ShellTool::NAME.to_string(),
+        FileReadTool::NAME.to_string(),
+        FileWriteTool::NAME.to_string(),
+        FileEditTool::NAME.to_string(),
+        FileListTool::NAME.to_string(),
+        TaskUpdateTool::NAME.to_string(),
+        SetStatusTool::NAME.to_string(),
+        ReadSkillTool::NAME.to_string(),
     ];
 
     if secrets_enabled {
         names.push(<SecretSetTool as rig::tool::Tool>::NAME.to_string());
     }
     if browser_enabled {
-        names.push(<BrowserTool as rig::tool::Tool>::NAME.to_string());
+        names.extend(
+            [
+                "browser_launch",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press_key",
+                "browser_screenshot",
+                "browser_evaluate",
+                "browser_tab_open",
+                "browser_tab_list",
+                "browser_tab_close",
+                "browser_close",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
     }
     if brave_search_enabled {
         names.push(<WebSearchTool as rig::tool::Tool>::NAME.to_string());

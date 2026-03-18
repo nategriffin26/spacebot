@@ -229,15 +229,21 @@ fn should_forward_stream_delta(state: &mut StreamForwardingState, text_delta: &s
 #[derive(Clone)]
 struct ChannelStreamingHook {
     spacebot_hook: SpacebotHook,
-    response_tx: mpsc::Sender<OutboundResponse>,
+    response_tx: mpsc::Sender<RoutedResponse>,
+    target: InboundMessage,
     forwarding_state: Arc<Mutex<StreamForwardingState>>,
 }
 
 impl ChannelStreamingHook {
-    fn new(spacebot_hook: SpacebotHook, response_tx: mpsc::Sender<OutboundResponse>) -> Self {
+    fn new(
+        spacebot_hook: SpacebotHook,
+        response_tx: mpsc::Sender<RoutedResponse>,
+        target: InboundMessage,
+    ) -> Self {
         Self {
             spacebot_hook,
             response_tx,
+            target,
             forwarding_state: Arc::new(Mutex::new(StreamForwardingState::default())),
         }
     }
@@ -325,10 +331,10 @@ where
         };
 
         if should_forward {
-            match self
-                .response_tx
-                .try_send(OutboundResponse::StreamChunk(text_delta.to_string()))
-            {
+            match self.response_tx.try_send(RoutedResponse {
+                response: OutboundResponse::StreamChunk(text_delta.to_string()),
+                target: self.target.clone(),
+            }) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     tracing::debug!(
@@ -2747,8 +2753,13 @@ impl Channel {
 
         let streaming_enabled = rig_alignment.channel_streaming;
         let (mut result, mut history) = if streaming_enabled {
-            let streaming_hook =
-                ChannelStreamingHook::new(self.hook.clone(), self.response_tx.clone());
+            let streaming_hook = ChannelStreamingHook::new(
+                self.hook.clone(),
+                self.response_tx.clone(),
+                self.current_inbound
+                    .clone()
+                    .unwrap_or_else(InboundMessage::empty),
+            );
             prompt_once_streaming(&agent, streaming_hook, history, user_text).await
         } else {
             let result = self.hook.prompt_once(&agent, &mut history, user_text).await;
@@ -2777,8 +2788,13 @@ impl Channel {
             let prompt_engine = self.deps.runtime_config.prompts.load();
             let correction = prompt_engine.render_system_tool_syntax_correction()?;
             if streaming_enabled {
-                let streaming_hook =
-                    ChannelStreamingHook::new(self.hook.clone(), self.response_tx.clone());
+                let streaming_hook = ChannelStreamingHook::new(
+                    self.hook.clone(),
+                    self.response_tx.clone(),
+                    self.current_inbound
+                        .clone()
+                        .unwrap_or_else(InboundMessage::empty),
+                );
                 let (next_result, next_history) =
                     prompt_once_streaming(&agent, streaming_hook, history, &correction).await;
                 result = next_result;
@@ -4071,7 +4087,10 @@ mod tests {
     async fn channel_streaming_hook_drops_when_response_channel_is_full() {
         let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
         response_tx
-            .send(crate::OutboundResponse::Text("already queued".to_string()))
+            .send(crate::RoutedResponse {
+                response: crate::OutboundResponse::Text("already queued".to_string()),
+                target: InboundMessage::empty(),
+            })
             .await
             .expect("prefill response queue");
 
@@ -4085,6 +4104,7 @@ mod tests {
                 event_tx,
             ),
             response_tx,
+            InboundMessage::empty(),
         );
 
         let action = <ChannelStreamingHook as PromptHook<SpacebotModel>>::on_text_delta(
@@ -4099,7 +4119,7 @@ mod tests {
             .recv()
             .await
             .expect("prefilled message should remain");
-        assert!(matches!(queued, crate::OutboundResponse::Text(_)));
+        assert!(matches!(queued.response, crate::OutboundResponse::Text(_)));
         assert!(
             response_rx.try_recv().is_err(),
             "streaming hook should drop deltas instead of blocking when the outbound queue is full"

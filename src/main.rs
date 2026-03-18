@@ -2483,13 +2483,10 @@ async fn run(
                                             ) {
                                                 api_event_tx.send(api_event).ok();
                                             }
-                                            let current_message = match stream_message.as_ref() {
-                                                Some(message) => message.clone(),
-                                                None => outbound_message.read().await.clone(),
-                                            };
-                                            if let Err(error) = messaging_for_outbound
-                                                .respond(&current_message, cleanup)
-                                                .await
+                                            if let Some(current_message) = stream_message.as_ref().cloned()
+                                                && let Err(error) = messaging_for_outbound
+                                                    .respond(&current_message, cleanup)
+                                                    .await
                                             {
                                                 tracing::warn!(%error, "failed to clean up streamed response after outbound channel closed");
                                             }

@@ -8,7 +8,7 @@
 use crate::conversation::history::ProcessRunLogger;
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
-use crate::{AgentDeps, ProcessId, ProcessType};
+use crate::{AgentDeps, ProcessEvent, ProcessId, ProcessType};
 
 use futures::StreamExt as _;
 use rig::agent::MultiTurnStreamItem;
@@ -18,7 +18,7 @@ use rig::completion::{
 };
 use rig::streaming::StreamingPrompt;
 use rig::tool::server::ToolServerHandle;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
@@ -36,6 +36,26 @@ pub struct CortexChatMessage {
     pub content: String,
     pub channel_context: Option<String>,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<CortexChatToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CortexChatThread {
+    pub thread_id: String,
+    pub preview: String,
+    pub message_count: i64,
+    pub first_message_at: String,
+    pub last_message_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CortexChatToolCall {
+    pub id: String,
+    pub tool: String,
+    pub args: String,
+    pub result: Option<String>,
+    pub status: String,
 }
 
 /// Events emitted during a cortex chat response (sent via SSE to the client).
@@ -47,14 +67,24 @@ pub enum CortexChatEvent {
     /// A partial text delta arrived from the model stream.
     TextDelta { text_delta: String },
     /// A tool call started.
-    ToolStarted { tool: String },
+    ToolStarted {
+        tool: String,
+        call_id: String,
+        args: String,
+    },
     /// A tool call completed.
     ToolCompleted {
         tool: String,
+        call_id: String,
+        args: String,
+        result: String,
         result_preview: String,
     },
     /// The full response is ready.
-    Done { full_text: String },
+    Done {
+        full_text: String,
+        tool_calls: Vec<CortexChatToolCall>,
+    },
     /// An error occurred.
     Error { message: String },
 }
@@ -74,13 +104,19 @@ pub enum CortexChatSendError {
 struct CortexChatHook {
     event_tx: mpsc::Sender<CortexChatEvent>,
     spacebot_hook: SpacebotHook,
+    tool_calls: Arc<Mutex<Vec<CortexChatToolCall>>>,
 }
 
 impl CortexChatHook {
-    fn new(event_tx: mpsc::Sender<CortexChatEvent>, spacebot_hook: SpacebotHook) -> Self {
+    fn new(
+        event_tx: mpsc::Sender<CortexChatEvent>,
+        spacebot_hook: SpacebotHook,
+        tool_calls: Arc<Mutex<Vec<CortexChatToolCall>>>,
+    ) -> Self {
         Self {
             event_tx,
             spacebot_hook,
+            tool_calls,
         }
     }
 
@@ -114,7 +150,7 @@ async fn persist_and_emit_cortex_chat_error(
     message: String,
 ) {
     if let Err(error) = store
-        .save_message(thread_id, "assistant", &message, channel_ref)
+        .save_message(thread_id, "assistant", &message, channel_ref, None)
         .await
     {
         tracing::error!(%error, %thread_id, "failed to persist cortex chat error message");
@@ -130,9 +166,21 @@ async fn persist_and_emit_cortex_chat_done(
     thread_id: &str,
     channel_ref: Option<&str>,
     response: String,
+    tool_calls: Vec<CortexChatToolCall>,
 ) {
+    let tool_calls_json = if tool_calls.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&tool_calls).ok()
+    };
     if let Err(error) = store
-        .save_message(thread_id, "assistant", &response, channel_ref)
+        .save_message(
+            thread_id,
+            "assistant",
+            &response,
+            channel_ref,
+            tool_calls_json.as_deref(),
+        )
         .await
     {
         tracing::error!(%error, %thread_id, "failed to persist cortex chat response");
@@ -140,6 +188,7 @@ async fn persist_and_emit_cortex_chat_done(
     if let Err(error) = event_tx
         .send(CortexChatEvent::Done {
             full_text: response,
+            tool_calls,
         })
         .await
     {
@@ -232,8 +281,22 @@ impl<M: CompletionModel> PromptHook<M> for CortexChatHook {
             return action;
         }
 
+        let call_id = internal_call_id.to_string();
+        {
+            let mut calls = self.tool_calls.lock().await;
+            calls.push(CortexChatToolCall {
+                id: call_id.clone(),
+                tool: tool_name.to_string(),
+                args: args.to_string(),
+                result: None,
+                status: "running".to_string(),
+            });
+        }
+
         self.send(CortexChatEvent::ToolStarted {
             tool: tool_name.to_string(),
+            call_id,
+            args: args.to_string(),
         })
         .await;
         action
@@ -244,7 +307,7 @@ impl<M: CompletionModel> PromptHook<M> for CortexChatHook {
         tool_name: &str,
         _tool_call_id: Option<String>,
         internal_call_id: &str,
-        _args: &str,
+        args: &str,
         result: &str,
     ) -> HookAction {
         let guard_action = self.spacebot_hook.guard_tool_result(tool_name, result);
@@ -256,8 +319,19 @@ impl<M: CompletionModel> PromptHook<M> for CortexChatHook {
             .emit_tool_completed_event_from_capped(tool_name, preview.clone());
         self.spacebot_hook
             .record_tool_result_metrics(tool_name, internal_call_id);
+        let call_id = internal_call_id.to_string();
+        {
+            let mut calls = self.tool_calls.lock().await;
+            if let Some(call) = calls.iter_mut().find(|call| call.id == call_id) {
+                call.result = Some(result.to_string());
+                call.status = "completed".to_string();
+            }
+        }
         self.send(CortexChatEvent::ToolCompleted {
             tool: tool_name.to_string(),
+            call_id,
+            args: args.to_string(),
+            result: result.to_string(),
             result_preview: preview,
         })
         .await;
@@ -296,11 +370,16 @@ struct ChatMessageRow {
     role: String,
     content: String,
     channel_context: Option<String>,
+    tool_calls: Option<String>,
     created_at: chrono::NaiveDateTime,
 }
 
 impl ChatMessageRow {
     fn into_message(self) -> CortexChatMessage {
+        let tool_calls = self
+            .tool_calls
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<CortexChatToolCall>>(json).ok());
         CortexChatMessage {
             id: self.id,
             thread_id: self.thread_id,
@@ -308,6 +387,28 @@ impl ChatMessageRow {
             content: self.content,
             channel_context: self.channel_context,
             created_at: self.created_at.and_utc().to_rfc3339(),
+            tool_calls,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CortexChatThreadRow {
+    thread_id: String,
+    message_count: i32,
+    first_message_at: chrono::NaiveDateTime,
+    last_message_at: chrono::NaiveDateTime,
+    preview: String,
+}
+
+impl CortexChatThreadRow {
+    fn into_thread(self) -> CortexChatThread {
+        CortexChatThread {
+            thread_id: self.thread_id,
+            preview: self.preview,
+            message_count: self.message_count as i64,
+            first_message_at: self.first_message_at.and_utc().to_rfc3339(),
+            last_message_at: self.last_message_at.and_utc().to_rfc3339(),
         }
     }
 }
@@ -324,7 +425,7 @@ impl CortexChatStore {
         limit: i64,
     ) -> Result<Vec<CortexChatMessage>, sqlx::Error> {
         let rows: Vec<ChatMessageRow> = sqlx::query_as(
-            "SELECT id, thread_id, role, content, channel_context, created_at \
+            "SELECT id, thread_id, role, content, channel_context, tool_calls, created_at \
              FROM cortex_chat_messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?",
         )
         .bind(thread_id)
@@ -345,17 +446,19 @@ impl CortexChatStore {
         role: &str,
         content: &str,
         channel_context: Option<&str>,
+        tool_calls: Option<&str>,
     ) -> Result<String, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO cortex_chat_messages (id, thread_id, role, content, channel_context) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO cortex_chat_messages (id, thread_id, role, content, channel_context, tool_calls) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(thread_id)
         .bind(role)
         .bind(content)
         .bind(channel_context)
+        .bind(tool_calls)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -369,6 +472,39 @@ impl CortexChatStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
+    }
+
+    pub async fn list_threads(&self) -> Result<Vec<CortexChatThread>, sqlx::Error> {
+        let rows: Vec<CortexChatThreadRow> = sqlx::query_as(
+            "SELECT \
+                 thread_id, \
+                 COUNT(*) as message_count, \
+                 MIN(created_at) as first_message_at, \
+                 MAX(created_at) as last_message_at, \
+                 ( \
+                     SELECT content FROM cortex_chat_messages m2 \
+                     WHERE m2.thread_id = cortex_chat_messages.thread_id \
+                     ORDER BY m2.created_at ASC LIMIT 1 \
+                 ) as preview \
+             FROM cortex_chat_messages \
+             GROUP BY thread_id \
+             ORDER BY MAX(created_at) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(CortexChatThreadRow::into_thread)
+            .collect())
+    }
+
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM cortex_chat_messages WHERE thread_id = ?")
+            .bind(thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -655,7 +791,7 @@ impl CortexChatSession {
 
         if persist_input {
             self.store
-                .save_message(thread_id, "user", user_text, channel_context_id)
+                .save_message(thread_id, "user", user_text, channel_context_id, None)
                 .await?;
         }
 
@@ -711,7 +847,8 @@ impl CortexChatSession {
             channel_context_id.map(std::sync::Arc::<str>::from),
             self.deps.event_tx.clone(),
         );
-        let hook = CortexChatHook::new(event_tx.clone(), spacebot_hook);
+        let tool_calls = Arc::new(Mutex::new(Vec::new()));
+        let hook = CortexChatHook::new(event_tx.clone(), spacebot_hook, tool_calls.clone());
 
         // Clone what the spawned task needs
         let user_text = user_text.to_string();
@@ -751,12 +888,14 @@ impl CortexChatSession {
 
             match prompt_result {
                 Ok(Ok(response)) => {
+                    let accumulated_tool_calls = tool_calls.lock().await.clone();
                     persist_and_emit_cortex_chat_done(
                         &store,
                         &event_tx,
                         &thread_id,
                         channel_ref,
                         response,
+                        accumulated_tool_calls,
                     )
                     .await;
                 }
@@ -816,10 +955,12 @@ impl CortexChatSession {
         let browser_enabled = runtime_config.browser_config.load().enabled;
         let web_search_enabled = runtime_config.brave_search_key.load().is_some();
         let opencode_enabled = runtime_config.opencode.load().enabled;
+        let mcp_tool_names = self.deps.mcp_manager.get_tool_names().await;
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
             opencode_enabled,
+            &mcp_tool_names,
         )?;
 
         // Load channel transcript if a channel context is active
@@ -845,6 +986,7 @@ impl CortexChatSession {
             empty_to_none(changelog_highlights),
             empty_to_none(runtime_config_snapshot),
             worker_capabilities,
+            self.factory_enabled,
         )
     }
 
@@ -1066,6 +1208,7 @@ mod tests {
                 role TEXT NOT NULL, \
                 content TEXT NOT NULL, \
                 channel_context TEXT, \
+                tool_calls TEXT, \
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP \
             )",
         )
@@ -1084,7 +1227,11 @@ mod tests {
             None,
             process_event_tx,
         );
-        let hook = CortexChatHook::new(event_tx.clone(), spacebot_hook);
+        let hook = CortexChatHook::new(
+            event_tx.clone(),
+            spacebot_hook,
+            Arc::new(Mutex::new(Vec::new())),
+        );
 
         let hook_action = <CortexChatHook as PromptHook<SpacebotModel>>::on_text_delta(
             &hook,
@@ -1098,8 +1245,15 @@ mod tests {
         );
 
         let final_response = "final response".to_string();
-        persist_and_emit_cortex_chat_done(&store, &event_tx, "thread-1", None, final_response)
-            .await;
+        persist_and_emit_cortex_chat_done(
+            &store,
+            &event_tx,
+            "thread-1",
+            None,
+            final_response,
+            Vec::new(),
+        )
+        .await;
 
         let first_event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
             .await
@@ -1117,7 +1271,7 @@ mod tests {
             .expect("should receive done event")
             .expect("done event should exist");
         match second_event {
-            CortexChatEvent::Done { full_text } => {
+            CortexChatEvent::Done { full_text, .. } => {
                 assert_eq!(full_text, "final response");
             }
             other => panic!("expected Done event, got {other:?}"),
@@ -1152,7 +1306,7 @@ mod tests {
             None,
             process_event_tx,
         );
-        let hook = CortexChatHook::new(event_tx, spacebot_hook);
+        let hook = CortexChatHook::new(event_tx, spacebot_hook, Arc::new(Mutex::new(Vec::new())));
 
         let action = tokio::time::timeout(
             Duration::from_millis(20),

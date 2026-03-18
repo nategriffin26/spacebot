@@ -1,8 +1,10 @@
 //! SpacebotHook: Prompt hook for channels, branches, and workers.
 
+use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
 use crate::{AgentId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, CompletionResponse, Message, Prompt, PromptError};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Controls whether hook-driven tool nudge retries are enabled.
@@ -37,10 +39,14 @@ pub struct SpacebotHook {
     tool_nudge_policy: ToolNudgePolicy,
     completion_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     nudge_request_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    completion_contract_request_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set to `true` when the worker calls `set_status` with `kind: "outcome"`.
     /// Once signaled, the nudge system allows text-only responses to pass
     /// through as legitimate completions.
     outcome_signaled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inject_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>>,
+    injected_messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
 }
 
 impl SpacebotHook {
@@ -50,8 +56,19 @@ impl SpacebotHook {
          before finishing.";
     /// PromptCancelled reason used internally for tool nudge retries.
     pub const TOOL_NUDGE_REASON: &str = "spacebot_tool_nudge_retry";
+    /// PromptCancelled reason used when injected context is pending.
+    pub const CONTEXT_INJECTION_REASON: &str = "spacebot_context_injection";
+    /// PromptCancelled reason used when memory persistence missed a terminal tool outcome.
+    pub const MEMORY_PERSISTENCE_CONTRACT_REASON: &str =
+        "spacebot_memory_persistence_contract_retry";
     /// Maximum nudge retries per prompt request.
     pub const TOOL_NUDGE_MAX_RETRIES: usize = 2;
+    /// Prompt used to nudge memory-persistence branches toward a terminal tool outcome.
+    pub const MEMORY_PERSISTENCE_CONTRACT_PROMPT: &str = "You must finish this memory-persistence run by calling memory_persistence_complete. \
+         First recall relevant memories, then save real memories if needed, then call \
+         memory_persistence_complete with either outcome=\"saved\" and exact saved_memory_ids \
+         from successful memory_save calls in this run, or outcome=\"no_memories\" with a short \
+         reason and no saved IDs. Do not invent memory IDs.";
 
     /// Create a new hook.
     pub fn new(
@@ -70,13 +87,32 @@ impl SpacebotHook {
             tool_nudge_policy: ToolNudgePolicy::for_process(process_type),
             completion_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             nudge_request_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completion_contract_request_active: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inject_rx: None,
+            injected_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            memory_persistence_contract: None,
         }
     }
 
     /// Override the default process-scoped nudge policy.
     pub fn with_tool_nudge_policy(mut self, policy: ToolNudgePolicy) -> Self {
         self.tool_nudge_policy = policy;
+        self
+    }
+
+    pub fn with_inject_rx(mut self, inject_rx: tokio::sync::mpsc::Receiver<String>) -> Self {
+        self.inject_rx = Some(std::sync::Arc::new(tokio::sync::Mutex::new(inject_rx)));
+        self
+    }
+
+    pub fn with_memory_persistence_contract(
+        mut self,
+        contract_state: Arc<MemoryPersistenceContractState>,
+    ) -> Self {
+        self.memory_persistence_contract = Some(contract_state);
         self
     }
 
@@ -98,9 +134,29 @@ impl SpacebotHook {
             .store(active, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn set_completion_contract_request_active(&self, active: bool) {
+        self.completion_contract_request_active
+            .store(active, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Return true if a PromptCancelled reason indicates a tool nudge retry.
     pub fn is_tool_nudge_reason(reason: &str) -> bool {
         reason == Self::TOOL_NUDGE_REASON
+    }
+
+    pub fn is_context_injection_reason(reason: &str) -> bool {
+        reason == Self::CONTEXT_INJECTION_REASON
+    }
+
+    pub fn is_memory_persistence_contract_reason(reason: &str) -> bool {
+        reason == Self::MEMORY_PERSISTENCE_CONTRACT_REASON
+    }
+
+    pub fn take_injected_messages(&self) -> Vec<String> {
+        self.injected_messages
+            .lock()
+            .map(|mut messages| std::mem::take(&mut *messages))
+            .unwrap_or_default()
     }
 
     /// Prompt an agent with bounded hook-driven tool nudge retries.
@@ -157,6 +213,21 @@ impl SpacebotHook {
             };
 
             match &result {
+                Err(PromptError::PromptCancelled { reason, .. })
+                    if Self::is_context_injection_reason(reason) =>
+                {
+                    let injected = self.take_injected_messages();
+                    for message in injected {
+                        history.push(Message::user(format!(
+                            "[Context update from the user]: {message}"
+                        )));
+                    }
+                    current_prompt = std::borrow::Cow::Borrowed(
+                        "New context has been provided above. Incorporate it and continue working. Do not repeat completed work.",
+                    );
+                    using_tool_nudge_prompt = false;
+                    continue;
+                }
                 Err(PromptError::PromptCancelled { reason, .. })
                     if Self::is_tool_nudge_reason(reason)
                         && nudge_attempts < Self::TOOL_NUDGE_MAX_RETRIES =>
@@ -460,6 +531,87 @@ impl SpacebotHook {
             }
         })
     }
+
+    fn should_reject_memory_persistence_completion<M>(
+        &self,
+        response: &CompletionResponse<M::Response>,
+    ) -> bool
+    where
+        M: CompletionModel,
+    {
+        let Some(contract_state) = &self.memory_persistence_contract else {
+            return false;
+        };
+        if !self
+            .completion_contract_request_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        if contract_state.has_terminal_outcome() {
+            return false;
+        }
+
+        !response
+            .choice
+            .iter()
+            .any(|content| matches!(content, rig::message::AssistantContent::ToolCall(_)))
+    }
+
+    fn parse_successful_memory_save_id(result: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<serde_json::Value>(result).ok()?;
+        if parsed.get("success").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+        parsed
+            .get("memory_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|memory_id| !memory_id.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn parse_memory_persistence_terminal_outcome(
+        result: &str,
+    ) -> Option<MemoryPersistenceTerminalOutcome> {
+        let parsed = serde_json::from_str::<serde_json::Value>(result).ok()?;
+        if parsed.get("success").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+
+        match parsed.get("outcome").and_then(|value| value.as_str()) {
+            Some("saved") => {
+                let saved_memory_ids = parsed
+                    .get("saved_memory_ids")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|memory_id| !memory_id.is_empty())
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if saved_memory_ids.is_empty() {
+                    return None;
+                }
+                Some(MemoryPersistenceTerminalOutcome::Saved { saved_memory_ids })
+            }
+            Some("no_memories") => {
+                let reason = parsed
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())?;
+                Some(MemoryPersistenceTerminalOutcome::NoMemories {
+                    reason: reason.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 // Timer map for tool call duration measurement. Entries are inserted in
@@ -479,6 +631,23 @@ where
         if self.tool_nudge_policy.is_enabled() {
             self.completion_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Some(inject_rx) = &self.inject_rx {
+            let mut drained = Vec::new();
+            if let Ok(mut receiver) = inject_rx.try_lock() {
+                while let Ok(message) = receiver.try_recv() {
+                    drained.push(message);
+                }
+            }
+            if !drained.is_empty() {
+                if let Ok(mut buffer) = self.injected_messages.lock() {
+                    buffer.extend(drained);
+                }
+                return HookAction::Terminate {
+                    reason: Self::CONTEXT_INJECTION_REASON.into(),
+                };
+            }
         }
 
         // Log the completion call but don't block it
@@ -504,6 +673,12 @@ where
         if self.should_nudge_tool_usage::<M>(response) {
             return HookAction::Terminate {
                 reason: Self::TOOL_NUDGE_REASON.into(),
+            };
+        }
+
+        if self.should_reject_memory_persistence_completion::<M>(response) {
+            return HookAction::Terminate {
+                reason: Self::MEMORY_PERSISTENCE_CONTRACT_REASON.into(),
             };
         }
 
@@ -634,6 +809,18 @@ where
         );
 
         self.record_tool_result_metrics(tool_name, internal_call_id);
+
+        if let Some(contract_state) = &self.memory_persistence_contract {
+            if tool_name == "memory_save" {
+                if let Some(memory_id) = Self::parse_successful_memory_save_id(result) {
+                    contract_state.record_saved_memory_id(memory_id);
+                }
+            } else if tool_name == "memory_persistence_complete"
+                && let Some(outcome) = Self::parse_memory_persistence_terminal_outcome(result)
+            {
+                contract_state.set_terminal_outcome(outcome);
+            }
+        }
 
         // Detect terminal outcome signal from successful set_status results.
         // We check the *result* (not the args) so the flag is only set after the

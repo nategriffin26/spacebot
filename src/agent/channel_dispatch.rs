@@ -7,7 +7,7 @@
 use crate::ProcessType;
 use crate::agent::branch::{Branch, BranchExecutionConfig};
 use crate::agent::channel::ChannelState;
-use crate::agent::channel_prompt::TemporalContext;
+use crate::agent::channel_prompt::{TemporalContext, build_worker_task_with_temporal_context};
 use crate::agent::worker::Worker;
 use crate::error::{AgentError, Error as SpacebotError};
 use crate::tools::{BranchToolProfile, MemoryPersistenceContractState};
@@ -469,7 +469,7 @@ async fn spawn_worker_inner(
     let worker_status_text = build_worker_status_text(rc.as_ref(), &state.deps.sandbox);
     let temporal_context = TemporalContext::from_runtime(rc.as_ref());
     let mut worker_task =
-        build_worker_task_with_temporal_context(&task, &temporal_context, &prompt_engine)
+        build_worker_task_with_temporal_context(task, &temporal_context, &prompt_engine)
             .map_err(|error| AgentError::Other(anyhow::anyhow!("{error}")))?;
 
     // Inject topic context if topic_ids were provided.

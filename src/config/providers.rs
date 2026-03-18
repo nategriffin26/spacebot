@@ -26,7 +26,6 @@ pub(super) const NVIDIA_PROVIDER_BASE_URL: &str = "https://integrate.api.nvidia.
 pub(super) const FIREWORKS_PROVIDER_BASE_URL: &str = "https://api.fireworks.ai/inference";
 pub(crate) const GEMINI_PROVIDER_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
-pub(super) const GITHUB_COPILOT_DEFAULT_BASE_URL: &str = "https://api.individual.githubcopilot.com";
 
 /// App attribution headers sent with every OpenRouter API request.
 /// See <https://openrouter.ai/docs/app-attribution>.

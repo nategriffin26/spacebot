@@ -4,6 +4,7 @@
 //! all the prompt-building methods that assemble the channel's
 //! system prompt from identity, memory bulletin, skills, status, etc.
 
+use crate::error::Result;
 use chrono::{DateTime, Local, Utc};
 use chrono_tz::Tz;
 
@@ -121,4 +122,16 @@ impl TemporalContext {
             self.now_utc.format("%Y-%m-%d %H:%M:%S UTC")
         )
     }
+}
+
+pub(crate) fn build_worker_task_with_temporal_context(
+    task: &str,
+    temporal_context: &TemporalContext,
+    _prompt_engine: &crate::prompts::PromptEngine,
+) -> Result<String> {
+    Ok(format!(
+        "Current time: {}\n\n{}",
+        temporal_context.current_time_line(),
+        task
+    ))
 }
