@@ -216,7 +216,7 @@ WebChat ─┘                                              Channel.handle_messa
 
 ### Outbound Flow
 
-1. Channel tools (reply, react, send_file) produce `OutboundResponse` values
+1. Channel tools (reply, react, send_file) and receipt-backed artifact delivery both produce `OutboundResponse` values
 2. Each channel has an outbound routing task that receives responses via `mpsc::channel`
 3. The routing task determines the platform from the channel ID prefix (`discord:`, `slack:`, `telegram:`, etc.)
 4. `MessagingManager::broadcast()` delivers the response to the correct platform adapter

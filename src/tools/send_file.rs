@@ -31,58 +31,6 @@ impl SendFileTool {
             sandbox,
         }
     }
-
-    /// Validate that a path falls within the workspace boundary.
-    ///
-    /// Checks both the canonicalized path and individual path components for
-    /// symlinks to prevent TOCTOU races where a symlink is swapped between
-    /// validation and the actual file read.
-    fn validate_workspace_path(&self, path: &std::path::Path) -> Result<PathBuf, SendFileError> {
-        let workspace = &self.workspace;
-
-        let canonical = path.canonicalize().map_err(|error| {
-            SendFileError(format!("can't resolve path '{}': {error}", path.display()))
-        })?;
-        let workspace_canonical = workspace
-            .canonicalize()
-            .unwrap_or_else(|_| workspace.clone());
-
-        if !canonical.starts_with(&workspace_canonical) {
-            return Err(SendFileError(format!(
-                "ACCESS DENIED: Path is outside the workspace boundary. \
-                 File operations are restricted to {}.",
-                workspace.display()
-            )));
-        }
-
-        // Reject paths containing symlinks within the workspace to prevent
-        // TOCTOU races where a path component is replaced with a symlink
-        // between this check and the file read.
-        let relative_original = path
-            .strip_prefix(workspace)
-            .or_else(|_| path.strip_prefix(&workspace_canonical))
-            .unwrap_or(path);
-        let mut walk = workspace_canonical.clone();
-        for component in relative_original.components() {
-            walk.push(component);
-            match walk.symlink_metadata() {
-                Ok(meta) if meta.is_symlink() => {
-                    return Err(SendFileError(
-                        "ACCESS DENIED: Symlinks are not allowed within the workspace.".into(),
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    return Err(SendFileError(format!(
-                        "can't verify path component '{}': {error}",
-                        walk.display()
-                    )));
-                }
-            }
-        }
-
-        Ok(canonical)
-    }
 }
 
 /// Error type for send_file tool.
@@ -108,8 +56,135 @@ pub struct SendFileOutput {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedOutboundFile {
+    pub filename: String,
+    pub data: Vec<u8>,
+    pub mime_type: String,
+    pub size_bytes: u64,
+}
+
+impl PreparedOutboundFile {
+    pub fn into_response(
+        self,
+        override_filename: Option<String>,
+        caption: Option<String>,
+    ) -> OutboundResponse {
+        OutboundResponse::File {
+            filename: override_filename.unwrap_or(self.filename),
+            data: self.data,
+            mime_type: self.mime_type,
+            caption,
+        }
+    }
+}
+
 /// Maximum file size: 25 MB (Discord's limit for non-boosted servers).
 const MAX_FILE_SIZE_BYTES: u64 = 25 * 1024 * 1024;
+
+fn validate_workspace_path(
+    workspace: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<PathBuf, SendFileError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        SendFileError(format!("can't resolve path '{}': {error}", path.display()))
+    })?;
+    let workspace_canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    if !canonical.starts_with(&workspace_canonical) {
+        return Err(SendFileError(format!(
+            "ACCESS DENIED: Path is outside the workspace boundary. \
+             File operations are restricted to {}.",
+            workspace.display()
+        )));
+    }
+
+    // Reject paths containing symlinks within the workspace to prevent
+    // TOCTOU races where a path component is replaced with a symlink
+    // between this check and the file read.
+    let relative_original = path
+        .strip_prefix(workspace)
+        .or_else(|_| path.strip_prefix(&workspace_canonical))
+        .unwrap_or(path);
+    let mut walk = workspace_canonical.clone();
+    for component in relative_original.components() {
+        walk.push(component);
+        match walk.symlink_metadata() {
+            Ok(meta) if meta.is_symlink() => {
+                return Err(SendFileError(
+                    "ACCESS DENIED: Symlinks are not allowed within the workspace.".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(SendFileError(format!(
+                    "can't verify path component '{}': {error}",
+                    walk.display()
+                )));
+            }
+        }
+    }
+
+    Ok(canonical)
+}
+
+pub async fn prepare_outbound_file(
+    raw_path: &std::path::Path,
+    workspace: &std::path::Path,
+    sandbox: &Sandbox,
+) -> Result<PreparedOutboundFile, SendFileError> {
+    if !raw_path.is_absolute() {
+        return Err(SendFileError("file_path must be an absolute path".into()));
+    }
+
+    let path = if sandbox.mode_enabled() {
+        validate_workspace_path(workspace, raw_path)?
+    } else {
+        raw_path.canonicalize().map_err(|error| {
+            SendFileError(format!(
+                "can't resolve path '{}': {error}",
+                raw_path.display()
+            ))
+        })?
+    };
+
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| SendFileError(format!("can't read file '{}': {error}", path.display())))?;
+
+    if !metadata.is_file() {
+        return Err(SendFileError(format!("'{}' is not a file", path.display())));
+    }
+
+    if metadata.len() > MAX_FILE_SIZE_BYTES {
+        return Err(SendFileError(format!(
+            "file is too large ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_FILE_SIZE_BYTES,
+        )));
+    }
+
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|error| SendFileError(format!("failed to read '{}': {error}", path.display())))?;
+
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let mime_type = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .to_string();
+
+    Ok(PreparedOutboundFile {
+        filename,
+        size_bytes: data.len() as u64,
+        data,
+        mime_type,
+    })
+}
 
 impl Tool for SendFileTool {
     const NAME: &'static str = "send_file";
@@ -141,77 +216,26 @@ impl Tool for SendFileTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let raw_path = PathBuf::from(&args.file_path);
-
-        if !raw_path.is_absolute() {
-            return Err(SendFileError("file_path must be an absolute path".into()));
-        }
-
-        let path = if self.sandbox.mode_enabled() {
-            self.validate_workspace_path(&raw_path)?
-        } else {
-            raw_path.canonicalize().map_err(|error| {
-                SendFileError(format!(
-                    "can't resolve path '{}': {error}",
-                    raw_path.display()
-                ))
-            })?
-        };
-
-        let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
-            SendFileError(format!("can't read file '{}': {error}", path.display()))
-        })?;
-
-        if !metadata.is_file() {
-            return Err(SendFileError(format!("'{}' is not a file", path.display())));
-        }
-
-        if metadata.len() > MAX_FILE_SIZE_BYTES {
-            return Err(SendFileError(format!(
-                "file is too large ({} bytes, max {} bytes)",
-                metadata.len(),
-                MAX_FILE_SIZE_BYTES,
-            )));
-        }
-
-        let data = tokio::fs::read(&path).await.map_err(|error| {
-            SendFileError(format!("failed to read '{}': {error}", path.display()))
-        })?;
-
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".into());
-
-        let mime_type = mime_guess::from_path(&path)
-            .first_or_octet_stream()
-            .to_string();
-
-        let size_bytes = data.len() as u64;
+        let prepared =
+            prepare_outbound_file(&raw_path, &self.workspace, self.sandbox.as_ref()).await?;
 
         tracing::info!(
-            file_path = %path.display(),
-            filename = %filename,
-            mime_type = %mime_type,
-            size_bytes,
+            file_path = %raw_path.display(),
+            filename = %prepared.filename,
+            mime_type = %prepared.mime_type,
+            size_bytes = prepared.size_bytes,
             "send_file tool called"
         );
 
-        let response = OutboundResponse::File {
-            filename: filename.clone(),
-            data,
-            mime_type,
-            caption: args.caption,
-        };
-
         self.response_tx
-            .send(response)
+            .send(prepared.clone().into_response(None, args.caption))
             .await
             .map_err(|error| SendFileError(format!("failed to send file: {error}")))?;
 
         Ok(SendFileOutput {
             success: true,
-            filename,
-            size_bytes,
+            filename: prepared.filename,
+            size_bytes: prepared.size_bytes,
         })
     }
 }
@@ -232,13 +256,6 @@ mod tests {
         Arc::new(Sandbox::new_for_test(config, workspace.to_path_buf()))
     }
 
-    fn create_tool(workspace: PathBuf) -> SendFileTool {
-        let sandbox = create_sandbox(SandboxMode::Enabled, &workspace);
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let response_tx = RoutedSender::new(tx, crate::InboundMessage::empty());
-        SendFileTool::new(response_tx, workspace, sandbox)
-    }
-
     #[test]
     fn validate_workspace_path_accepts_regular_file() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -248,10 +265,8 @@ mod tests {
         let path = workspace.join("report.txt");
         fs::write(&path, "ok").expect("failed to write test file");
 
-        let tool = create_tool(workspace.clone());
-        let validated = tool
-            .validate_workspace_path(&path)
-            .expect("path should be accepted");
+        let validated =
+            validate_workspace_path(&workspace, &path).expect("path should be accepted");
 
         assert_eq!(
             validated,
@@ -274,8 +289,7 @@ mod tests {
         fs::write(&real_file, "secret").expect("failed to write test file");
         symlink(&real_dir, &link_dir).expect("failed to create symlink");
 
-        let tool = create_tool(workspace.clone());
-        let result = tool.validate_workspace_path(&link_dir.join("file.txt"));
+        let result = validate_workspace_path(&workspace, &link_dir.join("file.txt"));
 
         assert!(result.is_err(), "symlink traversal should be rejected");
         let error = result.expect_err("missing expected error").to_string();
@@ -296,8 +310,7 @@ mod tests {
         let file = outside.join("secret.txt");
         fs::write(&file, "secret data").expect("failed to write file");
 
-        let tool = create_tool(workspace);
-        let result = tool.validate_workspace_path(&file);
+        let result = validate_workspace_path(&workspace, &file);
 
         assert!(result.is_err(), "should reject path outside workspace");
         let error = result.expect_err("missing expected error").to_string();

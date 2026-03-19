@@ -15,6 +15,7 @@ use crate::agent::compactor::Compactor;
 use crate::agent::process_control::ControlActionResult;
 use crate::agent::status::{StatusBlock, SystemInfo};
 use crate::agent::worker::Worker;
+use crate::conversation::history::ArtifactDeliveryUpdate;
 use crate::conversation::{ChannelStore, ConversationLogger, ProcessRunLogger};
 use crate::error::{AgentError, Result};
 use crate::hooks::SpacebotHook;
@@ -36,6 +37,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
+
+use crate::tools::send_file::prepare_outbound_file;
 
 /// Shared cache of in-flight worker transcript steps, keyed by worker ID.
 pub type LiveWorkerTranscripts =
@@ -61,6 +64,15 @@ struct PendingResult {
     request_group_origin: Option<String>,
     source_manifest_summary: Option<String>,
     artifact_summary: Option<String>,
+    artifact_outcomes: Vec<crate::ArtifactOutcome>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PendingArtifactDelivery {
+    worker_id: String,
+    path: String,
+    #[serde(default)]
+    suggested_name: Option<String>,
 }
 
 fn summarize_receipt_artifacts(receipt: &crate::WorkerOutcomeReceipt) -> Option<String> {
@@ -90,6 +102,24 @@ fn summarize_receipt_artifacts(receipt: &crate::WorkerOutcomeReceipt) -> Option<
     } else {
         Some(artifacts.join("\n"))
     }
+}
+
+fn should_auto_deliver_artifact(artifact: &crate::ArtifactOutcome) -> bool {
+    let visibility = artifact
+        .visibility
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("user");
+    if matches!(visibility, "private" | "internal" | "hidden" | "local_only") {
+        return false;
+    }
+
+    let delivery_status = artifact
+        .delivery_status
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    !matches!(delivery_status, "delivered" | "blocked")
 }
 
 #[derive(Clone, Debug)]
@@ -1552,6 +1582,102 @@ impl Channel {
         }
     }
 
+    fn current_delivery_target_label(&self) -> Option<String> {
+        self.current_inbound.as_ref().map(|message| {
+            if message.conversation_id.trim().is_empty() {
+                message.adapter_key().to_string()
+            } else {
+                message.conversation_id.clone()
+            }
+        })
+    }
+
+    async fn deliver_retrigger_artifacts(&mut self, deliveries: &[PendingArtifactDelivery]) {
+        if deliveries.is_empty() {
+            return;
+        }
+
+        let delivery_target = self.current_delivery_target_label();
+        let mut updates_by_worker: HashMap<String, Vec<ArtifactDeliveryUpdate>> = HashMap::new();
+
+        for delivery in deliveries {
+            let prepared = prepare_outbound_file(
+                std::path::Path::new(&delivery.path),
+                &self.deps.runtime_config.workspace_dir,
+                self.deps.sandbox.as_ref(),
+            )
+            .await;
+
+            match prepared {
+                Ok(prepared) => {
+                    let response = prepared.into_response(delivery.suggested_name.clone(), None);
+                    match self.send_routed(response).await {
+                        Ok(()) => {
+                            updates_by_worker
+                                .entry(delivery.worker_id.clone())
+                                .or_default()
+                                .push(ArtifactDeliveryUpdate {
+                                    path: delivery.path.clone(),
+                                    delivery_status: "delivered".to_string(),
+                                    delivery_target: delivery_target.clone(),
+                                });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                channel_id = %self.id,
+                                worker_id = %delivery.worker_id,
+                                path = %delivery.path,
+                                %error,
+                                "failed to route artifact delivery"
+                            );
+                            updates_by_worker
+                                .entry(delivery.worker_id.clone())
+                                .or_default()
+                                .push(ArtifactDeliveryUpdate {
+                                    path: delivery.path.clone(),
+                                    delivery_status: "delivery_failed_send".to_string(),
+                                    delivery_target: delivery_target.clone(),
+                                });
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id = %self.id,
+                        worker_id = %delivery.worker_id,
+                        path = %delivery.path,
+                        %error,
+                        "artifact could not be prepared for delivery"
+                    );
+                    updates_by_worker
+                        .entry(delivery.worker_id.clone())
+                        .or_default()
+                        .push(ArtifactDeliveryUpdate {
+                            path: delivery.path.clone(),
+                            delivery_status: "delivery_unavailable".to_string(),
+                            delivery_target: delivery_target.clone(),
+                        });
+                }
+            }
+        }
+
+        for (worker_id, updates) in updates_by_worker {
+            if let Err(error) = self
+                .state
+                .process_run_logger
+                .update_worker_receipt_artifact_delivery(&worker_id, &updates)
+                .await
+            {
+                tracing::warn!(
+                    channel_id = %self.id,
+                    %worker_id,
+                    %error,
+                    "failed to persist artifact delivery updates"
+                );
+            }
+        }
+    }
+
     fn record_assistant_reply_metrics(&self, _text: Option<&str>, _kind: &str) {
         #[cfg(feature = "metrics")]
         {
@@ -2701,6 +2827,17 @@ impl Channel {
                     "marked retrigger results as relayed in status block"
                 );
             }
+
+            if replied
+                && let Some(deliveries) = message
+                    .metadata
+                    .get("retrigger_artifact_deliveries")
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<PendingArtifactDelivery>>(value.clone()).ok()
+                    })
+            {
+                self.deliver_retrigger_artifacts(&deliveries).await;
+            }
         }
 
         // Check context size and trigger compaction if needed
@@ -3752,6 +3889,7 @@ impl Channel {
                                 .as_ref()
                                 .and_then(|value| value.1.clone()),
                             artifact_summary: None,
+                            artifact_outcomes: Vec::new(),
                         });
                         should_retrigger = true;
                     } else {
@@ -3792,6 +3930,7 @@ impl Channel {
                                         .as_ref()
                                         .and_then(|value| value.1.clone()),
                                     artifact_summary: None,
+                                    artifact_outcomes: Vec::new(),
                                 });
                                 should_retrigger = true;
                             }
@@ -3814,6 +3953,7 @@ impl Channel {
                             .as_ref()
                             .and_then(|value| value.1.clone()),
                         artifact_summary: None,
+                        artifact_outcomes: Vec::new(),
                     });
                     should_retrigger = true;
 
@@ -3900,7 +4040,7 @@ impl Channel {
                 }
 
                 run_logger.log_worker_completed(*worker_id, result, *success);
-                let artifact_summary = run_logger
+                let worker_receipt = run_logger
                     .get_worker_detail(&self.deps.agent_id, &worker_id.to_string())
                     .await
                     .ok()
@@ -3908,8 +4048,19 @@ impl Channel {
                     .and_then(|detail| detail.outcome_receipt_json)
                     .and_then(|value| {
                         serde_json::from_str::<crate::WorkerOutcomeReceipt>(&value).ok()
+                    });
+                let artifact_summary = worker_receipt
+                    .as_ref()
+                    .and_then(summarize_receipt_artifacts);
+                let artifact_outcomes = worker_receipt
+                    .map(|receipt| {
+                        receipt
+                            .artifact_outcomes
+                            .into_iter()
+                            .filter(should_auto_deliver_artifact)
+                            .collect::<Vec<_>>()
                     })
-                    .and_then(|receipt| summarize_receipt_artifacts(&receipt));
+                    .unwrap_or_default();
 
                 self.state.active_workers.write().await.remove(worker_id);
                 self.state.worker_inputs.write().await.remove(worker_id);
@@ -3931,6 +4082,7 @@ impl Channel {
                             .as_ref()
                             .and_then(|value| value.1.clone()),
                         artifact_summary,
+                        artifact_outcomes,
                     });
                     should_retrigger = true;
                 }
@@ -3988,6 +4140,7 @@ impl Channel {
                         .as_ref()
                         .and_then(|value| value.1.clone()),
                     artifact_summary: None,
+                    artifact_outcomes: Vec::new(),
                 });
                 should_retrigger = true;
                 tracing::info!(
@@ -4127,6 +4280,21 @@ impl Channel {
         }
 
         let result_count = ready_results.len();
+        let artifact_deliveries: Vec<PendingArtifactDelivery> = ready_results
+            .iter()
+            .filter(|result| result.process_type == "worker")
+            .flat_map(|result| {
+                result
+                    .artifact_outcomes
+                    .iter()
+                    .map(|artifact| PendingArtifactDelivery {
+                        worker_id: result.process_id.clone(),
+                        path: artifact.path.clone(),
+                        suggested_name: artifact.suggested_name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         // Build per-result summaries for the template.
         let result_items: Vec<_> = ready_results
@@ -4209,6 +4377,13 @@ impl Channel {
             "retrigger_process_ids".to_string(),
             serde_json::json!(retrigger_process_ids),
         );
+        if !artifact_deliveries.is_empty() {
+            metadata.insert(
+                "retrigger_artifact_deliveries".to_string(),
+                serde_json::to_value(&artifact_deliveries)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+            );
+        }
 
         let synthetic = InboundMessage {
             id: uuid::Uuid::new_v4().to_string(),

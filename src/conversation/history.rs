@@ -64,6 +64,13 @@ pub struct RequestGroupDetail {
     pub merged: SwarmMergeSummary,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArtifactDeliveryUpdate {
+    pub path: String,
+    pub delivery_status: String,
+    pub delivery_target: Option<String>,
+}
+
 fn summarize_request_group_receipt(
     worker_id: &str,
     receipt: &WorkerOutcomeReceipt,
@@ -830,6 +837,69 @@ impl ProcessRunLogger {
         });
     }
 
+    /// Update typed artifact delivery facts after the channel/runtime has
+    /// attempted delivery. This keeps worker receipts auditable without asking
+    /// the model to infer adapter behavior in prose.
+    pub async fn update_worker_receipt_artifact_delivery(
+        &self,
+        worker_id: &str,
+        updates: &[ArtifactDeliveryUpdate],
+    ) -> crate::error::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let row = sqlx::query("SELECT outcome_receipt_json FROM worker_runs WHERE id = ?")
+            .bind(worker_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        let Some(row) = row else {
+            return Ok(());
+        };
+
+        let Some(receipt_json) = row
+            .try_get::<Option<String>, _>("outcome_receipt_json")
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+
+        let mut receipt: WorkerOutcomeReceipt = serde_json::from_str(&receipt_json)
+            .map_err(|error| anyhow::anyhow!("failed to decode worker receipt: {error}"))?;
+
+        if receipt.artifact_outcomes.is_empty() {
+            return Ok(());
+        }
+
+        for update in updates {
+            if let Some(artifact) = receipt
+                .artifact_outcomes
+                .iter_mut()
+                .find(|artifact| artifact.path == update.path)
+            {
+                artifact.delivery_status = Some(update.delivery_status.clone());
+                if update.delivery_target.is_some() {
+                    artifact.delivery_target = update.delivery_target.clone();
+                }
+            }
+        }
+
+        let updated_json = serde_json::to_string(&receipt)
+            .map_err(|error| anyhow::anyhow!("failed to encode updated worker receipt: {error}"))?;
+
+        sqlx::query("UPDATE worker_runs SET outcome_receipt_json = ? WHERE id = ?")
+            .bind(updated_json)
+            .bind(worker_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(())
+    }
+
     /// Update a worker's status. Fire-and-forget.
     /// Most status text updates are transient — they're available via the
     /// in-memory StatusBlock for live workers and don't need to be persisted.
@@ -1443,7 +1513,8 @@ pub struct WorkerDetailRow {
 
 #[cfg(test)]
 mod tests {
-    use super::ProcessRunLogger;
+    use super::{ArtifactDeliveryUpdate, ProcessRunLogger};
+    use crate::{ArtifactOutcome, WorkerOutcomeReceipt};
 
     async fn setup_worker_runs_table() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1458,7 +1529,8 @@ mod tests {
                 channel_id TEXT,
                 status TEXT NOT NULL,
                 result TEXT,
-                completed_at TIMESTAMP
+                completed_at TIMESTAMP,
+                outcome_receipt_json TEXT
             )",
         )
         .execute(&pool)
@@ -1646,5 +1718,60 @@ mod tests {
             .expect("failed to fetch worker row");
         let status: String = sqlx::Row::try_get(&row, "status").expect("missing status");
         assert_eq!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn update_worker_receipt_artifact_delivery_patches_typed_outcomes() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+        let receipt = WorkerOutcomeReceipt {
+            summary: "done".to_string(),
+            artifact_outcomes: vec![ArtifactOutcome {
+                path: "/tmp/report.txt".to_string(),
+                suggested_name: Some("report.txt".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        sqlx::query(
+            "INSERT INTO worker_runs (id, channel_id, status, result, outcome_receipt_json) VALUES (?, 'ch-1', 'done', 'ok', ?)",
+        )
+        .bind(worker_id.to_string())
+        .bind(serde_json::to_string(&receipt).expect("receipt json"))
+        .execute(&pool)
+        .await
+        .expect("insert");
+
+        logger
+            .update_worker_receipt_artifact_delivery(
+                &worker_id.to_string(),
+                &[ArtifactDeliveryUpdate {
+                    path: "/tmp/report.txt".to_string(),
+                    delivery_status: "delivered".to_string(),
+                    delivery_target: Some("telegram:123".to_string()),
+                }],
+            )
+            .await
+            .expect("update should succeed");
+
+        let updated_json: String =
+            sqlx::query_scalar("SELECT outcome_receipt_json FROM worker_runs WHERE id = ?")
+                .bind(worker_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("fetch receipt json");
+        let updated: WorkerOutcomeReceipt =
+            serde_json::from_str(&updated_json).expect("decode updated receipt");
+
+        assert_eq!(
+            updated.artifact_outcomes[0].delivery_status.as_deref(),
+            Some("delivered")
+        );
+        assert_eq!(
+            updated.artifact_outcomes[0].delivery_target.as_deref(),
+            Some("telegram:123")
+        );
     }
 }
