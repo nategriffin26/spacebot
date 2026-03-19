@@ -95,6 +95,9 @@ impl Worker {
             channel_id.clone(),
             deps.event_tx.clone(),
         )
+        .with_completion_receipt_requirement(
+            task_class.is_some_and(|value| value.requires_receipt_contract()),
+        )
         .with_inject_rx(inject_rx);
         let (status_tx, status_rx) = watch::channel("starting".to_string());
 

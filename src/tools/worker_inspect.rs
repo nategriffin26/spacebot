@@ -113,6 +113,15 @@ impl Tool for WorkerInspectTool {
                 Ok(receipt) => {
                     summary.push_str("\n### Receipt\n\n");
                     summary.push_str(&format!("**Summary:** {}\n\n", receipt.summary));
+                    if let Some(task_summary) = &receipt.original_task_summary {
+                        summary.push_str(&format!("**Original task:** {task_summary}\n\n"));
+                    }
+                    if let Some(terminal_reason) = receipt.terminal_reason {
+                        summary.push_str(&format!(
+                            "**Terminal reason:** {}\n\n",
+                            terminal_reason.as_str()
+                        ));
+                    }
                     if !receipt.sources_used.is_empty() {
                         summary.push_str(&format!(
                             "**Sources used:** {}\n\n",
@@ -124,6 +133,13 @@ impl Tool for WorkerInspectTool {
                             "**Artifacts created:** {}\n\n",
                             receipt.artifacts_created.join(", ")
                         ));
+                    }
+                    if !receipt.artifact_outcomes.is_empty() {
+                        summary.push_str("**Artifact outcomes:**\n");
+                        for artifact in &receipt.artifact_outcomes {
+                            summary.push_str(&format!("- {}\n", artifact.path));
+                        }
+                        summary.push('\n');
                     }
                     if !receipt.commands_run.is_empty() {
                         summary.push_str("**Commands run:**\n");
@@ -150,6 +166,20 @@ impl Tool for WorkerInspectTool {
                         summary.push_str("**Blockers:**\n");
                         for blocker in &receipt.blockers {
                             summary.push_str(&format!("- {blocker}\n"));
+                        }
+                        summary.push('\n');
+                    }
+                    if !receipt.requirements_completed.is_empty() {
+                        summary.push_str("**Requirements completed:**\n");
+                        for item in &receipt.requirements_completed {
+                            summary.push_str(&format!("- {item}\n"));
+                        }
+                        summary.push('\n');
+                    }
+                    if !receipt.requirements_blocked.is_empty() {
+                        summary.push_str("**Requirements blocked:**\n");
+                        for item in &receipt.requirements_blocked {
+                            summary.push_str(&format!("- {item}\n"));
                         }
                         summary.push('\n');
                     }

@@ -251,6 +251,12 @@ async fn dump_channel_context() {
         live_worker_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
+        current_request_context: Arc::new(tokio::sync::RwLock::new(None)),
+        request_group_runtime: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        pending_branch_spawns: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        process_request_groups: Arc::new(
+            tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        ),
     };
 
     let tool_server = rig::tool::server::ToolServer::new().run();
@@ -396,6 +402,7 @@ async fn dump_worker_context() {
         worker_id,
         None,
         deps.task_store.clone(),
+        spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
         deps.event_tx.clone(),
         browser_config,
         std::path::PathBuf::from("/tmp/screenshots"),
@@ -493,6 +500,12 @@ async fn dump_all_contexts() {
         live_worker_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
+        current_request_context: Arc::new(tokio::sync::RwLock::new(None)),
+        request_group_runtime: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        pending_branch_spawns: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        process_request_groups: Arc::new(
+            tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        ),
     };
     let channel_tool_server = rig::tool::server::ToolServer::new().run();
     let skip_flag = spacebot::tools::new_skip_flag();
@@ -578,6 +591,7 @@ async fn dump_all_contexts() {
         uuid::Uuid::new_v4(),
         None,
         deps.task_store.clone(),
+        spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
         deps.event_tx.clone(),
         browser_config,
         std::path::PathBuf::from("/tmp/screenshots"),

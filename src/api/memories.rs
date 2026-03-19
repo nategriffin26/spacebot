@@ -42,6 +42,8 @@ pub(super) struct MemoriesListQuery {
     offset: usize,
     #[serde(default)]
     memory_type: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default = "default_memories_sort")]
     sort: String,
 }
@@ -84,6 +86,8 @@ pub(super) struct MemoriesSearchQuery {
     limit: usize,
     #[serde(default)]
     memory_type: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn default_search_limit() -> usize {
@@ -99,6 +103,8 @@ pub(super) struct MemoryGraphQuery {
     offset: usize,
     #[serde(default)]
     memory_type: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default = "default_memories_sort")]
     sort: String,
 }
@@ -137,7 +143,7 @@ pub(super) async fn list_memories(
 
     let fetch_limit = limit + query.offset as i64;
     let all = store
-        .get_sorted(sort, fetch_limit, memory_type)
+        .get_sorted_filtered(sort, fetch_limit, memory_type, query.source.as_deref())
         .await
         .map_err(|error| {
             tracing::warn!(%error, agent_id = %query.agent_id, "failed to list memories");
@@ -161,6 +167,7 @@ pub(super) async fn search_memories(
     let config = SearchConfig {
         mode: SearchMode::Hybrid,
         memory_type: query.memory_type.as_deref().and_then(parse_memory_type),
+        source: query.source.clone(),
         max_results: query.limit.min(100),
         ..SearchConfig::default()
     };
@@ -190,7 +197,7 @@ pub(super) async fn memory_graph(
 
     let fetch_limit = limit + query.offset as i64;
     let all = store
-        .get_sorted(sort, fetch_limit, memory_type)
+        .get_sorted_filtered(sort, fetch_limit, memory_type, query.source.as_deref())
         .await
         .map_err(|error| {
             tracing::warn!(%error, agent_id = %query.agent_id, "failed to load graph nodes");

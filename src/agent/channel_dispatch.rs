@@ -6,7 +6,7 @@
 
 use crate::ProcessType;
 use crate::agent::branch::{Branch, BranchExecutionConfig};
-use crate::agent::channel::ChannelState;
+use crate::agent::channel::{ChannelState, PendingBranchSpawn};
 use crate::agent::channel_prompt::{TemporalContext, build_worker_task_with_temporal_context};
 use crate::agent::worker::Worker;
 use crate::error::{AgentError, Error as SpacebotError};
@@ -155,6 +155,7 @@ fn classify_request_task(
 #[derive(Debug, Clone)]
 struct BranchSpawnOptions {
     profile: BranchToolProfile,
+    pending_worker_spawn: Option<PendingBranchSpawn>,
 }
 
 /// Spawn a branch from a ChannelState. Used by the BranchTool.
@@ -181,6 +182,7 @@ pub async fn spawn_branch_from_state(
         "branch",
         BranchSpawnOptions {
             profile: BranchToolProfile::Default,
+            pending_worker_spawn: None,
         },
     )
     .await
@@ -214,6 +216,56 @@ pub(crate) async fn spawn_memory_persistence_branch(
         "memory_persistence_branch",
         BranchSpawnOptions {
             profile: BranchToolProfile::MemoryPersistence { contract_state },
+            pending_worker_spawn: None,
+        },
+    )
+    .await
+}
+
+/// Spawn a preparation branch that will automatically start a worker from the
+/// branch conclusion when it completes.
+pub async fn spawn_branch_and_spawn_from_state(
+    state: &ChannelState,
+    task: impl Into<String>,
+    interactive: bool,
+    suggested_skills: &[&str],
+    topic_ids: &[String],
+) -> std::result::Result<BranchId, AgentError> {
+    let task = task.into();
+    let rc = &state.deps.runtime_config;
+    let prompt_engine = rc.prompts.load();
+    let system_prompt = prompt_engine
+        .render_branch_and_spawn_prompt(
+            &rc.instance_dir.display().to_string(),
+            &rc.workspace_dir.display().to_string(),
+        )
+        .map_err(|error| AgentError::Other(anyhow::anyhow!("{error}")))?;
+    let prompt = format!(
+        "Prepare a worker-ready task brief for this request.\n\nOriginal request:\n{task}\n\nReturn only the final task brief the worker should receive."
+    );
+    let status_label = format!(
+        "preparing work: {}",
+        crate::tools::truncate_utf8_ellipsis(&task, 96)
+    );
+
+    spawn_branch(
+        state,
+        &task,
+        &prompt,
+        &system_prompt,
+        &status_label,
+        "branch_and_spawn",
+        BranchSpawnOptions {
+            profile: BranchToolProfile::PreparationOnly,
+            pending_worker_spawn: Some(PendingBranchSpawn {
+                original_task: task.clone(),
+                interactive,
+                suggested_skills: suggested_skills
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+                topic_ids: topic_ids.to_vec(),
+            }),
         },
     )
     .await
@@ -270,10 +322,13 @@ async fn spawn_branch(
     dispatch_type: &'static str,
     branch_options: BranchSpawnOptions,
 ) -> std::result::Result<BranchId, AgentError> {
-    let BranchSpawnOptions { profile } = branch_options;
+    let BranchSpawnOptions {
+        profile,
+        pending_worker_spawn,
+    } = branch_options;
     let memory_persistence_contract = match &profile {
         BranchToolProfile::MemoryPersistence { contract_state } => Some(contract_state.clone()),
-        BranchToolProfile::Default => None,
+        BranchToolProfile::Default | BranchToolProfile::PreparationOnly => None,
     };
 
     let max_branches = **state.deps.runtime_config.max_concurrent_branches.load();
@@ -321,6 +376,13 @@ async fn spawn_branch(
     );
 
     let branch_id = branch.id;
+    if let Some(pending_worker_spawn) = pending_worker_spawn {
+        state
+            .pending_branch_spawns
+            .write()
+            .await
+            .insert(branch_id, pending_worker_spawn);
+    }
     let prompt = prompt.to_owned();
     let request_group_id = state.ensure_request_group().await;
 

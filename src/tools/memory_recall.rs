@@ -47,6 +47,9 @@ pub struct MemoryRecallArgs {
     pub max_results: usize,
     /// Optional memory type filter. Required for "typed" mode.
     pub memory_type: Option<String>,
+    /// Optional exact source filter, for example `cortex:autonomy`.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Search mode: "hybrid" (default), "recent", "important", "typed".
     #[serde(default)]
     pub mode: Option<String>,
@@ -130,6 +133,8 @@ pub struct MemoryOutput {
     pub created_at: String,
     /// The relevance score from the search.
     pub relevance_score: f32,
+    /// The memory source label, when present.
+    pub source: Option<String>,
 }
 
 impl Tool for MemoryRecallTool {
@@ -164,6 +169,10 @@ impl Tool for MemoryRecallTool {
                             .map(|t| t.to_string())
                             .collect::<Vec<_>>(),
                         "description": "Filter to a specific memory type. Required for \"typed\" mode, optional filter for other modes."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional exact memory source filter, such as \"cortex:autonomy\" or \"branch:memory_persistence\"."
                     },
                     "mode": {
                         "type": "string",
@@ -214,6 +223,7 @@ impl Tool for MemoryRecallTool {
         let config = SearchConfig {
             mode,
             memory_type,
+            source: args.source.clone(),
             sort_by,
             max_results: args.max_results,
             max_results_per_source: args.max_results * 2,
@@ -248,6 +258,7 @@ impl Tool for MemoryRecallTool {
                 importance: result.memory.importance,
                 created_at: result.memory.created_at.to_rfc3339(),
                 relevance_score: result.score,
+                source: result.memory.source.clone(),
             });
         }
 
@@ -310,6 +321,7 @@ pub async fn memory_recall(
         query: Some(query.to_string()),
         max_results,
         memory_type: None,
+        source: None,
         mode: None,
         sort_by: None,
     };

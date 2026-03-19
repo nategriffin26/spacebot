@@ -29,6 +29,7 @@
 //! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, and `spawn_worker`
 
 pub mod attachment_recall;
+pub mod branch_and_spawn;
 pub mod branch_tool;
 pub mod browser;
 pub mod cancel;
@@ -74,6 +75,9 @@ pub mod factory_update_identity;
 
 pub use attachment_recall::{
     AttachmentRecallArgs, AttachmentRecallError, AttachmentRecallOutput, AttachmentRecallTool,
+};
+pub use branch_and_spawn::{
+    BranchAndSpawnArgs, BranchAndSpawnError, BranchAndSpawnOutput, BranchAndSpawnTool,
 };
 pub use branch_tool::{BranchArgs, BranchError, BranchOutput, BranchTool};
 pub use browser::{
@@ -191,6 +195,7 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone)]
 pub enum BranchToolProfile {
     Default,
+    PreparationOnly,
     MemoryPersistence {
         contract_state: Arc<MemoryPersistenceContractState>,
     },
@@ -439,6 +444,12 @@ pub async fn add_channel_tools(
             .await?;
     }
     handle
+        .add_tool(BranchAndSpawnTool::new(
+            state.clone(),
+            turn_action_tracker.clone(),
+        ))
+        .await?;
+    handle
         .add_tool(BranchTool::new(state.clone(), turn_action_tracker.clone()))
         .await?;
     handle
@@ -552,6 +563,7 @@ pub async fn remove_channel_tools(
     if allow_direct_reply {
         handle.remove_tool(ReplyTool::NAME).await?;
     }
+    handle.remove_tool(BranchAndSpawnTool::NAME).await?;
     handle.remove_tool(BranchTool::NAME).await?;
     handle.remove_tool(SpawnWorkerTool::NAME).await?;
     handle.remove_tool(RouteTool::NAME).await?;
@@ -600,6 +612,7 @@ pub fn create_branch_tool_server(
         agent_id.clone(),
         memory_event_tx.clone(),
     );
+    let allow_spawn_worker = !matches!(profile, BranchToolProfile::PreparationOnly);
     if let BranchToolProfile::MemoryPersistence { contract_state } = &profile {
         memory_save = memory_save.with_contract_state(contract_state.clone());
     }
@@ -624,7 +637,9 @@ pub fn create_branch_tool_server(
         server = server.tool(MemoryPersistenceCompleteTool::new(contract_state));
     }
 
-    if let Some(state) = state {
+    if let Some(state) = state
+        && allow_spawn_worker
+    {
         server = server.tool(SpawnWorkerTool::new(state, TurnActionTracker::new()));
     }
 

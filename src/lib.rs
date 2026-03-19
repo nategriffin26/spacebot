@@ -30,12 +30,14 @@ pub mod skills;
 pub mod tasks;
 #[cfg(feature = "metrics")]
 pub mod telemetry;
+pub mod tooling;
 pub mod tools;
 pub mod topics;
 pub mod update;
 
 pub use error::{Error, Result};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -381,7 +383,7 @@ impl TaskClass {
 }
 
 /// Explicit user-named sources that must outrank workspace residue.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SourceManifest {
     pub explicit_paths: Vec<String>,
     pub explicit_files: Vec<String>,
@@ -402,16 +404,82 @@ impl SourceManifest {
 }
 
 /// Structured worker completion receipt used for post-hoc audits.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WorkerOutcomeReceipt {
     pub summary: String,
+    #[serde(default)]
+    pub original_task_summary: Option<String>,
+    #[serde(default)]
     pub sources_used: Vec<String>,
+    #[serde(default)]
     pub artifacts_created: Vec<String>,
+    #[serde(default)]
+    pub artifact_outcomes: Vec<ArtifactOutcome>,
+    #[serde(default)]
     pub commands_run: Vec<String>,
+    #[serde(default)]
     pub verified_claims: Vec<String>,
+    #[serde(default)]
     pub inferred_claims: Vec<String>,
+    #[serde(default)]
+    pub requirements_completed: Vec<String>,
+    #[serde(default)]
+    pub requirements_blocked: Vec<String>,
+    #[serde(default)]
     pub blockers: Vec<String>,
+    #[serde(default)]
+    pub terminal_reason: Option<WorkerTerminalReason>,
+    #[serde(default)]
+    pub retries_attempted: u32,
+    #[serde(default)]
+    pub remediations_attempted: Vec<String>,
+    #[serde(default)]
+    pub merge_ready: bool,
+    #[serde(default)]
+    pub source_manifest_used: Option<SourceManifest>,
     pub wrong_source_detected: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTerminalReason {
+    #[default]
+    Success,
+    PartialSuccess,
+    Blocked,
+    FailedTransient,
+    FailedDeterministic,
+    Cancelled,
+    SuspiciousCompletion,
+}
+
+impl WorkerTerminalReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::PartialSuccess => "partial_success",
+            Self::Blocked => "blocked",
+            Self::FailedTransient => "failed_transient",
+            Self::FailedDeterministic => "failed_deterministic",
+            Self::Cancelled => "cancelled",
+            Self::SuspiciousCompletion => "suspicious_completion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactOutcome {
+    pub path: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub suggested_name: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub delivery_status: Option<String>,
+    #[serde(default)]
+    pub delivery_target: Option<String>,
 }
 
 /// Default broadcast capacity for the per-agent control event bus.

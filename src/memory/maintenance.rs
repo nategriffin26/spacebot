@@ -216,7 +216,7 @@ async fn repair_memory_contradictions(
 
     if report.secret_rows_redacted > 0 || report.contradictions_repaired > 0 {
         let mut cleanup = Memory::new(
-            &format!(
+            format!(
                 "Maintenance repaired {} contradiction(s) and redacted {} secret-bearing memory row(s).",
                 report.contradictions_repaired, report.secret_rows_redacted
             ),

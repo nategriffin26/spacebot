@@ -69,100 +69,18 @@ pub fn refresh_verified_capabilities(
         .into_iter()
         .map(|entry| (entry.capability_name.clone(), entry))
         .collect::<std::collections::HashMap<_, _>>();
-    let now = chrono::Utc::now().to_rfc3339();
 
-    let mut entries = Vec::new();
-    let browser = runtime_config.browser_config.load();
-    if browser.enabled {
-        entries.push(merge_capability_entry(
-            previous.get("browser"),
-            VerifiedCapability {
-                capability_name: "browser".to_string(),
-                category: "tool".to_string(),
-                invocation_path: "browser_*".to_string(),
-                required_secrets_present: true,
-                health_state: "verified".to_string(),
-                last_verified_at: Some(now.clone()),
-                last_failure_at: None,
-                failure_reason: None,
-                note: Some("builtin browser tools enabled".to_string()),
-            },
-        ));
-    }
-
-    let brave_configured = runtime_config.brave_search_key.load().is_some();
-    if brave_configured {
-        entries.push(merge_capability_entry(
-            previous.get("web_search"),
-            VerifiedCapability {
-                capability_name: "web_search".to_string(),
-                category: "tool".to_string(),
-                invocation_path: "web_search".to_string(),
-                required_secrets_present: true,
-                health_state: "verified".to_string(),
-                last_verified_at: Some(now.clone()),
-                last_failure_at: None,
-                failure_reason: None,
-                note: Some("Brave Search key configured".to_string()),
-            },
-        ));
-    }
-
-    let opencode = runtime_config.opencode.load();
-    if opencode.enabled {
-        entries.push(merge_capability_entry(
-            previous.get("opencode"),
-            VerifiedCapability {
-                capability_name: "opencode".to_string(),
-                category: "worker".to_string(),
-                invocation_path: "spawn_worker(worker_type=opencode)".to_string(),
-                required_secrets_present: true,
-                health_state: "verified".to_string(),
-                last_verified_at: Some(now.clone()),
-                last_failure_at: None,
-                failure_reason: None,
-                note: Some(format!("path={}", opencode.path)),
-            },
-        ));
-    }
-
-    for server in runtime_config
-        .mcp
-        .load()
-        .iter()
-        .filter(|server| server.enabled)
-    {
-        let connected = connected_mcp_servers
-            .iter()
-            .any(|name| name == &server.name);
-        entries.push(merge_capability_entry(
-            previous.get(server.name.as_str()),
-            VerifiedCapability {
-                capability_name: server.name.clone(),
-                category: "mcp".to_string(),
-                invocation_path: format!("mcp:{}", server.name),
-                required_secrets_present: true,
-                health_state: if connected {
-                    "verified".to_string()
-                } else {
-                    "degraded".to_string()
-                },
-                last_verified_at: connected.then(|| now.clone()),
-                last_failure_at: (!connected).then(|| now.clone()),
-                failure_reason: (!connected).then(|| "configured but not connected".to_string()),
-                note: Some(format!("transport={}", server.transport.kind())),
-            },
-        ));
-        #[cfg(feature = "metrics")]
-        if !connected {
-            crate::telemetry::Metrics::global()
-                .mcp_degraded_incidence_total
-                .with_label_values(&[agent_id, &server.name])
-                .inc();
-        }
-    }
+    let mut entries = crate::tooling::build_verified_capabilities(
+        agent_id,
+        runtime_config,
+        connected_mcp_servers,
+    )
+    .into_iter()
+    .map(|entry| merge_capability_entry(previous.get(entry.capability_name.as_str()), entry))
+    .collect::<Vec<_>>();
 
     if let Some(image_generation) = read_image_generation_config(&runtime_config.instance_dir) {
+        let now = chrono::Utc::now().to_rfc3339();
         entries.push(merge_capability_entry(
             previous.get("image_generation"),
             VerifiedCapability {

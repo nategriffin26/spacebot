@@ -57,6 +57,10 @@ impl PromptEngine {
         // Process prompts
         env.add_template("channel", crate::prompts::text::get("channel"))?;
         env.add_template("branch", crate::prompts::text::get("branch"))?;
+        env.add_template(
+            "branch_and_spawn",
+            crate::prompts::text::get("branch_and_spawn"),
+        )?;
         env.add_template("worker", crate::prompts::text::get("worker"))?;
         env.add_template("cortex", crate::prompts::text::get("cortex"))?;
         env.add_template(
@@ -294,6 +298,21 @@ impl PromptEngine {
     pub fn render_branch_prompt(&self, instance_dir: &str, workspace_dir: &str) -> Result<String> {
         self.render(
             "branch",
+            context! {
+                instance_dir => instance_dir,
+                workspace_dir => workspace_dir,
+            },
+        )
+    }
+
+    /// Render the specialized branch-and-spawn preparation prompt.
+    pub fn render_branch_and_spawn_prompt(
+        &self,
+        instance_dir: &str,
+        workspace_dir: &str,
+    ) -> Result<String> {
+        self.render(
+            "branch_and_spawn",
             context! {
                 instance_dir => instance_dir,
                 workspace_dir => workspace_dir,

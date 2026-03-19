@@ -143,8 +143,10 @@ impl SkillSet {
 
     /// Render the skills listing for injection into a worker system prompt.
     ///
-    /// Workers see all available skills with any channel-suggested skills flagged.
-    /// They decide which skills are relevant and read them via the read_skill tool.
+    /// When the channel suggests skills, workers see only that narrowed list by
+    /// default; if no suggestions resolve, they fall back to the full catalog.
+    /// Workers still decide which skills are relevant and read them via the
+    /// read_skill tool.
     pub fn render_worker_skills(
         &self,
         suggested: &[&str],
@@ -158,8 +160,24 @@ impl SkillSet {
         sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
 
         let suggested_lower: Vec<String> = suggested.iter().map(|s| s.to_lowercase()).collect();
+        let any_suggestions = !suggested_lower.is_empty();
 
-        let skill_infos: Vec<crate::prompts::SkillInfo> = sorted_skills
+        let filtered_skills: Vec<&Skill> = if any_suggestions {
+            let filtered = sorted_skills
+                .iter()
+                .copied()
+                .filter(|skill| suggested_lower.contains(&skill.name.to_lowercase()))
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                sorted_skills
+            } else {
+                filtered
+            }
+        } else {
+            sorted_skills
+        };
+
+        let skill_infos: Vec<crate::prompts::SkillInfo> = filtered_skills
             .into_iter()
             .map(|s| crate::prompts::SkillInfo {
                 suggested: suggested_lower.contains(&s.name.to_lowercase()),

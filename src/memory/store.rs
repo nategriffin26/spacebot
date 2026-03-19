@@ -616,45 +616,53 @@ impl MemoryStore {
         limit: i64,
         memory_type: Option<MemoryType>,
     ) -> Result<Vec<Memory>> {
+        self.get_sorted_filtered(sort, limit, memory_type, None)
+            .await
+    }
+
+    /// Get memories sorted by a flexible criterion with optional type and source filters.
+    pub async fn get_sorted_filtered(
+        &self,
+        sort: SearchSort,
+        limit: i64,
+        memory_type: Option<MemoryType>,
+        source: Option<&str>,
+    ) -> Result<Vec<Memory>> {
         let order_clause = match sort {
             SearchSort::Recent => "ORDER BY created_at DESC",
             SearchSort::Importance => "ORDER BY importance DESC, created_at DESC",
             SearchSort::MostAccessed => "ORDER BY access_count DESC, created_at DESC",
         };
 
-        let (query_str, type_filter) = if let Some(ref memory_type) = memory_type {
-            (
-                format!(
-                    "SELECT id, content, memory_type, importance, created_at, updated_at, \
-                     last_accessed_at, access_count, source, channel_id, forgotten \
-                     FROM memories WHERE memory_type = ? AND forgotten = 0 {order_clause} LIMIT ?"
-                ),
-                Some(memory_type.to_string()),
-            )
-        } else {
-            (
-                format!(
-                    "SELECT id, content, memory_type, importance, created_at, updated_at, \
-                     last_accessed_at, access_count, source, channel_id, forgotten \
-                     FROM memories WHERE forgotten = 0 {order_clause} LIMIT ?"
-                ),
-                None,
-            )
-        };
-
-        let rows = if let Some(type_str) = type_filter {
-            sqlx::query(&query_str)
-                .bind(type_str)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
-        } else {
-            sqlx::query(&query_str)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+        let mut query = String::from(
+            "SELECT id, content, memory_type, importance, created_at, updated_at, \
+             last_accessed_at, access_count, source, channel_id, forgotten \
+             FROM memories WHERE forgotten = 0",
+        );
+        let type_filter = memory_type.map(|memory_type| memory_type.to_string());
+        if type_filter.is_some() {
+            query.push_str(" AND memory_type = ?");
         }
-        .with_context(|| format!("failed to get sorted memories ({sort:?})"))?;
+        if source.is_some() {
+            query.push_str(" AND source = ?");
+        }
+        query.push(' ');
+        query.push_str(order_clause);
+        query.push_str(" LIMIT ?");
+
+        let mut query = sqlx::query(&query);
+        if let Some(type_str) = type_filter {
+            query = query.bind(type_str);
+        }
+        if let Some(source) = source {
+            query = query.bind(source);
+        }
+
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to get sorted memories ({sort:?})"))?;
 
         Ok(rows.into_iter().map(|row| row_to_memory(&row)).collect())
     }
@@ -922,5 +930,39 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, visible.id);
+    }
+
+    #[tokio::test]
+    async fn test_get_sorted_with_source_filter() {
+        let store = MemoryStore::connect_in_memory().await;
+        let now = Utc::now();
+
+        let autonomy = insert_memory_at(
+            &store,
+            "autonomy finding",
+            MemoryType::Observation,
+            0.5,
+            now,
+        )
+        .await
+        .with_source("cortex:autonomy");
+        let bulletin = insert_memory_at(&store, "bulletin note", MemoryType::Observation, 0.5, now)
+            .await
+            .with_source("cortex:bulletin");
+        store.update(&autonomy).await.unwrap();
+        store.update(&bulletin).await.unwrap();
+
+        let results = store
+            .get_sorted_filtered(
+                SearchSort::Recent,
+                10,
+                Some(MemoryType::Observation),
+                Some("cortex:autonomy"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source.as_deref(), Some("cortex:autonomy"));
     }
 }

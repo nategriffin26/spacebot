@@ -134,7 +134,12 @@ impl MemorySearch {
     ) -> Result<Vec<MemorySearchResult>> {
         let memories = self
             .store
-            .get_sorted(sort, config.max_results as i64, config.memory_type)
+            .get_sorted_filtered(
+                sort,
+                config.max_results as i64,
+                config.memory_type,
+                config.source.as_deref(),
+            )
             .await?;
 
         let total = memories.len();
@@ -183,6 +188,7 @@ impl MemorySearch {
                 for (memory_id, score) in fts_matches {
                     if let Some(memory) = self.store.load(&memory_id).await?
                         && !memory.forgotten
+                        && matches_source_filter(&memory, config.source.as_deref())
                     {
                         fts_results.push(ScoredMemory {
                             memory,
@@ -208,6 +214,7 @@ impl MemorySearch {
                     let similarity = 1.0 - distance;
                     if let Some(memory) = self.store.load(&memory_id).await?
                         && !memory.forgotten
+                        && matches_source_filter(&memory, config.source.as_deref())
                     {
                         vector_results.push(ScoredMemory {
                             memory,
@@ -226,6 +233,9 @@ impl MemorySearch {
         let seed_memories = self.store.get_high_importance(0.8, 20).await?;
 
         for seed in seed_memories {
+            if !matches_source_filter(&seed, config.source.as_deref()) {
+                continue;
+            }
             // Check if seed is semantically related to query via simple keyword matching
             if query
                 .to_lowercase()
@@ -254,6 +264,7 @@ impl MemorySearch {
                 config
                     .memory_type
                     .is_none_or(|t| scored.memory.memory_type == t)
+                    && matches_source_filter(&scored.memory, config.source.as_deref())
             })
             .enumerate()
             .map(|(rank, scored)| MemorySearchResult {
@@ -346,6 +357,8 @@ pub struct SearchConfig {
     pub mode: SearchMode,
     /// Optional memory type filter. Required for `Typed` mode, optional for others.
     pub memory_type: Option<MemoryType>,
+    /// Optional exact source filter.
+    pub source: Option<String>,
     /// Sort order for non-hybrid modes.
     pub sort_by: SearchSort,
     /// Maximum number of results to return.
@@ -365,6 +378,7 @@ impl Default for SearchConfig {
         Self {
             mode: SearchMode::Hybrid,
             memory_type: None,
+            source: None,
             sort_by: SearchSort::Recent,
             max_results: 10,
             max_results_per_source: 50,
@@ -382,6 +396,13 @@ impl Default for SearchConfig {
 struct ScoredMemory {
     memory: Memory,
     score: f64,
+}
+
+fn matches_source_filter(memory: &Memory, expected_source: Option<&str>) -> bool {
+    match expected_source {
+        Some(expected_source) => memory.source.as_deref() == Some(expected_source),
+        None => true,
+    }
 }
 
 /// Reciprocal Rank Fusion to combine results from multiple sources.

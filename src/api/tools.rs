@@ -1,16 +1,28 @@
-//! Durable binary location observability.
+//! Truthful callable-tool and durable-binary observability.
 
 use super::state::ApiState;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use serde::Serialize;
+use rig::tool::Tool as _;
+use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::sync::Arc;
 
+#[derive(Deserialize)]
+pub(super) struct ToolsQuery {
+    agent_id: String,
+}
+
 #[derive(Serialize)]
-pub(super) struct ToolsResponse {
+pub(super) struct AgentToolsResponse {
+    snapshot: crate::tooling::CapabilitySnapshot,
+    doctor: crate::tooling::ToolDoctorReport,
+}
+
+#[derive(Serialize)]
+pub(super) struct ToolBinariesResponse {
     tools_bin: String,
     binaries: Vec<BinaryEntry>,
 }
@@ -22,10 +34,49 @@ pub(super) struct BinaryEntry {
     modified: Option<String>,
 }
 
-/// List the contents of the durable `tools/bin` directory.
+/// List callable tools and capability health for a specific agent.
 pub(super) async fn list_tools(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ToolsResponse>, StatusCode> {
+    Query(query): Query<ToolsQuery>,
+) -> Result<Json<AgentToolsResponse>, StatusCode> {
+    let runtime_configs = state.runtime_configs.load();
+    let runtime_config = runtime_configs
+        .get(&query.agent_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let managers = state.mcp_managers.load();
+    let manager = managers.get(&query.agent_id);
+
+    let connected_mcp_servers = if let Some(manager) = manager {
+        manager.connected_server_names().await
+    } else {
+        Vec::new()
+    };
+    let connected_mcp_tool_names = if let Some(manager) = manager {
+        manager
+            .get_tools()
+            .await
+            .into_iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let snapshot = crate::tooling::build_capability_snapshot(
+        &query.agent_id,
+        runtime_config,
+        &connected_mcp_servers,
+        &connected_mcp_tool_names,
+    );
+    let doctor = crate::tooling::build_tool_doctor_report(&snapshot);
+
+    Ok(Json(AgentToolsResponse { snapshot, doctor }))
+}
+
+/// List the contents of the durable `tools/bin` directory.
+pub(super) async fn list_tool_binaries(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ToolBinariesResponse>, StatusCode> {
     let instance_dir = state.instance_dir.load();
     let tools_bin = instance_dir.join("tools/bin");
 
@@ -82,7 +133,7 @@ pub(super) async fn list_tools(
 
     binaries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(Json(ToolsResponse {
+    Ok(Json(ToolBinariesResponse {
         tools_bin: tools_bin.display().to_string(),
         binaries,
     }))

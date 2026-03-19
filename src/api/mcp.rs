@@ -39,6 +39,10 @@ pub(super) struct McpServerInfo {
     pub transport: String,
     pub enabled: bool,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -144,6 +148,8 @@ pub(super) async fn list_mcp_servers(
             transport,
             enabled,
             state: state_str,
+            reason_code: None,
+            remediation: None,
         });
     }
 
@@ -381,9 +387,43 @@ pub(super) async fn mcp_status(State(state): State<Arc<ApiState>>) -> Json<Vec<M
 
     for (agent_id, manager) in managers.iter() {
         let statuses = manager.statuses().await;
+        let connected_server_names = statuses
+            .iter()
+            .filter_map(|status| match status.state {
+                crate::mcp::McpConnectionState::Connected => Some(status.name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let runtime_configs = state.runtime_configs.load();
+        let snapshot = runtime_configs.get(agent_id).map(|runtime_config| {
+            crate::tooling::build_capability_snapshot(
+                agent_id,
+                runtime_config,
+                &connected_server_names,
+                &[],
+            )
+        });
+        let capability_lookup = snapshot
+            .map(|snapshot| {
+                snapshot
+                    .capabilities
+                    .into_iter()
+                    .filter(|record| {
+                        matches!(record.subject, crate::tooling::CapabilitySubject::McpServer)
+                    })
+                    .map(|record| (record.name.clone(), record))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let servers = statuses
             .into_iter()
             .map(|s| McpServerInfo {
+                reason_code: capability_lookup
+                    .get(&s.name)
+                    .and_then(|record| record.reason_code.clone()),
+                remediation: capability_lookup
+                    .get(&s.name)
+                    .and_then(|record| record.remediation.clone()),
                 name: s.name,
                 transport: s.transport,
                 enabled: s.enabled,

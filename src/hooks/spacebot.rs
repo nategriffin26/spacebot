@@ -44,6 +44,9 @@ pub struct SpacebotHook {
     /// Once signaled, the nudge system allows text-only responses to pass
     /// through as legitimate completions.
     outcome_signaled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set to `true` when the worker persists a structured receipt.
+    receipt_signaled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    require_receipt_before_completion: bool,
     inject_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>>,
     injected_messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
@@ -91,6 +94,8 @@ impl SpacebotHook {
                 std::sync::atomic::AtomicBool::new(false),
             ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            receipt_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            require_receipt_before_completion: false,
             inject_rx: None,
             injected_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             memory_persistence_contract: None,
@@ -100,6 +105,11 @@ impl SpacebotHook {
     /// Override the default process-scoped nudge policy.
     pub fn with_tool_nudge_policy(mut self, policy: ToolNudgePolicy) -> Self {
         self.tool_nudge_policy = policy;
+        self
+    }
+
+    pub fn with_completion_receipt_requirement(mut self, require_receipt: bool) -> Self {
+        self.require_receipt_before_completion = require_receipt;
         self
     }
 
@@ -126,6 +136,8 @@ impl SpacebotHook {
         self.completion_calls
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.outcome_signaled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.receipt_signaled
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -506,10 +518,14 @@ impl SpacebotHook {
         }
 
         // If the worker already signaled a terminal outcome, allow text-only
-        // responses — the worker is legitimately finishing up.
+        // responses only when the receipt contract is also satisfied.
         if self
             .outcome_signaled
             .load(std::sync::atomic::Ordering::Relaxed)
+            && (!self.require_receipt_before_completion
+                || self
+                    .receipt_signaled
+                    .load(std::sync::atomic::Ordering::Relaxed))
         {
             return false;
         }
@@ -849,6 +865,15 @@ where
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        if self.tool_nudge_policy.is_enabled()
+            && tool_name == "record_receipt"
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result)
+            && parsed.get("success").and_then(|v| v.as_bool()) == Some(true)
+        {
+            self.receipt_signaled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Channel turns should end immediately after a successful reply tool call.
         // This avoids extra post-reply LLM iterations that add latency, cost, and
         // noisy logs when providers return empty trailing responses.
@@ -1067,6 +1092,113 @@ mod tests {
         assert!(
             matches!(response, HookAction::Continue),
             "Expected text-only to pass through after outcome signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_required_completion_still_nudges_without_receipt() {
+        let hook = make_hook()
+            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
+            .with_completion_receipt_requirement(true);
+        let prompt = prompt_message();
+        hook.reset_tool_nudge_state();
+        hook.set_tool_nudge_request_active(true);
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call(
+            &hook,
+            "set_status",
+            None,
+            "internal_2",
+            "{\"status\":\"Done\",\"kind\":\"outcome\"}",
+        )
+        .await;
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_2",
+            "{\"status\":\"Done\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"Done\",\"kind\":\"outcome\"}",
+        )
+        .await;
+
+        let _ =
+            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
+                .await;
+        let response = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
+            &hook,
+            &prompt,
+            &text_response("Task finished"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                response,
+                HookAction::Terminate { ref reason }
+                if reason == SpacebotHook::TOOL_NUDGE_REASON
+            ),
+            "Expected nudge when outcome is signaled without a receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_required_completion_allows_text_after_receipt_and_outcome() {
+        let hook = make_hook()
+            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
+            .with_completion_receipt_requirement(true);
+        let prompt = prompt_message();
+        hook.reset_tool_nudge_state();
+        hook.set_tool_nudge_request_active(true);
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call(
+            &hook,
+            "record_receipt",
+            None,
+            "internal_receipt",
+            "{\"summary\":\"done\"}",
+        )
+        .await;
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "record_receipt",
+            None,
+            "internal_receipt",
+            "{\"summary\":\"done\"}",
+            "{\"success\":true,\"worker_id\":1,\"receipt\":{\"summary\":\"done\"}}",
+        )
+        .await;
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call(
+            &hook,
+            "set_status",
+            None,
+            "internal_2",
+            "{\"status\":\"Done\",\"kind\":\"outcome\"}",
+        )
+        .await;
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_2",
+            "{\"status\":\"Done\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"Done\",\"kind\":\"outcome\"}",
+        )
+        .await;
+
+        let _ =
+            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
+                .await;
+        let response = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
+            &hook,
+            &prompt,
+            &text_response("Task finished"),
+        )
+        .await;
+
+        assert!(
+            matches!(response, HookAction::Continue),
+            "Expected text-only completion after receipt and outcome signals"
         );
     }
 

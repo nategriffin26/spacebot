@@ -56,6 +56,7 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         // Process Prompts
         ("en", "channel") => include_str!("../../prompts/en/channel.md.j2"),
         ("en", "branch") => include_str!("../../prompts/en/branch.md.j2"),
+        ("en", "branch_and_spawn") => include_str!("../../prompts/en/branch_and_spawn.md.j2"),
         ("en", "worker") => include_str!("../../prompts/en/worker.md.j2"),
         ("en", "cortex") => include_str!("../../prompts/en/cortex.md.j2"),
         ("en", "cortex_bulletin") => include_str!("../../prompts/en/cortex_bulletin.md.j2"),
@@ -138,6 +139,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         // Tool Descriptions
         ("en", "tools/reply") => include_str!("../../prompts/en/tools/reply_description.md.j2"),
         ("en", "tools/branch") => include_str!("../../prompts/en/tools/branch_description.md.j2"),
+        ("en", "tools/branch_and_spawn") => {
+            include_str!("../../prompts/en/tools/branch_and_spawn_description.md.j2")
+        }
         ("en", "tools/spawn_worker") => {
             include_str!("../../prompts/en/tools/spawn_worker_description.md.j2")
         }

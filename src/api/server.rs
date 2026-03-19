@@ -214,6 +214,7 @@ pub async fn start_http_server(
         .route("/agents/skills/upload", post(skills::upload_skill))
         .route("/agents/skills/remove", delete(skills::remove_skill))
         .route("/agents/tools", get(tools::list_tools))
+        .route("/agents/tools/bin", get(tools::list_tool_binaries))
         // Secret store management
         .route("/secrets/status", get(secrets::secrets_status))
         .route("/secrets", get(secrets::list_secrets))

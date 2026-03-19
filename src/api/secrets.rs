@@ -1023,10 +1023,10 @@ fn migrate_image_generation_secret(
 
 fn is_plaintext_secret_candidate(value: &str) -> bool {
     let trimmed = value.trim();
-    !trimmed.is_empty()
-        && !trimmed.starts_with("env:")
-        && !trimmed.starts_with("secret:")
-        && !(trimmed.starts_with("${") && trimmed.ends_with('}'))
+    !(trimmed.is_empty()
+        || trimmed.starts_with("env:")
+        || trimmed.starts_with("secret:")
+        || (trimmed.starts_with("${") && trimmed.ends_with('}')))
 }
 
 fn normalize_secret_component(value: &str) -> String {

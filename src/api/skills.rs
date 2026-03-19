@@ -37,6 +37,10 @@ pub(super) struct SkillInfo {
     file_path: String,
     base_dir: String,
     source: String,
+    status: String,
+    confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_repo: Option<String>,
 }
@@ -182,20 +186,44 @@ pub(super) async fn list_skills(
     let workspace_skills_dir = agent.workspace.join("skills");
 
     let skills = crate::skills::SkillSet::load(&instance_skills_dir, &workspace_skills_dir).await;
+    let runtime_configs = state.runtime_configs.load();
+    let runtime_config = runtime_configs
+        .get(&query.agent_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let snapshot =
+        crate::tooling::build_capability_snapshot(&query.agent_id, runtime_config, &[], &[]);
+    let skill_capabilities = snapshot
+        .capabilities
+        .into_iter()
+        .filter(|record| matches!(record.subject, crate::tooling::CapabilitySubject::Skill))
+        .map(|record| (record.name.to_lowercase(), record))
+        .collect::<std::collections::HashMap<_, _>>();
 
     let skill_infos: Vec<SkillInfo> = skills
         .list()
         .into_iter()
-        .map(|s| SkillInfo {
-            name: s.name,
-            description: s.description,
-            file_path: s.file_path.display().to_string(),
-            base_dir: s.base_dir.display().to_string(),
-            source: match s.source {
-                crate::skills::SkillSource::Instance => "instance".to_string(),
-                crate::skills::SkillSource::Workspace => "workspace".to_string(),
-            },
-            source_repo: s.source_repo,
+        .map(|s| {
+            let capability = skill_capabilities.get(&s.name.to_lowercase());
+            SkillInfo {
+                name: s.name,
+                description: s.description,
+                file_path: s.file_path.display().to_string(),
+                base_dir: s.base_dir.display().to_string(),
+                source: match s.source {
+                    crate::skills::SkillSource::Instance => "instance".to_string(),
+                    crate::skills::SkillSource::Workspace => "workspace".to_string(),
+                },
+                status: capability
+                    .map(|record| serde_json::to_string(&record.status).unwrap_or_default())
+                    .map(|value| value.trim_matches('"').to_string())
+                    .unwrap_or_else(|| "available".to_string()),
+                confidence: capability
+                    .map(|record| serde_json::to_string(&record.confidence).unwrap_or_default())
+                    .map(|value| value.trim_matches('"').to_string())
+                    .unwrap_or_else(|| "runtime_verified_now".to_string()),
+                detail: capability.and_then(|record| record.detail.clone()),
+                source_repo: s.source_repo,
+            }
         })
         .collect();
 

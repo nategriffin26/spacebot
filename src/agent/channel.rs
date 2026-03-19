@@ -73,6 +73,14 @@ pub struct CurrentRequestContext {
 }
 
 #[derive(Clone, Debug)]
+pub struct PendingBranchSpawn {
+    pub original_task: String,
+    pub interactive: bool,
+    pub suggested_skills: Vec<String>,
+    pub topic_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct RequestGroupRuntimeState {
     pub request_group_id: String,
     pub origin_user_text: String,
@@ -174,6 +182,13 @@ fn reply_is_low_substance(reply: &str) -> bool {
         return true;
     }
     trimmed.len() <= 120 && trimmed.lines().count() <= 2 && trimmed.split_whitespace().count() <= 20
+}
+
+fn branch_conclusion_indicates_failure(conclusion: &str) -> bool {
+    let normalized = conclusion.trim().to_ascii_lowercase();
+    normalized.starts_with("branch failed:")
+        || normalized.starts_with("branch cancelled")
+        || normalized.starts_with("branch was cancelled")
 }
 
 fn infer_request_group_mode(user_text: &str) -> crate::RequestGroupMode {
@@ -687,6 +702,7 @@ pub struct ChannelState {
     pub current_request_context: Arc<RwLock<Option<CurrentRequestContext>>>,
     pub request_group_runtime: Arc<RwLock<HashMap<String, RequestGroupRuntimeState>>>,
     pub process_request_groups: Arc<RwLock<HashMap<String, String>>>,
+    pub pending_branch_spawns: Arc<RwLock<HashMap<BranchId, PendingBranchSpawn>>>,
     /// Discord message ID to reply to for work spawned in the current turn.
     pub reply_target_message_id: Arc<RwLock<Option<String>>>,
     pub channel_store: ChannelStore,
@@ -1178,6 +1194,7 @@ impl Channel {
         let current_request_context = Arc::new(RwLock::new(None));
         let request_group_runtime = Arc::new(RwLock::new(HashMap::new()));
         let process_request_groups = Arc::new(RwLock::new(HashMap::new()));
+        let pending_branch_spawns = Arc::new(RwLock::new(HashMap::new()));
 
         let compactor = Compactor::new(id.clone(), deps.clone(), history.clone());
 
@@ -1197,6 +1214,7 @@ impl Channel {
             current_request_context,
             request_group_runtime,
             process_request_groups,
+            pending_branch_spawns,
             reply_target_message_id: Arc::new(RwLock::new(None)),
             channel_store: channel_store.clone(),
             screenshot_dir,
@@ -3637,6 +3655,12 @@ impl Channel {
                     None
                 };
                 let reply_target_message_id = self.branch_reply_targets.get(branch_id).cloned();
+                let pending_branch_spawn = self
+                    .state
+                    .pending_branch_spawns
+                    .write()
+                    .await
+                    .remove(branch_id);
                 let was_active = self
                     .state
                     .active_branches
@@ -3669,6 +3693,66 @@ impl Channel {
                 // happened inside the branch via tool calls.
                 if was_memory_persistence {
                     tracing::info!(branch_id = %branch_id, "memory persistence branch completed");
+                } else if let Some(pending_spawn) = pending_branch_spawn {
+                    if branch_conclusion_indicates_failure(conclusion) {
+                        self.pending_results.push(PendingResult {
+                            process_type: "branch",
+                            process_id: branch_id.to_string(),
+                            result: format!(
+                                "Work preparation failed before execution could start. {conclusion}"
+                            ),
+                            success: false,
+                            request_group_id,
+                            request_group_origin: request_group_summary
+                                .as_ref()
+                                .map(|value| value.0.clone()),
+                            source_manifest_summary: request_group_summary
+                                .as_ref()
+                                .and_then(|value| value.1.clone()),
+                        });
+                        should_retrigger = true;
+                    } else {
+                        match crate::agent::channel_dispatch::spawn_worker_from_state(
+                            &self.state,
+                            conclusion.trim(),
+                            pending_spawn.interactive,
+                            &pending_spawn
+                                .suggested_skills
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                            &pending_spawn.topic_ids,
+                        )
+                        .await
+                        {
+                            Ok(worker_id) => {
+                                tracing::info!(
+                                    branch_id = %branch_id,
+                                    worker_id = %worker_id,
+                                    original_task = %pending_spawn.original_task,
+                                    "branch_and_spawn preparation completed and worker started"
+                                );
+                            }
+                            Err(error) => {
+                                self.pending_results.push(PendingResult {
+                                    process_type: "branch",
+                                    process_id: branch_id.to_string(),
+                                    result: format!(
+                                        "Prepared work could not be started automatically. {error}"
+                                    ),
+                                    success: false,
+                                    request_group_id,
+                                    request_group_origin: request_group_summary
+                                        .as_ref()
+                                        .map(|value| value.0.clone()),
+                                    source_manifest_summary: request_group_summary
+                                        .as_ref()
+                                        .and_then(|value| value.1.clone()),
+                                });
+                                should_retrigger = true;
+                            }
+                        }
+                    }
                 } else {
                     // Regular branch: accumulate result for the next retrigger.
                     // The result text will be embedded directly in the retrigger

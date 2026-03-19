@@ -12,6 +12,7 @@ interface/public/opencode-embed/
 .idea
 list/
 agents/
+update_docs/
 
 # Nix
 result/

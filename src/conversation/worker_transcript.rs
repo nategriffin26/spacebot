@@ -9,10 +9,12 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::io::{Read, Write};
 
 /// Maximum byte length for tool call arguments in transcripts.
 const MAX_TOOL_ARGS_BYTES: usize = 2_000;
+const TRANSCRIPT_VERSION: u32 = 2;
 
 /// A single step in a worker transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,30 @@ pub enum ActionContent {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TranscriptEnvelope {
+    version: u32,
+    checksum_sha256: String,
+    steps: Vec<TranscriptStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptHealth {
+    Valid,
+    LegacyFormat,
+    InvalidChecksum,
+    DecodeFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptInspection {
+    pub steps: Vec<TranscriptStep>,
+    pub version: Option<u32>,
+    pub checksum_sha256: Option<String>,
+    pub health: TranscriptHealth,
+}
+
 /// Convert a Rig message history to transcript steps, serialize as JSON, and gzip compress.
 pub fn serialize_transcript(history: &[rig::message::Message]) -> Vec<u8> {
     let steps = convert_history(history);
@@ -59,20 +85,53 @@ pub fn serialize_transcript(history: &[rig::message::Message]) -> Vec<u8> {
 /// Used by OpenCode workers that build transcript steps directly from SSE
 /// events rather than from a Rig message history.
 pub fn serialize_steps(steps: &[TranscriptStep]) -> Vec<u8> {
-    let json = serde_json::to_vec(steps).unwrap_or_default();
+    let steps_json = serde_json::to_vec(steps).unwrap_or_default();
+    let checksum_sha256 = format!("{:x}", Sha256::digest(&steps_json));
+    let envelope_json = serde_json::to_vec(&TranscriptEnvelope {
+        version: TRANSCRIPT_VERSION,
+        checksum_sha256,
+        steps: steps.to_vec(),
+    })
+    .unwrap_or(steps_json);
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&json).ok();
+    encoder.write_all(&envelope_json).ok();
     encoder.finish().unwrap_or_default()
 }
 
 /// Decompress and deserialize a gzipped transcript blob.
 pub fn deserialize_transcript(blob: &[u8]) -> anyhow::Result<Vec<TranscriptStep>> {
+    Ok(inspect_transcript(blob)?.steps)
+}
+
+/// Inspect a transcript blob and return decoded steps plus health metadata.
+pub fn inspect_transcript(blob: &[u8]) -> anyhow::Result<TranscriptInspection> {
     let mut decoder = GzDecoder::new(blob);
     let mut json = Vec::new();
     decoder.read_to_end(&mut json)?;
+    if let Ok(envelope) = serde_json::from_slice::<TranscriptEnvelope>(&json) {
+        let steps_json = serde_json::to_vec(&envelope.steps)?;
+        let checksum_sha256 = format!("{:x}", Sha256::digest(&steps_json));
+        let health = if checksum_sha256 == envelope.checksum_sha256 {
+            TranscriptHealth::Valid
+        } else {
+            TranscriptHealth::InvalidChecksum
+        };
+        return Ok(TranscriptInspection {
+            steps: envelope.steps,
+            version: Some(envelope.version),
+            checksum_sha256: Some(envelope.checksum_sha256),
+            health,
+        });
+    }
+
     let steps: Vec<TranscriptStep> = serde_json::from_slice(&json)?;
-    Ok(steps)
+    Ok(TranscriptInspection {
+        steps,
+        version: None,
+        checksum_sha256: None,
+        health: TranscriptHealth::LegacyFormat,
+    })
 }
 
 /// Convert OpenCode messages (from `GET /session/:id/message`) into transcript

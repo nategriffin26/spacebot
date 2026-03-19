@@ -70,7 +70,13 @@ pub(super) struct WorkerDetailResponse {
     started_at: String,
     completed_at: Option<String>,
     transcript: Option<Vec<worker_transcript::TranscriptStep>>,
+    transcript_health: Option<String>,
+    transcript_version: Option<u32>,
+    transcript_checksum_sha256: Option<String>,
     tool_calls: i64,
+    receipt_present: bool,
+    receipt: Option<crate::WorkerOutcomeReceipt>,
+    terminal_reason: Option<String>,
     /// OpenCode session ID (for workers with an embeddable web UI).
     opencode_session_id: Option<String>,
     /// OpenCode server port (for workers with an embeddable web UI).
@@ -170,18 +176,34 @@ pub(super) async fn worker_detail(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let transcript = match detail.transcript_blob.as_deref() {
-        Some(blob) => worker_transcript::deserialize_transcript(blob)
+    let transcript_inspection = match detail.transcript_blob.as_deref() {
+        Some(blob) => worker_transcript::inspect_transcript(blob)
             .map_err(|error| {
-                tracing::warn!(%error, worker_id = %query.worker_id, "failed to decompress transcript");
+                tracing::warn!(%error, worker_id = %query.worker_id, "failed to inspect transcript");
             })
             .ok(),
         None => {
             // No persisted transcript yet — check the live transcript cache
             // so page refreshes can recover in-progress worker transcripts.
-            state.get_live_transcript(&query.worker_id).await
+            state
+                .get_live_transcript(&query.worker_id)
+                .await
+                .map(|steps| worker_transcript::TranscriptInspection {
+                    steps,
+                    version: None,
+                    checksum_sha256: None,
+                    health: worker_transcript::TranscriptHealth::LegacyFormat,
+                })
         }
     };
+    let receipt = detail
+        .outcome_receipt_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<crate::WorkerOutcomeReceipt>(value).ok());
+    let terminal_reason = receipt
+        .as_ref()
+        .and_then(|receipt| receipt.terminal_reason)
+        .map(|value| value.as_str().to_string());
 
     Ok(Json(WorkerDetailResponse {
         id: detail.id,
@@ -193,8 +215,23 @@ pub(super) async fn worker_detail(
         channel_name: detail.channel_name,
         started_at: detail.started_at,
         completed_at: detail.completed_at,
-        transcript,
+        transcript: transcript_inspection
+            .as_ref()
+            .map(|inspection| inspection.steps.clone()),
+        transcript_health: transcript_inspection
+            .as_ref()
+            .map(|inspection| serde_json::to_string(&inspection.health).unwrap_or_default())
+            .map(|value| value.trim_matches('"').to_string()),
+        transcript_version: transcript_inspection
+            .as_ref()
+            .and_then(|inspection| inspection.version),
+        transcript_checksum_sha256: transcript_inspection
+            .as_ref()
+            .and_then(|inspection| inspection.checksum_sha256.clone()),
         tool_calls: detail.tool_calls,
+        receipt_present: receipt.is_some(),
+        receipt,
+        terminal_reason,
         opencode_session_id: detail.opencode_session_id,
         opencode_port: detail.opencode_port,
         interactive: detail.interactive,
