@@ -316,6 +316,40 @@ pub(super) struct TomlRoutingConfig {
     #[serde(default)]
     pub(super) task_overrides: HashMap<String, String>,
     pub(super) fallbacks: Option<HashMap<String, Vec<String>>>,
+    pub(super) prompt_routing: Option<TomlPromptRoutingConfig>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlPromptRoutingConfig {
+    pub(super) enabled: Option<bool>,
+    pub(super) process_types: Option<Vec<String>>,
+    pub(super) tiers: Option<TomlPromptRoutingTiers>,
+    pub(super) boundaries: Option<TomlPromptRoutingBoundaries>,
+    pub(super) weights: Option<TomlPromptRoutingWeights>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlPromptRoutingTiers {
+    pub(super) light: Option<String>,
+    pub(super) standard: Option<String>,
+    pub(super) heavy: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlPromptRoutingBoundaries {
+    pub(super) light_standard: Option<f32>,
+    pub(super) standard_heavy: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlPromptRoutingWeights {
+    pub(super) token_count: Option<f32>,
+    pub(super) code_presence: Option<f32>,
+    pub(super) reasoning: Option<f32>,
+    pub(super) technical: Option<f32>,
+    pub(super) constraints: Option<f32>,
+    pub(super) multi_step: Option<f32>,
+    pub(super) simple: Option<f32>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -364,6 +398,11 @@ pub(super) struct TomlCortexConfig {
     pub(super) tick_interval_secs: Option<u64>,
     pub(super) worker_timeout_secs: Option<u64>,
     pub(super) branch_timeout_secs: Option<u64>,
+    pub(super) autonomy_enabled: Option<bool>,
+    pub(super) autonomy_interval_secs: Option<u64>,
+    pub(super) autonomy_max_turns: Option<usize>,
+    pub(super) autonomy_max_workers: Option<usize>,
+    pub(super) autonomy_tasks_require_approval: Option<bool>,
     pub(super) topic_sync_interval_secs: Option<u64>,
     pub(super) detached_worker_timeout_retry_limit: Option<u8>,
     pub(super) supervisor_kill_budget_per_tick: Option<usize>,

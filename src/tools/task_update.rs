@@ -71,6 +71,14 @@ pub struct TaskUpdateArgs {
     pub complete_subtask: Option<i32>,
     pub worker_id: Option<String>,
     pub approved_by: Option<String>,
+    pub risk_class: Option<String>,
+    pub risk_reason: Option<String>,
+    pub source: Option<String>,
+    pub source_memory_ids: Option<Vec<String>>,
+    pub origin_process: Option<String>,
+    pub origin_worker_id: Option<String>,
+    pub requires_approval: Option<bool>,
+    pub auto_ready_allowed: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,7 +154,23 @@ impl Tool for TaskUpdateTool {
                     "metadata": { "type": "object", "description": "Metadata object merged with current metadata" },
                     "complete_subtask": { "type": "integer", "description": "Subtask index to mark complete" },
                     "worker_id": { "type": "string", "description": "Optional worker ID to bind to this task" },
-                    "approved_by": { "type": "string", "description": "Optional approver identifier" }
+                    "approved_by": { "type": "string", "description": "Optional approver identifier" },
+                    "risk_class": {
+                        "type": "string",
+                        "enum": ["observe_only", "read_only_external", "local_reversible_write", "privileged_or_external_mutation"],
+                        "description": "Optional autonomy risk class."
+                    },
+                    "risk_reason": { "type": "string", "description": "Optional autonomy risk explanation." },
+                    "source": { "type": "string", "description": "Optional stable source label." },
+                    "source_memory_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional source memory IDs."
+                    },
+                    "origin_process": { "type": "string", "description": "Optional origin process label." },
+                    "origin_worker_id": { "type": "string", "description": "Optional originating worker ID." },
+                    "requires_approval": { "type": "boolean", "description": "Whether approval is still required." },
+                    "auto_ready_allowed": { "type": "boolean", "description": "Whether the task may auto-start safely." }
                 },
                 "required": ["task_number"]
             })
@@ -252,6 +276,23 @@ impl Tool for TaskUpdateTool {
                     .map_err(|_| TaskUpdateError(format!("invalid subtask index: {value}")))?,
             ),
         };
+        let risk_class = match args.risk_class.as_deref() {
+            None => None,
+            Some(value) => Some(
+                crate::tasks::TaskRiskClass::parse(value)
+                    .ok_or_else(|| TaskUpdateError(format!("invalid risk_class: {value}")))?,
+            ),
+        };
+        let autonomy = crate::tasks::TaskAutonomyContext {
+            source: args.source,
+            source_memory_ids: args.source_memory_ids.unwrap_or_default(),
+            origin_process: args.origin_process,
+            origin_worker_id: args.origin_worker_id,
+            risk_class,
+            risk_reason: args.risk_reason,
+            requires_approval: args.requires_approval.unwrap_or(false),
+            auto_ready_allowed: args.auto_ready_allowed.unwrap_or(false),
+        };
 
         let updated = self
             .task_store
@@ -269,6 +310,7 @@ impl Tool for TaskUpdateTool {
                     clear_worker_id: false,
                     approved_by: args.approved_by,
                     complete_subtask,
+                    autonomy: autonomy.is_meaningful().then_some(autonomy),
                 },
             )
             .await
@@ -354,6 +396,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "cortex".to_string(),
+                autonomy: None,
             })
             .await
             .expect("task should be created");
@@ -379,6 +422,14 @@ mod tests {
                 complete_subtask: None,
                 worker_id: None,
                 approved_by: None,
+                risk_class: None,
+                risk_reason: None,
+                source: None,
+                source_memory_ids: None,
+                origin_process: None,
+                origin_worker_id: None,
+                requires_approval: None,
+                auto_ready_allowed: None,
             })
             .await
             .expect_err("CorPilot should block core rewrites for in-progress tasks");
@@ -416,6 +467,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "cortex".to_string(),
+                autonomy: None,
             })
             .await
             .expect("task should be created");
@@ -438,6 +490,14 @@ mod tests {
                 complete_subtask: None,
                 worker_id: None,
                 approved_by: None,
+                risk_class: None,
+                risk_reason: None,
+                source: None,
+                source_memory_ids: None,
+                origin_process: None,
+                origin_worker_id: None,
+                requires_approval: None,
+                auto_ready_allowed: None,
             })
             .await
             .expect("status-only update should succeed");

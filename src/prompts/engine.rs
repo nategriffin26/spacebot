@@ -22,6 +22,8 @@ pub struct RetriggerResult {
     pub request_group_origin: Option<String>,
     /// Compact source-manifest summary for source-sensitive work.
     pub source_manifest_summary: Option<String>,
+    /// Confirmed artifact outcomes from a worker receipt, when present.
+    pub artifact_summary: Option<String>,
 }
 
 /// Template engine for rendering system prompts with dynamic variables.

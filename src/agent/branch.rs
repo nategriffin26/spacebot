@@ -105,7 +105,19 @@ impl Branch {
         self.maybe_compact_history();
 
         let routing = self.deps.runtime_config.routing.load();
-        let model_name = routing.resolve(ProcessType::Branch, None).to_string();
+        let routing_decision =
+            routing.resolve_with_prompt(ProcessType::Branch, None, Some(&prompt));
+        if let Some(tier) = routing_decision.prompt_tier {
+            tracing::debug!(
+                branch_id = %self.id,
+                tier = tier.as_str(),
+                score = routing_decision.prompt_score.unwrap_or_default(),
+                reason = routing_decision.resolution_reason,
+                model = routing_decision.model_name,
+                "branch prompt routing applied"
+            );
+        }
+        let model_name = routing_decision.model_name.to_string();
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(&*self.deps.agent_id, "branch")
             .with_rig_alignment((**self.deps.runtime_config.rig_alignment.load()).clone())

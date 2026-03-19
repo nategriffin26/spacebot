@@ -3822,6 +3822,13 @@ async fn initialize_agents(
         cortex_handles.push(ready_task_handle);
         tracing::info!(agent_id = %agent_id, "cortex ready-task loop started");
 
+        let autonomy_handle = spacebot::agent::cortex::spawn_autonomy_loop(
+            agent.deps.clone(),
+            spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone()),
+        );
+        cortex_handles.push(autonomy_handle);
+        tracing::info!(agent_id = %agent_id, "cortex autonomy loop started");
+
         let topic_sync_handle = spacebot::agent::cortex::spawn_topic_sync_loop(
             agent.deps.clone(),
             spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone()),

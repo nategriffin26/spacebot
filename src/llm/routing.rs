@@ -3,6 +3,99 @@
 use crate::ProcessType;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+pub struct PromptRoutingConfig {
+    pub enabled: bool,
+    pub process_types: Vec<ProcessType>,
+    pub tiers: PromptRoutingTiers,
+    pub boundaries: PromptRoutingBoundaries,
+    pub weights: PromptRoutingWeights,
+}
+
+impl Default for PromptRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            process_types: vec![ProcessType::Channel, ProcessType::Branch],
+            tiers: PromptRoutingTiers::default(),
+            boundaries: PromptRoutingBoundaries::default(),
+            weights: PromptRoutingWeights::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PromptRoutingTiers {
+    pub light: Option<String>,
+    pub standard: Option<String>,
+    pub heavy: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PromptRoutingBoundaries {
+    pub light_standard: f32,
+    pub standard_heavy: f32,
+}
+
+impl Default for PromptRoutingBoundaries {
+    fn default() -> Self {
+        Self {
+            light_standard: 0.8,
+            standard_heavy: 2.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PromptRoutingWeights {
+    pub token_count: f32,
+    pub code_presence: f32,
+    pub reasoning: f32,
+    pub technical: f32,
+    pub constraints: f32,
+    pub multi_step: f32,
+    pub simple: f32,
+}
+
+impl Default for PromptRoutingWeights {
+    fn default() -> Self {
+        Self {
+            token_count: 0.5,
+            code_presence: 0.7,
+            reasoning: 0.8,
+            technical: 0.5,
+            constraints: 0.6,
+            multi_step: 0.7,
+            simple: -0.9,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRoutingTier {
+    Light,
+    Standard,
+    Heavy,
+}
+
+impl PromptRoutingTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Standard => "standard",
+            Self::Heavy => "heavy",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutingDecision<'a> {
+    pub model_name: &'a str,
+    pub prompt_tier: Option<PromptRoutingTier>,
+    pub prompt_score: Option<f32>,
+    pub resolution_reason: &'static str,
+}
+
 /// Model routing configuration. Lives on the agent config (via defaults).
 /// Determines which LLM model each process type uses, with task-type
 /// overrides for workers/branches and fallback chains for resilience.
@@ -32,6 +125,7 @@ pub struct RoutingConfig {
     pub worker_thinking_effort: String,
     pub compactor_thinking_effort: String,
     pub cortex_thinking_effort: String,
+    pub prompt_routing: PromptRoutingConfig,
 }
 
 impl Default for RoutingConfig {
@@ -58,6 +152,7 @@ impl RoutingConfig {
             worker_thinking_effort: "auto".into(),
             compactor_thinking_effort: "auto".into(),
             cortex_thinking_effort: "auto".into(),
+            prompt_routing: PromptRoutingConfig::default(),
         }
     }
 }
@@ -65,12 +160,27 @@ impl RoutingConfig {
 impl RoutingConfig {
     /// Resolve the model name for a process type and optional task type.
     pub fn resolve(&self, process_type: ProcessType, task_type: Option<&str>) -> &str {
+        self.resolve_with_prompt(process_type, task_type, None)
+            .model_name
+    }
+
+    pub fn resolve_with_prompt<'a>(
+        &'a self,
+        process_type: ProcessType,
+        task_type: Option<&str>,
+        prompt_text: Option<&str>,
+    ) -> RoutingDecision<'a> {
         // Check task-type override first (only for workers and branches)
         if let Some(task) = task_type
             && matches!(process_type, ProcessType::Worker | ProcessType::Branch)
             && let Some(override_model) = self.task_overrides.get(task)
         {
-            return override_model;
+            return RoutingDecision {
+                model_name: override_model,
+                prompt_tier: None,
+                prompt_score: None,
+                resolution_reason: "task_override",
+            };
         }
 
         if let Some(task) = task_type
@@ -83,15 +193,39 @@ impl RoutingConfig {
                     | "multi_lane_synthesis"
             )
         {
-            return &self.branch;
+            return RoutingDecision {
+                model_name: &self.branch,
+                prompt_tier: None,
+                prompt_score: None,
+                resolution_reason: "task_class_bias",
+            };
         }
 
-        match process_type {
+        if let Some(prompt_text) = prompt_text
+            && let Some((tier, score)) = self.classify_prompt_tier(prompt_text, process_type)
+            && let Some(model_name) = self.model_for_prompt_tier(tier, process_type)
+        {
+            return RoutingDecision {
+                model_name,
+                prompt_tier: Some(tier),
+                prompt_score: Some(score),
+                resolution_reason: "prompt_routing",
+            };
+        }
+
+        let model_name = match process_type {
             ProcessType::Channel => &self.channel,
             ProcessType::Branch => &self.branch,
             ProcessType::Worker => &self.worker,
             ProcessType::Compactor => &self.compactor,
             ProcessType::Cortex => &self.cortex,
+        };
+
+        RoutingDecision {
+            model_name,
+            prompt_tier: None,
+            prompt_score: None,
+            resolution_reason: "process_default",
         }
     }
 
@@ -120,6 +254,131 @@ impl RoutingConfig {
             .get(model_name)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn classify_prompt_tier(
+        &self,
+        prompt_text: &str,
+        process_type: ProcessType,
+    ) -> Option<(PromptRoutingTier, f32)> {
+        let config = &self.prompt_routing;
+        if !config.enabled || !config.process_types.contains(&process_type) {
+            return None;
+        }
+
+        let lower = prompt_text.to_ascii_lowercase();
+        let weights = config.weights;
+        let mut score = score_token_count(prompt_text) * weights.token_count;
+        score += score_keywords(&lower, CODE_KEYWORDS) * weights.code_presence;
+        score += score_keywords(&lower, REASONING_KEYWORDS) * weights.reasoning;
+        score += score_keywords(&lower, TECHNICAL_KEYWORDS) * weights.technical;
+        score += score_keywords(&lower, CONSTRAINT_KEYWORDS) * weights.constraints;
+        score += score_multi_step(&lower) * weights.multi_step;
+        score += score_keywords(&lower, SIMPLE_KEYWORDS) * weights.simple;
+
+        let tier = if score < config.boundaries.light_standard {
+            PromptRoutingTier::Light
+        } else if score >= config.boundaries.standard_heavy {
+            PromptRoutingTier::Heavy
+        } else {
+            PromptRoutingTier::Standard
+        };
+
+        Some((tier, score))
+    }
+
+    fn model_for_prompt_tier(
+        &self,
+        tier: PromptRoutingTier,
+        process_type: ProcessType,
+    ) -> Option<&str> {
+        let default_model = match process_type {
+            ProcessType::Channel => self.channel.as_str(),
+            ProcessType::Branch => self.branch.as_str(),
+            ProcessType::Worker => self.worker.as_str(),
+            ProcessType::Compactor => self.compactor.as_str(),
+            ProcessType::Cortex => self.cortex.as_str(),
+        };
+
+        match tier {
+            PromptRoutingTier::Light => self
+                .prompt_routing
+                .tiers
+                .light
+                .as_deref()
+                .or(Some(default_model)),
+            PromptRoutingTier::Standard => self
+                .prompt_routing
+                .tiers
+                .standard
+                .as_deref()
+                .or(Some(default_model)),
+            PromptRoutingTier::Heavy => self
+                .prompt_routing
+                .tiers
+                .heavy
+                .as_deref()
+                .or(Some(default_model)),
+        }
+    }
+}
+
+const CODE_KEYWORDS: &[&str] = &[
+    "code",
+    "rust",
+    "python",
+    "typescript",
+    "compile",
+    "test",
+    "debug",
+    "refactor",
+    "build",
+    "implementation",
+];
+const REASONING_KEYWORDS: &[&str] = &[
+    "why",
+    "analyze",
+    "compare",
+    "tradeoff",
+    "deep dive",
+    "root cause",
+    "investigate",
+    "verify",
+];
+const TECHNICAL_KEYWORDS: &[&str] = &[
+    "api",
+    "config",
+    "schema",
+    "migration",
+    "architecture",
+    "capability",
+    "memory",
+    "worker",
+];
+const CONSTRAINT_KEYWORDS: &[&str] = &[
+    "must", "should", "without", "do not", "never", "exactly", "fully",
+];
+const SIMPLE_KEYWORDS: &[&str] = &["hi", "hello", "thanks", "what time", "quickly", "simple"];
+const MULTI_STEP_HINTS: &[&str] = &["1.", "2.", "first", "then", "after that", "finally"];
+
+fn score_keywords(lower: &str, keywords: &[&str]) -> f32 {
+    keywords
+        .iter()
+        .filter(|keyword| lower.contains(**keyword))
+        .count() as f32
+}
+
+fn score_multi_step(lower: &str) -> f32 {
+    score_keywords(lower, MULTI_STEP_HINTS).min(3.0)
+}
+
+fn score_token_count(text: &str) -> f32 {
+    let tokens = text.split_whitespace().count();
+    match tokens {
+        0..=24 => 0.0,
+        25..=79 => 0.7,
+        80..=199 => 1.3,
+        _ => 2.0,
     }
 }
 

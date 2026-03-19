@@ -29,6 +29,18 @@ const MAX_OVERFLOW_RETRIES: usize = 3;
 /// without completing the task.
 const MAX_SEGMENTS: usize = 10;
 
+fn context_budget_status(usage: f32) -> Option<&'static str> {
+    if usage >= 0.85 {
+        Some("context budget high (85%)")
+    } else if usage >= 0.70 {
+        Some("context budget elevated (70%)")
+    } else if usage >= 0.50 {
+        Some("context budget warming (50%)")
+    } else {
+        None
+    }
+}
+
 /// Worker state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
@@ -599,6 +611,10 @@ impl Worker {
         let context_window = **self.deps.runtime_config.context_window.load();
         let estimated = estimate_history_tokens(history);
         let usage = estimated as f32 / context_window as f32;
+
+        if let Some(status) = context_budget_status(usage) {
+            self.hook.send_status(status);
+        }
 
         if usage < 0.70 {
             return;

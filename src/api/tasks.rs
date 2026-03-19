@@ -40,6 +40,22 @@ pub(super) struct CreateTaskRequest {
     source_memory_id: Option<String>,
     #[serde(default)]
     created_by: Option<String>,
+    #[serde(default)]
+    risk_class: Option<String>,
+    #[serde(default)]
+    risk_reason: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_memory_ids: Vec<String>,
+    #[serde(default)]
+    origin_process: Option<String>,
+    #[serde(default)]
+    origin_worker_id: Option<String>,
+    #[serde(default)]
+    requires_approval: Option<bool>,
+    #[serde(default)]
+    auto_ready_allowed: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +79,22 @@ pub(super) struct UpdateTaskRequest {
     worker_id: Option<String>,
     #[serde(default)]
     approved_by: Option<String>,
+    #[serde(default)]
+    risk_class: Option<String>,
+    #[serde(default)]
+    risk_reason: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_memory_ids: Option<Vec<String>>,
+    #[serde(default)]
+    origin_process: Option<String>,
+    #[serde(default)]
+    origin_worker_id: Option<String>,
+    #[serde(default)]
+    requires_approval: Option<bool>,
+    #[serde(default)]
+    auto_ready_allowed: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +120,47 @@ pub(super) struct TaskActionResponse {
 
 fn default_task_limit() -> i64 {
     20
+}
+
+fn parse_risk_class(value: Option<&str>) -> Option<crate::tasks::TaskRiskClass> {
+    value.and_then(crate::tasks::TaskRiskClass::parse)
+}
+
+fn build_create_autonomy(
+    status: crate::tasks::TaskStatus,
+    request: &CreateTaskRequest,
+) -> Option<crate::tasks::TaskAutonomyContext> {
+    let autonomy = crate::tasks::TaskAutonomyContext {
+        source: request.source.clone(),
+        source_memory_ids: request.source_memory_ids.clone(),
+        origin_process: request.origin_process.clone(),
+        origin_worker_id: request.origin_worker_id.clone(),
+        risk_class: parse_risk_class(request.risk_class.as_deref()),
+        risk_reason: request.risk_reason.clone(),
+        requires_approval: request
+            .requires_approval
+            .unwrap_or(status == crate::tasks::TaskStatus::PendingApproval),
+        auto_ready_allowed: request
+            .auto_ready_allowed
+            .unwrap_or(status == crate::tasks::TaskStatus::Ready),
+    };
+
+    autonomy.is_meaningful().then_some(autonomy)
+}
+
+fn build_update_autonomy(request: &UpdateTaskRequest) -> Option<crate::tasks::TaskAutonomyContext> {
+    let autonomy = crate::tasks::TaskAutonomyContext {
+        source: request.source.clone(),
+        source_memory_ids: request.source_memory_ids.clone().unwrap_or_default(),
+        origin_process: request.origin_process.clone(),
+        origin_worker_id: request.origin_worker_id.clone(),
+        risk_class: parse_risk_class(request.risk_class.as_deref()),
+        risk_reason: request.risk_reason.clone(),
+        requires_approval: request.requires_approval.unwrap_or(false),
+        auto_ready_allowed: request.auto_ready_allowed.unwrap_or(false),
+    };
+
+    autonomy.is_meaningful().then_some(autonomy)
 }
 
 pub(super) async fn list_tasks(
@@ -154,6 +227,7 @@ pub(super) async fn create_task(
         None => crate::tasks::TaskPriority::Medium,
         Some(value) => crate::tasks::TaskPriority::parse(value).ok_or(StatusCode::BAD_REQUEST)?,
     };
+    let autonomy = build_create_autonomy(status, &request);
 
     let task = store
         .create(crate::tasks::CreateTaskInput {
@@ -166,6 +240,7 @@ pub(super) async fn create_task(
             metadata: request.metadata.unwrap_or_else(|| serde_json::json!({})),
             source_memory_id: request.source_memory_id,
             created_by: request.created_by.unwrap_or_else(|| "human".to_string()),
+            autonomy,
         })
         .await
         .map_err(|error| {
@@ -204,6 +279,7 @@ pub(super) async fn update_task(
             Some(crate::tasks::TaskPriority::parse(value).ok_or(StatusCode::BAD_REQUEST)?)
         }
     };
+    let autonomy = build_update_autonomy(&request);
 
     let task = store
         .update(
@@ -220,6 +296,7 @@ pub(super) async fn update_task(
                 clear_worker_id: false,
                 approved_by: request.approved_by,
                 complete_subtask: request.complete_subtask,
+                autonomy,
             },
         )
         .await

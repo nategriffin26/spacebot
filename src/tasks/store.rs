@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row as _, SqlitePool};
 
+const TASK_AUTONOMY_KEY: &str = "autonomy";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -97,6 +99,75 @@ impl std::fmt::Display for TaskPriority {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRiskClass {
+    ObserveOnly,
+    ReadOnlyExternal,
+    LocalReversibleWrite,
+    PrivilegedOrExternalMutation,
+}
+
+impl TaskRiskClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ObserveOnly => "observe_only",
+            Self::ReadOnlyExternal => "read_only_external",
+            Self::LocalReversibleWrite => "local_reversible_write",
+            Self::PrivilegedOrExternalMutation => "privileged_or_external_mutation",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "observe_only" => Some(Self::ObserveOnly),
+            "read_only_external" => Some(Self::ReadOnlyExternal),
+            "local_reversible_write" => Some(Self::LocalReversibleWrite),
+            "privileged_or_external_mutation" => Some(Self::PrivilegedOrExternalMutation),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskRiskClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TaskAutonomyContext {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_memory_ids: Vec<String>,
+    #[serde(default)]
+    pub origin_process: Option<String>,
+    #[serde(default)]
+    pub origin_worker_id: Option<String>,
+    #[serde(default)]
+    pub risk_class: Option<TaskRiskClass>,
+    #[serde(default)]
+    pub risk_reason: Option<String>,
+    #[serde(default)]
+    pub requires_approval: bool,
+    #[serde(default)]
+    pub auto_ready_allowed: bool,
+}
+
+impl TaskAutonomyContext {
+    pub fn is_meaningful(&self) -> bool {
+        self.source.is_some()
+            || !self.source_memory_ids.is_empty()
+            || self.origin_process.is_some()
+            || self.origin_worker_id.is_some()
+            || self.risk_class.is_some()
+            || self.risk_reason.is_some()
+            || self.requires_approval
+            || self.auto_ready_allowed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TaskSubtask {
     pub title: String,
@@ -122,6 +193,7 @@ pub struct Task {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    pub autonomy: Option<TaskAutonomyContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +207,7 @@ pub struct CreateTaskInput {
     pub metadata: Value,
     pub source_memory_id: Option<String>,
     pub created_by: String,
+    pub autonomy: Option<TaskAutonomyContext>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +222,7 @@ pub struct UpdateTaskInput {
     pub clear_worker_id: bool,
     pub approved_by: Option<String>,
     pub complete_subtask: Option<usize>,
+    pub autonomy: Option<TaskAutonomyContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +242,7 @@ impl TaskStore {
     pub async fn create(&self, input: CreateTaskInput) -> Result<Task> {
         let subtasks_json =
             serde_json::to_string(&input.subtasks).context("failed to serialize subtasks")?;
-        let metadata_json = input.metadata.to_string();
+        let metadata_json = encode_autonomy_metadata(input.metadata, input.autonomy)?.to_string();
 
         for attempt in 0..Self::MAX_CREATE_RETRIES {
             let mut tx = self
@@ -333,6 +407,7 @@ impl TaskStore {
         let next_status = input.status.unwrap_or(current.status);
         let next_priority = input.priority.unwrap_or(current.priority);
         let next_metadata = merge_json_object(current.metadata, input.metadata);
+        let next_metadata = encode_autonomy_metadata(next_metadata, input.autonomy)?;
         let next_worker_id = if let Some(worker_id) = input.worker_id {
             Some(worker_id)
         } else {
@@ -505,6 +580,36 @@ fn parse_metadata(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
 }
 
+fn encode_autonomy_metadata(
+    metadata: Value,
+    autonomy: Option<TaskAutonomyContext>,
+) -> Result<Value> {
+    let mut object = metadata.as_object().cloned().unwrap_or_default();
+    match autonomy {
+        Some(autonomy) if autonomy.is_meaningful() => {
+            object.insert(
+                TASK_AUTONOMY_KEY.to_string(),
+                serde_json::to_value(autonomy)
+                    .context("failed to encode task autonomy metadata")?,
+            );
+        }
+        Some(_) => {}
+        None => {
+            if !object.contains_key(TASK_AUTONOMY_KEY) && !object.is_empty() {
+                return Ok(Value::Object(object));
+            }
+        }
+    }
+    Ok(Value::Object(object))
+}
+
+fn parse_task_autonomy(metadata: &Value) -> Option<TaskAutonomyContext> {
+    metadata
+        .get(TASK_AUTONOMY_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
     let status_value: String = row
         .try_get("status")
@@ -520,6 +625,9 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
     let priority = TaskPriority::parse(&priority_value)
         .with_context(|| format!("invalid task priority in database: {priority_value}"))?;
 
+    let metadata = parse_metadata(&metadata_value);
+    let autonomy = parse_task_autonomy(&metadata);
+
     Ok(Task {
         id: row.try_get("id").context("failed to read task id")?,
         agent_id: row
@@ -533,7 +641,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
         status,
         priority,
         subtasks: parse_subtasks(&subtasks_value),
-        metadata: parse_metadata(&metadata_value),
+        metadata,
         source_memory_id: row.try_get("source_memory_id").ok(),
         worker_id: row
             .try_get::<Option<String>, _>("worker_id")
@@ -561,6 +669,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .try_get::<chrono::NaiveDateTime, _>("completed_at")
             .ok()
             .map(|v| v.and_utc().to_rfc3339()),
+        autonomy,
     })
 }
 
@@ -621,6 +730,10 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "cortex".to_string(),
+                autonomy: Some(TaskAutonomyContext {
+                    requires_approval: true,
+                    ..TaskAutonomyContext::default()
+                }),
             })
             .await
             .expect("task should be created");
@@ -654,6 +767,10 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "branch".to_string(),
+                autonomy: Some(TaskAutonomyContext {
+                    auto_ready_allowed: true,
+                    ..TaskAutonomyContext::default()
+                }),
             })
             .await
             .expect("task should be created");

@@ -476,8 +476,10 @@ impl SpacebotHook {
     }
 
     pub(crate) fn emit_tool_completed_event(&self, tool_name: &str, result: &str) {
-        let capped_result =
-            crate::tools::truncate_output(result, crate::tools::MAX_TOOL_OUTPUT_BYTES);
+        let capped_result = crate::tools::truncate_output(
+            result,
+            crate::tools::tool_output_budget_bytes(tool_name),
+        );
         self.emit_tool_completed_event_from_capped(tool_name, capped_result);
     }
 
@@ -823,8 +825,10 @@ where
         // don't reach the SSE dashboard.
         if matches!(self.process_type, ProcessType::Worker | ProcessType::Branch) {
             let scrubbed = crate::secrets::scrub::scrub_leaks(result);
-            let capped =
-                crate::tools::truncate_output(&scrubbed, crate::tools::MAX_TOOL_OUTPUT_BYTES);
+            let capped = crate::tools::truncate_output(
+                &scrubbed,
+                crate::tools::tool_output_budget_bytes(tool_name),
+            );
             self.emit_tool_completed_event_from_capped(tool_name, capped);
         } else {
             self.emit_tool_completed_event(tool_name, result);

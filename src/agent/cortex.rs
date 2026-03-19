@@ -2703,6 +2703,45 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
         return Ok(());
     };
 
+    if task
+        .autonomy
+        .as_ref()
+        .is_some_and(|autonomy| autonomy.requires_approval)
+    {
+        deps.task_store
+            .update(
+                &deps.agent_id,
+                task.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::PendingApproval),
+                    clear_worker_id: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        logger.log(
+            "task_pickup_blocked_pending_approval",
+            &format!(
+                "Returned ready task #{} to pending_approval because autonomy metadata still requires approval",
+                task.task_number
+            ),
+            Some(serde_json::json!({
+                "task_number": task.task_number,
+                "title": task.title,
+            })),
+        );
+
+        let _ = deps.event_tx.send(ProcessEvent::TaskUpdated {
+            agent_id: deps.agent_id.clone(),
+            task_number: task.task_number,
+            status: TaskStatus::PendingApproval.to_string(),
+            action: "updated".to_string(),
+        });
+
+        return Ok(());
+    }
+
     logger.log(
         "task_pickup_started",
         &format!("Picked up ready task #{}", task.task_number),
@@ -3314,6 +3353,288 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
             .unregister_detached_worker(worker_id)
             .await;
     });
+
+    Ok(())
+}
+
+pub fn spawn_autonomy_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = run_autonomy_loop(&deps, &logger).await {
+            tracing::error!(%error, "cortex autonomy loop exited with error");
+        }
+    })
+}
+
+async fn run_autonomy_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow::Result<()> {
+    tracing::info!("cortex autonomy loop started");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    loop {
+        let config = **deps.runtime_config.cortex.load();
+        tokio::time::sleep(Duration::from_secs(config.autonomy_interval_secs.max(60))).await;
+
+        let config = **deps.runtime_config.cortex.load();
+        if !config.autonomy_enabled {
+            continue;
+        }
+
+        if let Err(error) = run_one_autonomy_cycle(deps, logger, config).await {
+            tracing::warn!(%error, "autonomy cycle failed");
+            logger.log(
+                "autonomy_cycle_failed",
+                &format!("Autonomy cycle failed: {error}"),
+                None,
+            );
+        }
+    }
+}
+
+fn summarize_capability_snapshot(
+    snapshot: &crate::tooling::CapabilitySnapshot,
+    doctor: &crate::tooling::ToolDoctorReport,
+) -> String {
+    let mut lines = vec![format!(
+        "available={} degraded={} unavailable={}",
+        snapshot.summary.available, snapshot.summary.degraded, snapshot.summary.unavailable
+    )];
+
+    for capability in snapshot
+        .capabilities
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.status,
+                crate::tooling::CapabilityStatus::Degraded
+                    | crate::tooling::CapabilityStatus::Unavailable
+            )
+        })
+        .take(8)
+    {
+        let reason = capability.reason_code.as_deref().unwrap_or("degraded");
+        lines.push(format!("- {}: {}", capability.name, reason));
+    }
+
+    for diagnosis in doctor.diagnoses.iter().take(4) {
+        lines.push(format!(
+            "- doctor {}: {}",
+            diagnosis.class, diagnosis.summary
+        ));
+    }
+
+    lines.join("\n")
+}
+
+async fn build_autonomy_cycle_prompt(
+    deps: &AgentDeps,
+    logger: &CortexLogger,
+) -> anyhow::Result<String> {
+    let bulletin = deps.runtime_config.memory_bulletin.load().to_string();
+
+    let tasks = deps.task_store.list(&deps.agent_id, None, None, 12).await?;
+    let active_tasks = tasks
+        .iter()
+        .filter(|task| task.status != TaskStatus::Done)
+        .map(|task| {
+            let risk = task
+                .autonomy
+                .as_ref()
+                .and_then(|autonomy| autonomy.risk_class)
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| "unspecified".to_string());
+            format!(
+                "- #{} [{}] {} (risk: {})",
+                task.task_number, task.status, task.title, risk
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let recent_events = logger
+        .load_events(8, 0, None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| format!("- [{}] {}", event.event_type, event.summary))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let autonomy_findings = deps
+        .memory_search
+        .store()
+        .get_sorted_filtered(SearchSort::Recent, 8, None, Some("cortex:autonomy"))
+        .await?
+        .into_iter()
+        .map(|memory| {
+            format!(
+                "- [{}] {}",
+                memory.memory_type,
+                crate::summarize_first_non_empty_line(&memory.content, 180)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let connected_mcp_servers = deps.mcp_manager.connected_server_names().await;
+    let connected_mcp_tool_names = deps.mcp_manager.get_tool_names().await;
+    let snapshot = crate::tooling::build_capability_snapshot(
+        &deps.agent_id,
+        deps.runtime_config.as_ref(),
+        &connected_mcp_servers,
+        &connected_mcp_tool_names,
+    );
+    let doctor = crate::tooling::build_tool_doctor_report(&snapshot);
+    let capability_summary = summarize_capability_snapshot(&snapshot, &doctor);
+
+    let ready_count = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Ready)
+        .count();
+    let pending_approval_count = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::PendingApproval)
+        .count();
+
+    Ok(format!(
+        "Perform one bounded autonomy cycle.\n\n## Bulletin\n{}\n\n## Active Tasks\n{}\n\n## Recent Cortex Events\n{}\n\n## Recent Autonomy Findings\n{}\n\n## Capability Summary\n{}\n\n## Readiness State\n- ready_tasks={}\n- pending_approval_tasks={}\n\nIf there is nothing worth changing, say so briefly and stop. Prefer memory/task updates over prose.",
+        if bulletin.trim().is_empty() {
+            "[empty]"
+        } else {
+            &bulletin
+        },
+        if active_tasks.is_empty() {
+            "[no active tasks]"
+        } else {
+            &active_tasks
+        },
+        if recent_events.is_empty() {
+            "[no recent cortex events]"
+        } else {
+            &recent_events
+        },
+        if autonomy_findings.is_empty() {
+            "[no prior autonomy findings]"
+        } else {
+            &autonomy_findings
+        },
+        capability_summary,
+        ready_count,
+        pending_approval_count,
+    ))
+}
+
+fn create_autonomy_tool_server(
+    deps: &AgentDeps,
+    autonomy_max_workers: usize,
+) -> rig::tool::server::ToolServerHandle {
+    let screenshot_dir = deps
+        .runtime_config
+        .workspace_dir
+        .join(".spacebot")
+        .join("screenshots");
+    let logs_dir = deps
+        .runtime_config
+        .workspace_dir
+        .join(".spacebot")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&screenshot_dir);
+    let _ = std::fs::create_dir_all(&logs_dir);
+
+    let mut server = rig::tool::server::ToolServer::new()
+        .tool(
+            crate::tools::MemorySaveTool::new(deps.memory_search.clone())
+                .with_event_bus(deps.agent_id.clone(), deps.memory_event_tx.clone()),
+        )
+        .tool(crate::tools::MemoryRecallTool::new(
+            deps.memory_search.clone(),
+        ))
+        .tool(crate::tools::SpacebotDocsTool::new())
+        .tool(crate::tools::ConfigInspectTool::new(
+            deps.agent_id.to_string(),
+            deps.runtime_config.clone(),
+        ))
+        .tool(
+            crate::tools::TaskCreateTool::new(
+                deps.task_store.clone(),
+                deps.agent_id.to_string(),
+                "cortex:autonomy",
+            )
+            .with_autonomy_require_approval(
+                deps.runtime_config
+                    .cortex
+                    .load()
+                    .autonomy_tasks_require_approval,
+            ),
+        )
+        .tool(crate::tools::TaskListTool::new(
+            deps.task_store.clone(),
+            deps.agent_id.to_string(),
+        ))
+        .tool(crate::tools::TaskUpdateTool::for_branch(
+            deps.task_store.clone(),
+            deps.agent_id.clone(),
+        ))
+        .tool(crate::tools::WorkerInspectTool::new(
+            crate::conversation::history::ProcessRunLogger::new(deps.sqlite_pool.clone()),
+            deps.agent_id.to_string(),
+        ));
+
+    if autonomy_max_workers > 0 {
+        server = server.tool(crate::tools::DetachedSpawnWorkerTool::new(
+            deps.clone(),
+            screenshot_dir,
+            logs_dir,
+        ));
+    }
+
+    server.run()
+}
+
+async fn run_one_autonomy_cycle(
+    deps: &AgentDeps,
+    logger: &CortexLogger,
+    config: crate::config::CortexConfig,
+) -> anyhow::Result<()> {
+    logger.log(
+        "autonomy_cycle_started",
+        "Autonomy cycle started",
+        Some(serde_json::json!({
+            "max_turns": config.autonomy_max_turns,
+            "max_workers": config.autonomy_max_workers,
+        })),
+    );
+
+    let prompt_engine = deps.runtime_config.prompts.load();
+    let system_prompt = prompt_engine
+        .render_static("autonomy_loop")
+        .map_err(|error| anyhow::anyhow!("failed to render autonomy prompt: {error}"))?;
+    let cycle_prompt = build_autonomy_cycle_prompt(deps, logger).await?;
+    let tool_server = create_autonomy_tool_server(deps, config.autonomy_max_workers);
+
+    let routing = deps.runtime_config.routing.load();
+    let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+    let model = SpacebotModel::make(&deps.llm_manager, &model_name)
+        .with_context(&*deps.agent_id, "cortex")
+        .with_routing((**routing).clone());
+
+    let agent = AgentBuilder::new(model)
+        .preamble(&system_prompt)
+        .hook(CortexHook::new())
+        .default_max_turns(config.autonomy_max_turns.max(1))
+        .tool_server_handle(tool_server)
+        .build();
+
+    let response = agent
+        .prompt(&cycle_prompt)
+        .await
+        .map_err(|error| anyhow::anyhow!("autonomy prompt failed: {error}"))?;
+
+    logger.log(
+        "autonomy_cycle_completed",
+        &crate::summarize_first_non_empty_line(&response, 240),
+        Some(serde_json::json!({
+            "response_preview": crate::tools::truncate_utf8_ellipsis(&response, 400),
+        })),
+    );
 
     Ok(())
 }

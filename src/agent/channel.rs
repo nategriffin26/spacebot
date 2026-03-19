@@ -60,6 +60,36 @@ struct PendingResult {
     request_group_id: Option<String>,
     request_group_origin: Option<String>,
     source_manifest_summary: Option<String>,
+    artifact_summary: Option<String>,
+}
+
+fn summarize_receipt_artifacts(receipt: &crate::WorkerOutcomeReceipt) -> Option<String> {
+    let artifacts = if receipt.artifact_outcomes.is_empty() {
+        receipt
+            .artifacts_created
+            .iter()
+            .map(|path| format!("- created: {path}"))
+            .collect::<Vec<_>>()
+    } else {
+        receipt
+            .artifact_outcomes
+            .iter()
+            .map(|artifact| {
+                let suggested_name = artifact.suggested_name.as_deref().unwrap_or(&artifact.path);
+                let delivery = artifact
+                    .delivery_status
+                    .as_deref()
+                    .unwrap_or("not_delivered");
+                format!("- {} ({delivery}) from {}", suggested_name, artifact.path)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if artifacts.is_empty() {
+        None
+    } else {
+        Some(artifacts.join("\n"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3116,7 +3146,19 @@ impl Channel {
         } else {
             **rc.max_turns.load()
         };
-        let model_name = routing.resolve(ProcessType::Channel, None);
+        let routing_decision =
+            routing.resolve_with_prompt(ProcessType::Channel, None, Some(user_text));
+        if let Some(tier) = routing_decision.prompt_tier {
+            tracing::debug!(
+                channel_id = %self.id,
+                tier = tier.as_str(),
+                score = routing_decision.prompt_score.unwrap_or_default(),
+                reason = routing_decision.resolution_reason,
+                model = routing_decision.model_name,
+                "channel prompt routing applied"
+            );
+        }
+        let model_name = routing_decision.model_name;
         let model = SpacebotModel::make(&self.deps.llm_manager, model_name)
             .with_context(&*self.deps.agent_id, "channel")
             .with_rig_alignment((**rig_alignment).clone())
@@ -3709,6 +3751,7 @@ impl Channel {
                             source_manifest_summary: request_group_summary
                                 .as_ref()
                                 .and_then(|value| value.1.clone()),
+                            artifact_summary: None,
                         });
                         should_retrigger = true;
                     } else {
@@ -3748,6 +3791,7 @@ impl Channel {
                                     source_manifest_summary: request_group_summary
                                         .as_ref()
                                         .and_then(|value| value.1.clone()),
+                                    artifact_summary: None,
                                 });
                                 should_retrigger = true;
                             }
@@ -3769,6 +3813,7 @@ impl Channel {
                         source_manifest_summary: request_group_summary
                             .as_ref()
                             .and_then(|value| value.1.clone()),
+                        artifact_summary: None,
                     });
                     should_retrigger = true;
 
@@ -3855,6 +3900,16 @@ impl Channel {
                 }
 
                 run_logger.log_worker_completed(*worker_id, result, *success);
+                let artifact_summary = run_logger
+                    .get_worker_detail(&self.deps.agent_id, &worker_id.to_string())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|detail| detail.outcome_receipt_json)
+                    .and_then(|value| {
+                        serde_json::from_str::<crate::WorkerOutcomeReceipt>(&value).ok()
+                    })
+                    .and_then(|receipt| summarize_receipt_artifacts(&receipt));
 
                 self.state.active_workers.write().await.remove(worker_id);
                 self.state.worker_inputs.write().await.remove(worker_id);
@@ -3875,6 +3930,7 @@ impl Channel {
                         source_manifest_summary: request_group_summary
                             .as_ref()
                             .and_then(|value| value.1.clone()),
+                        artifact_summary,
                     });
                     should_retrigger = true;
                 }
@@ -3931,6 +3987,7 @@ impl Channel {
                     source_manifest_summary: request_group_summary
                         .as_ref()
                         .and_then(|value| value.1.clone()),
+                    artifact_summary: None,
                 });
                 should_retrigger = true;
                 tracing::info!(
@@ -4082,6 +4139,7 @@ impl Channel {
                 request_group_id: r.request_group_id.clone(),
                 request_group_origin: r.request_group_origin.clone(),
                 source_manifest_summary: r.source_manifest_summary.clone(),
+                artifact_summary: r.artifact_summary.clone(),
             })
             .collect();
 
@@ -4124,9 +4182,14 @@ impl Channel {
                 } else {
                     r.result.clone()
                 };
+                let artifact_summary = r
+                    .artifact_summary
+                    .as_ref()
+                    .map(|value| format!("\nArtifacts:\n{value}"))
+                    .unwrap_or_default();
                 format!(
-                    "[{} {} {}]: {}",
-                    r.process_type, r.process_id, status, truncated
+                    "[{} {} {}]: {}{}",
+                    r.process_type, r.process_id, status, truncated, artifact_summary
                 )
             })
             .collect::<Vec<_>>()

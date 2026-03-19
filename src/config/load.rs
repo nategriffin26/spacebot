@@ -230,6 +230,21 @@ impl CortexConfig {
             branch_timeout_secs: overrides
                 .branch_timeout_secs
                 .unwrap_or(defaults.branch_timeout_secs),
+            autonomy_enabled: overrides
+                .autonomy_enabled
+                .unwrap_or(defaults.autonomy_enabled),
+            autonomy_interval_secs: overrides
+                .autonomy_interval_secs
+                .unwrap_or(defaults.autonomy_interval_secs),
+            autonomy_max_turns: overrides
+                .autonomy_max_turns
+                .unwrap_or(defaults.autonomy_max_turns),
+            autonomy_max_workers: overrides
+                .autonomy_max_workers
+                .unwrap_or(defaults.autonomy_max_workers),
+            autonomy_tasks_require_approval: overrides
+                .autonomy_tasks_require_approval
+                .unwrap_or(defaults.autonomy_tasks_require_approval),
             topic_sync_interval_secs: overrides
                 .topic_sync_interval_secs
                 .unwrap_or(defaults.topic_sync_interval_secs),

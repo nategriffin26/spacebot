@@ -12,6 +12,7 @@ pub struct TaskCreateTool {
     task_store: Arc<TaskStore>,
     agent_id: String,
     created_by: String,
+    autonomy_require_approval: bool,
 }
 
 impl TaskCreateTool {
@@ -24,7 +25,13 @@ impl TaskCreateTool {
             task_store,
             agent_id: agent_id.into(),
             created_by: created_by.into(),
+            autonomy_require_approval: false,
         }
+    }
+
+    pub fn with_autonomy_require_approval(mut self, require_approval: bool) -> Self {
+        self.autonomy_require_approval = require_approval;
+        self
     }
 }
 
@@ -44,10 +51,42 @@ pub struct TaskCreateArgs {
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub risk_class: Option<String>,
+    #[serde(default)]
+    pub risk_reason: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_memory_ids: Vec<String>,
+    #[serde(default)]
+    pub origin_process: Option<String>,
+    #[serde(default)]
+    pub origin_worker_id: Option<String>,
+    #[serde(default)]
+    pub requires_approval: Option<bool>,
+    #[serde(default)]
+    pub auto_ready_allowed: Option<bool>,
 }
 
 fn default_priority() -> String {
     "medium".to_string()
+}
+
+fn resolve_autonomy_task_status(
+    requested_status: Option<TaskStatus>,
+    requires_approval: bool,
+    auto_ready_allowed: bool,
+) -> TaskStatus {
+    if requires_approval {
+        return TaskStatus::PendingApproval;
+    }
+
+    if auto_ready_allowed {
+        return requested_status.unwrap_or(TaskStatus::Ready);
+    }
+
+    requested_status.unwrap_or(TaskStatus::Backlog)
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +131,40 @@ impl Tool for TaskCreateTool {
                         "type": "string",
                         "enum": crate::tasks::TaskStatus::ALL.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                         "description": "Optional initial status"
+                    },
+                    "risk_class": {
+                        "type": "string",
+                        "enum": ["observe_only", "read_only_external", "local_reversible_write", "privileged_or_external_mutation"],
+                        "description": "Optional autonomy risk class for the task."
+                    },
+                    "risk_reason": {
+                        "type": "string",
+                        "description": "Optional explanation for the autonomy risk decision."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional stable source label, such as cortex:autonomy."
+                    },
+                    "source_memory_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional source memory IDs backing this task."
+                    },
+                    "origin_process": {
+                        "type": "string",
+                        "description": "Optional origin process label, such as autonomy_loop."
+                    },
+                    "origin_worker_id": {
+                        "type": "string",
+                        "description": "Optional originating worker ID."
+                    },
+                    "requires_approval": {
+                        "type": "boolean",
+                        "description": "Whether this task should wait for approval before execution."
+                    },
+                    "auto_ready_allowed": {
+                        "type": "boolean",
+                        "description": "Whether this task is safe to move straight to ready."
                     }
                 },
                 "required": ["title"]
@@ -102,10 +175,18 @@ impl Tool for TaskCreateTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let priority = TaskPriority::parse(&args.priority)
             .ok_or_else(|| TaskCreateError(format!("invalid priority: {}", args.priority)))?;
-        let status = match args.status.as_deref() {
-            None => TaskStatus::Backlog,
+        let requested_status = match args.status.as_deref() {
+            None => None,
             Some(value) => TaskStatus::parse(value)
-                .ok_or_else(|| TaskCreateError(format!("invalid status: {value}")))?,
+                .ok_or_else(|| TaskCreateError(format!("invalid status: {value}")))
+                .map(Some)?,
+        };
+        let risk_class = match args.risk_class.as_deref() {
+            None => None,
+            Some(value) => Some(
+                crate::tasks::TaskRiskClass::parse(value)
+                    .ok_or_else(|| TaskCreateError(format!("invalid risk_class: {value}")))?,
+            ),
         };
 
         let subtasks = args
@@ -116,6 +197,26 @@ impl Tool for TaskCreateTool {
                 completed: false,
             })
             .collect::<Vec<_>>();
+
+        let requires_approval = args.requires_approval.unwrap_or(
+            self.autonomy_require_approval
+                || matches!(
+                    risk_class,
+                    Some(crate::tasks::TaskRiskClass::PrivilegedOrExternalMutation)
+                ),
+        );
+        let auto_ready_allowed = args.auto_ready_allowed.unwrap_or(
+            !requires_approval
+                && matches!(
+                    risk_class,
+                    Some(
+                        crate::tasks::TaskRiskClass::ReadOnlyExternal
+                            | crate::tasks::TaskRiskClass::LocalReversibleWrite
+                    )
+                ),
+        );
+        let status =
+            resolve_autonomy_task_status(requested_status, requires_approval, auto_ready_allowed);
 
         let task = self
             .task_store
@@ -129,6 +230,16 @@ impl Tool for TaskCreateTool {
                 metadata: args.metadata.unwrap_or_else(|| serde_json::json!({})),
                 source_memory_id: None,
                 created_by: self.created_by.clone(),
+                autonomy: Some(crate::tasks::TaskAutonomyContext {
+                    source: args.source,
+                    source_memory_ids: args.source_memory_ids,
+                    origin_process: args.origin_process,
+                    origin_worker_id: args.origin_worker_id,
+                    risk_class,
+                    risk_reason: args.risk_reason,
+                    requires_approval,
+                    auto_ready_allowed,
+                }),
             })
             .await
             .map_err(|error| TaskCreateError(format!("{error}")))?;

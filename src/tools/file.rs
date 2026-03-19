@@ -254,7 +254,7 @@ impl Tool for FileReadTool {
             }
             result
         } else {
-            crate::tools::truncate_output(&raw, crate::tools::MAX_TOOL_OUTPUT_BYTES)
+            crate::tools::truncate_output(&raw, crate::tools::tool_output_budget_bytes("file_read"))
         };
 
         Ok(FileOutput {
@@ -632,7 +632,8 @@ pub async fn file_read(path: impl AsRef<Path>) -> crate::error::Result<String> {
             crate::error::AgentError::Other(anyhow::anyhow!("Failed to read file: {error}"))
         })?;
 
-    let content = crate::tools::truncate_output(&raw, crate::tools::MAX_TOOL_OUTPUT_BYTES);
+    let content =
+        crate::tools::truncate_output(&raw, crate::tools::tool_output_budget_bytes("file_read"));
     Ok(content)
 }
 

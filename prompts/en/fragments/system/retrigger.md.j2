@@ -13,6 +13,9 @@ Default behavior:
 {% endif %}
 {% if r.source_manifest_summary %}Source manifest: {{ r.source_manifest_summary }}
 {% endif %}
+{% if r.artifact_summary %}Confirmed artifacts:
+{{ r.artifact_summary }}
+{% endif %}
 {{ r.result }}
 {% endfor %}
 Instructions:

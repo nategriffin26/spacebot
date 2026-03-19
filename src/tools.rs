@@ -64,6 +64,7 @@ pub mod task_create;
 pub mod task_list;
 pub mod task_update;
 pub mod web_search;
+pub mod work;
 pub mod worker_inspect;
 
 pub mod factory_create_agent;
@@ -150,6 +151,7 @@ pub use task_create::{TaskCreateArgs, TaskCreateError, TaskCreateOutput, TaskCre
 pub use task_list::{TaskListArgs, TaskListError, TaskListOutput, TaskListTool};
 pub use task_update::{TaskUpdateArgs, TaskUpdateError, TaskUpdateOutput, TaskUpdateTool};
 pub use web_search::{SearchResult, WebSearchArgs, WebSearchError, WebSearchOutput, WebSearchTool};
+pub use work::{WorkArgs, WorkError, WorkOutput, WorkTool};
 pub use worker_inspect::{
     WorkerInspectArgs, WorkerInspectError, WorkerInspectOutput, WorkerInspectTool,
 };
@@ -249,6 +251,18 @@ where
 /// Maximum byte length for tool output strings (stdout, stderr, file content).
 /// ~50KB keeps a single tool result under ~12,500 tokens (at ~4 chars/token).
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 50_000;
+pub const DEFAULT_TOOL_OUTPUT_BUDGET_BYTES: usize = 8_000;
+
+pub fn tool_output_budget_bytes(tool_name: &str) -> usize {
+    match tool_name {
+        "shell" => 20_000,
+        "file_read" | "file_write" | "file_edit" | "file_list" => 16_000,
+        "mcp" | "web_search" => 12_000,
+        "browser_snapshot" | "browser_screenshot" | "browser_eval" => 18_000,
+        "worker_inspect" | "channel_recall" | "memory_recall" => 14_000,
+        _ => DEFAULT_TOOL_OUTPUT_BUDGET_BYTES,
+    }
+}
 
 /// Maximum number of entries returned by directory listings.
 pub const MAX_DIR_ENTRIES: usize = 500;
@@ -444,6 +458,9 @@ pub async fn add_channel_tools(
             .await?;
     }
     handle
+        .add_tool(WorkTool::new(state.clone(), turn_action_tracker.clone()))
+        .await?;
+    handle
         .add_tool(BranchAndSpawnTool::new(
             state.clone(),
             turn_action_tracker.clone(),
@@ -563,6 +580,7 @@ pub async fn remove_channel_tools(
     if allow_direct_reply {
         handle.remove_tool(ReplyTool::NAME).await?;
     }
+    handle.remove_tool(WorkTool::NAME).await?;
     handle.remove_tool(BranchAndSpawnTool::NAME).await?;
     handle.remove_tool(BranchTool::NAME).await?;
     handle.remove_tool(SpawnWorkerTool::NAME).await?;

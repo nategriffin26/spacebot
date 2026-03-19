@@ -235,6 +235,13 @@ impl Tool for SendAgentMessageTool {
                 metadata,
                 source_memory_id: None,
                 created_by: format!("agent:{}", sending_agent_id),
+                autonomy: Some(crate::tasks::TaskAutonomyContext {
+                    source: Some("agent_link".to_string()),
+                    origin_process: Some("send_agent_message".to_string()),
+                    risk_class: Some(crate::tasks::TaskRiskClass::LocalReversibleWrite),
+                    auto_ready_allowed: true,
+                    ..crate::tasks::TaskAutonomyContext::default()
+                }),
             })
             .await
             .map_err(|error| {

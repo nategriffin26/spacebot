@@ -259,18 +259,23 @@ impl Tool for ShellTool {
                 exit_code: -1,
             })?;
 
-        let stdout = crate::tools::truncate_output(
-            &String::from_utf8_lossy(&output.stdout),
-            crate::tools::MAX_TOOL_OUTPUT_BYTES,
-        );
-        let stderr = crate::tools::truncate_output(
-            &String::from_utf8_lossy(&output.stderr),
-            crate::tools::MAX_TOOL_OUTPUT_BYTES,
-        );
+        let output_budget = crate::tools::tool_output_budget_bytes(Self::NAME);
+        let stdout =
+            crate::tools::truncate_output(&String::from_utf8_lossy(&output.stdout), output_budget);
+        let stderr =
+            crate::tools::truncate_output(&String::from_utf8_lossy(&output.stderr), output_budget);
         let exit_code = output.status.code().unwrap_or(-1);
-        let success = output.status.success();
+        let false_success_reason =
+            classify_false_success(&stdout, &stderr, output.status.success());
+        let success = output.status.success() && false_success_reason.is_none();
 
-        let summary = format_shell_output(exit_code, &stdout, &stderr);
+        let summary = format_shell_output(
+            exit_code,
+            &stdout,
+            &stderr,
+            false_success_reason,
+            &args.command,
+        );
 
         Ok(ShellOutput {
             success,
@@ -283,7 +288,13 @@ impl Tool for ShellTool {
 }
 
 /// Format shell output for display.
-fn format_shell_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
+fn format_shell_output(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    false_success_reason: Option<&'static str>,
+    command: &str,
+) -> String {
     let mut output = String::new();
 
     output.push_str(&format!("Exit code: {}\n", exit_code));
@@ -302,7 +313,45 @@ fn format_shell_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
         output.push_str("\n[No output]\n");
     }
 
+    if let Some(reason) = false_success_reason {
+        output.push_str("\n--- CLASSIFICATION ---\n");
+        output.push_str(&format!(
+            "Marked as failed even though exit code was 0: {reason}\n"
+        ));
+    }
+
+    if command.contains("cd ")
+        && (stderr.contains("No such file or directory") || stderr.contains("can't cd to"))
+    {
+        output.push_str("\n--- PATH SANITY ---\n");
+        output.push_str(
+            "The command appears to assume a directory that does not exist from the current working directory.\n",
+        );
+    }
+
     output
+}
+
+fn classify_false_success(stdout: &str, stderr: &str, success: bool) -> Option<&'static str> {
+    if !success {
+        return None;
+    }
+
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if combined.contains("command not found") {
+        return Some("shell reported command-not-found text");
+    }
+    if combined.contains("no such file or directory") {
+        return Some("shell reported missing file/path text");
+    }
+    if combined.contains("permission denied") {
+        return Some("shell reported permission denied text");
+    }
+    if combined.contains("fatal:") || combined.contains("error:") {
+        return Some("shell output contains explicit fatal/error markers");
+    }
+
+    None
 }
 
 /// System-internal shell execution that bypasses path restrictions.
@@ -354,6 +403,6 @@ pub struct ShellResult {
 impl ShellResult {
     /// Format as a readable string for LLM consumption.
     pub fn format(&self) -> String {
-        format_shell_output(self.exit_code, &self.stdout, &self.stderr)
+        format_shell_output(self.exit_code, &self.stdout, &self.stderr, None, "")
     }
 }

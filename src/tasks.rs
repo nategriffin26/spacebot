@@ -3,5 +3,6 @@
 pub mod store;
 
 pub use store::{
-    CreateTaskInput, Task, TaskPriority, TaskStatus, TaskStore, TaskSubtask, UpdateTaskInput,
+    CreateTaskInput, Task, TaskAutonomyContext, TaskPriority, TaskRiskClass, TaskStatus, TaskStore,
+    TaskSubtask, UpdateTaskInput,
 };

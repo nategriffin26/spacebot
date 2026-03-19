@@ -1,6 +1,13 @@
-use super::toml_schema::TomlRoutingConfig;
+use super::toml_schema::{
+    TomlPromptRoutingBoundaries, TomlPromptRoutingConfig, TomlPromptRoutingTiers,
+    TomlPromptRoutingWeights, TomlRoutingConfig,
+};
 use super::{ApiType, ProviderConfig};
-use crate::llm::routing::RoutingConfig;
+use crate::ProcessType;
+use crate::llm::routing::{
+    PromptRoutingBoundaries, PromptRoutingConfig, PromptRoutingTiers, PromptRoutingWeights,
+    RoutingConfig,
+};
 
 use std::collections::HashMap;
 
@@ -335,5 +342,83 @@ pub(super) fn resolve_routing(
         cortex_thinking_effort: t
             .cortex_thinking_effort
             .unwrap_or_else(|| base.cortex_thinking_effort.clone()),
+        prompt_routing: resolve_prompt_routing(t.prompt_routing, &base.prompt_routing),
+    }
+}
+
+fn parse_prompt_routing_process_types(
+    values: Option<Vec<String>>,
+    defaults: &[ProcessType],
+) -> Vec<ProcessType> {
+    values
+        .map(|items| {
+            items
+                .into_iter()
+                .filter_map(|value| match value.as_str() {
+                    "channel" => Some(ProcessType::Channel),
+                    "branch" => Some(ProcessType::Branch),
+                    "worker" => Some(ProcessType::Worker),
+                    "compactor" => Some(ProcessType::Compactor),
+                    "cortex" => Some(ProcessType::Cortex),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| defaults.to_vec())
+}
+
+fn resolve_prompt_routing(
+    toml: Option<TomlPromptRoutingConfig>,
+    base: &PromptRoutingConfig,
+) -> PromptRoutingConfig {
+    let Some(toml) = toml else {
+        return base.clone();
+    };
+
+    let tiers = toml.tiers.unwrap_or(TomlPromptRoutingTiers {
+        light: None,
+        standard: None,
+        heavy: None,
+    });
+    let boundaries = toml.boundaries.unwrap_or(TomlPromptRoutingBoundaries {
+        light_standard: None,
+        standard_heavy: None,
+    });
+    let weights = toml.weights.unwrap_or(TomlPromptRoutingWeights {
+        token_count: None,
+        code_presence: None,
+        reasoning: None,
+        technical: None,
+        constraints: None,
+        multi_step: None,
+        simple: None,
+    });
+
+    PromptRoutingConfig {
+        enabled: toml.enabled.unwrap_or(base.enabled),
+        process_types: parse_prompt_routing_process_types(toml.process_types, &base.process_types),
+        tiers: PromptRoutingTiers {
+            light: tiers.light.or_else(|| base.tiers.light.clone()),
+            standard: tiers.standard.or_else(|| base.tiers.standard.clone()),
+            heavy: tiers.heavy.or_else(|| base.tiers.heavy.clone()),
+        },
+        boundaries: PromptRoutingBoundaries {
+            light_standard: boundaries
+                .light_standard
+                .unwrap_or(base.boundaries.light_standard),
+            standard_heavy: boundaries
+                .standard_heavy
+                .unwrap_or(base.boundaries.standard_heavy),
+        },
+        weights: PromptRoutingWeights {
+            token_count: weights.token_count.unwrap_or(base.weights.token_count),
+            code_presence: weights.code_presence.unwrap_or(base.weights.code_presence),
+            reasoning: weights.reasoning.unwrap_or(base.weights.reasoning),
+            technical: weights.technical.unwrap_or(base.weights.technical),
+            constraints: weights.constraints.unwrap_or(base.weights.constraints),
+            multi_step: weights.multi_step.unwrap_or(base.weights.multi_step),
+            simple: weights.simple.unwrap_or(base.weights.simple),
+        },
     }
 }
