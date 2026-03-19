@@ -6,17 +6,20 @@
 //! to the delivery target via the messaging system.
 
 use crate::agent::channel::Channel;
+use crate::conversation::history::ProcessRunLogger;
 use crate::cron::store::CronStore;
 use crate::error::Result;
 use crate::messaging::MessagingManager;
 use crate::messaging::target::{BroadcastTarget, parse_delivery_target};
+use crate::tooling::summarize_worker_receipt;
 use crate::{AgentDeps, InboundMessage, MessageContent, OutboundResponse, RoutedResponse};
 use chrono::Timelike;
 use chrono_tz::Tz;
 use cron::Schedule;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
@@ -79,6 +82,35 @@ pub struct CronContext {
     pub logs_dir: std::path::PathBuf,
     pub messaging_manager: Arc<MessagingManager>,
     pub store: Arc<CronStore>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CronTerminalReason {
+    Delivered,
+    NoOutput,
+    DeliveryFailed,
+    TimedOut,
+    ChannelFailed,
+    DispatchFailed,
+}
+
+impl CronTerminalReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::NoOutput => "no_output",
+            Self::DeliveryFailed => "delivery_failed",
+            Self::TimedOut => "timed_out",
+            Self::ChannelFailed => "channel_failed",
+            Self::DispatchFailed => "dispatch_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CronExecutionAudit {
+    worker_ids: BTreeSet<String>,
+    branch_ids: BTreeSet<String>,
 }
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -847,6 +879,44 @@ fn ensure_cron_dispatch_readiness(context: &CronContext, cron_id: &str) {
 async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
     ensure_cron_dispatch_readiness(context, &job.id);
     let channel_id: crate::ChannelId = Arc::from(format!("cron:{}", job.id).as_str());
+    let audit_state = Arc::new(Mutex::new(CronExecutionAudit::default()));
+    let mut audit_rx = context.deps.event_tx.subscribe();
+    let audit_agent_id = context.deps.agent_id.clone();
+    let audit_channel_id = channel_id.clone();
+    let audit_state_clone = audit_state.clone();
+    let audit_handle = tokio::spawn(async move {
+        loop {
+            match audit_rx.recv().await {
+                Ok(crate::ProcessEvent::BranchStarted {
+                    agent_id,
+                    channel_id,
+                    branch_id,
+                    ..
+                }) if agent_id == audit_agent_id && channel_id == audit_channel_id => {
+                    audit_state_clone
+                        .lock()
+                        .await
+                        .branch_ids
+                        .insert(branch_id.to_string());
+                }
+                Ok(crate::ProcessEvent::WorkerStarted {
+                    agent_id,
+                    channel_id: Some(channel_id),
+                    worker_id,
+                    ..
+                }) if agent_id == audit_agent_id && channel_id == audit_channel_id => {
+                    audit_state_clone
+                        .lock()
+                        .await
+                        .worker_ids
+                        .insert(worker_id.to_string());
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 
     // Create the outbound response channel to collect whatever the channel produces
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<RoutedResponse>(32);
@@ -866,11 +936,7 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
     );
 
     // Spawn the channel's event loop
-    let channel_handle = tokio::spawn(async move {
-        if let Err(error) = channel.run().await {
-            tracing::error!(%error, "cron channel failed");
-        }
-    });
+    let channel_handle = tokio::spawn(async move { channel.run().await });
 
     // Send the cron job prompt as a synthetic message
     let message = InboundMessage {
@@ -886,10 +952,25 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
         formatted_author: None,
     };
 
-    channel_tx
-        .send(message)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to send cron prompt to channel: {error}"))?;
+    if let Err(error) = channel_tx.send(message).await {
+        audit_handle.abort();
+        context
+            .store
+            .log_execution(crate::cron::store::CronExecutionRecord {
+                cron_id: job.id.clone(),
+                success: false,
+                result_summary: Some(format!("failed to send cron prompt to channel: {error}")),
+                channel_id: Some(channel_id.to_string()),
+                terminal_reason: Some(CronTerminalReason::DispatchFailed.as_str().into()),
+                delivered: Some(false),
+                result_count: Some(0),
+                worker_ids: Vec::new(),
+                branch_ids: Vec::new(),
+                receipt_refs: Vec::new(),
+            })
+            .await?;
+        return Err(anyhow::anyhow!("failed to send cron prompt to channel: {error}").into());
+    }
 
     // Collect responses with a timeout. The channel may produce multiple messages
     // (e.g. status updates, then text). We only care about text responses.
@@ -902,11 +983,13 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
     drop(channel_tx);
 
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut timed_out = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             tracing::warn!(cron_id = %job.id, "cron job timed out after {timeout:?}");
             channel_handle.abort();
+            timed_out = true;
             break;
         }
         match tokio::time::timeout(remaining, response_rx.recv()).await {
@@ -929,16 +1012,56 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
             Err(_) => {
                 tracing::warn!(cron_id = %job.id, "cron job timed out after {timeout:?}");
                 channel_handle.abort();
+                timed_out = true;
                 break;
             }
         }
     }
 
     // Wait for the channel task to finish (it should already be done since we dropped channel_tx)
-    let _ = channel_handle.await;
+    let channel_result = match channel_handle.await {
+        Ok(result) => result,
+        Err(join_error) if join_error.is_cancelled() && timed_out => Ok(()),
+        Err(join_error) => Err(anyhow::anyhow!("cron channel join failed: {join_error}").into()),
+    };
+
+    audit_handle.abort();
+    let audit = audit_state.lock().await.clone();
+    let receipt_refs =
+        collect_cron_receipts(&context.deps, audit.worker_ids.iter().cloned().collect()).await;
 
     let result_text = collected_text.join("\n\n");
     let has_result = !result_text.trim().is_empty();
+    let result_count = (!result_text.trim().is_empty()) as u32;
+    let mut execution_record = crate::cron::store::CronExecutionRecord {
+        cron_id: job.id.clone(),
+        success: true,
+        result_summary: has_result.then(|| result_text.clone()),
+        channel_id: Some(channel_id.to_string()),
+        terminal_reason: None,
+        delivered: Some(false),
+        result_count: Some(result_count),
+        worker_ids: audit.worker_ids.into_iter().collect(),
+        branch_ids: audit.branch_ids.into_iter().collect(),
+        receipt_refs,
+    };
+
+    if let Err(error) = channel_result {
+        tracing::error!(cron_id = %job.id, %error, "cron channel failed");
+        execution_record.success = false;
+        execution_record.terminal_reason = Some(CronTerminalReason::ChannelFailed.as_str().into());
+        execution_record.result_summary = Some(error.to_string());
+        context.store.log_execution(execution_record).await?;
+        return Err(error);
+    }
+
+    if timed_out {
+        execution_record.success = false;
+        execution_record.terminal_reason = Some(CronTerminalReason::TimedOut.as_str().into());
+        execution_record.result_summary = Some(format!("cron job timed out after {:?}", timeout));
+        context.store.log_execution(execution_record).await?;
+        return Err(anyhow::anyhow!("cron job timed out after {timeout:?}").into());
+    }
 
     // Deliver result to target (only if there's something to say)
     if has_result {
@@ -957,13 +1080,12 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
                 %error,
                 "failed to deliver cron result"
             );
-            if let Err(log_error) = context
-                .store
-                .log_execution(&job.id, false, Some(&error.to_string()))
-                .await
-            {
-                tracing::warn!(%log_error, "failed to log cron execution");
-            }
+            execution_record.success = false;
+            execution_record.delivered = Some(false);
+            execution_record.terminal_reason =
+                Some(CronTerminalReason::DeliveryFailed.as_str().into());
+            execution_record.result_summary = Some(error.to_string());
+            context.store.log_execution(execution_record).await?;
             return Err(error);
         }
 
@@ -972,20 +1094,45 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
             target = %job.delivery_target,
             "cron result delivered"
         );
+        execution_record.delivered = Some(true);
+        execution_record.terminal_reason = Some(CronTerminalReason::Delivered.as_str().into());
     } else {
         tracing::debug!(cron_id = %job.id, "cron job produced no output, skipping delivery");
+        execution_record.delivered = Some(false);
+        execution_record.terminal_reason = Some(CronTerminalReason::NoOutput.as_str().into());
     }
 
-    let summary = if has_result {
-        Some(result_text.as_str())
-    } else {
-        None
-    };
-    if let Err(error) = context.store.log_execution(&job.id, true, summary).await {
+    if let Err(error) = context.store.log_execution(execution_record).await {
         tracing::warn!(%error, "failed to log cron execution");
     }
 
     Ok(())
+}
+
+async fn collect_cron_receipts(
+    deps: &AgentDeps,
+    worker_ids: Vec<String>,
+) -> Vec<crate::tooling::ReceiptReference> {
+    let logger = ProcessRunLogger::new(deps.sqlite_pool.clone());
+    let mut receipts = Vec::new();
+
+    for worker_id in worker_ids {
+        let Ok(detail) = logger.get_worker_detail(&deps.agent_id, &worker_id).await else {
+            continue;
+        };
+        let Some(detail) = detail else {
+            continue;
+        };
+        let Some(receipt_json) = detail.outcome_receipt_json.as_deref() else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_str::<crate::WorkerOutcomeReceipt>(receipt_json) else {
+            continue;
+        };
+        receipts.push(summarize_worker_receipt(worker_id, &receipt));
+    }
+
+    receipts
 }
 
 #[cfg(test)]

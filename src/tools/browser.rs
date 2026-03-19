@@ -630,6 +630,36 @@ pub struct BrowserState {
     persistent_profile: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserFailureReason {
+    StaleProfileLock,
+    ActiveProfileInUse,
+    ExecutableNotFound,
+    WebsocketUnreachable,
+    LaunchFailed,
+}
+
+impl BrowserFailureReason {
+    pub const fn as_reason_code(self) -> &'static str {
+        match self {
+            Self::StaleProfileLock => "stale_profile_lock",
+            Self::ActiveProfileInUse => "active_profile_in_use",
+            Self::ExecutableNotFound => "executable_not_found",
+            Self::WebsocketUnreachable => "websocket_unreachable",
+            Self::LaunchFailed => "launch_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserHealthRecord {
+    pub reason_code: String,
+    pub detail: String,
+    pub remediation: String,
+    pub updated_at: String,
+}
+
 impl BrowserState {
     fn new() -> Self {
         Self {
@@ -696,12 +726,21 @@ impl std::fmt::Debug for BrowserState {
 #[error("Browser error: {message}")]
 pub struct BrowserError {
     pub message: String,
+    pub reason: Option<BrowserFailureReason>,
 }
 
 impl BrowserError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            reason: None,
+        }
+    }
+
+    fn with_reason(reason: BrowserFailureReason, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason: Some(reason),
         }
     }
 }
@@ -767,6 +806,7 @@ pub(crate) struct BrowserContext {
     state: Arc<Mutex<BrowserState>>,
     config: BrowserConfig,
     screenshot_dir: PathBuf,
+    health_path: PathBuf,
     /// Secrets store for resolving secret names in `browser_type`. When present,
     /// the `secret` parameter can look up credential values without exposing
     /// them in tool arguments or output.
@@ -778,13 +818,66 @@ impl BrowserContext {
         state: Arc<Mutex<BrowserState>>,
         config: BrowserConfig,
         screenshot_dir: PathBuf,
+        health_path: PathBuf,
         secrets: Option<Arc<SecretsStore>>,
     ) -> Self {
         Self {
             state,
             config,
             screenshot_dir,
+            health_path,
             secrets,
+        }
+    }
+
+    fn clear_health_issue(&self) {
+        if let Err(error) = std::fs::remove_file(&self.health_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                path = %self.health_path.display(),
+                %error,
+                "failed to clear browser health issue"
+            );
+        }
+    }
+
+    fn record_health_issue(&self, error: &BrowserError) {
+        let Some(reason) = error.reason else {
+            return;
+        };
+
+        let record = BrowserHealthRecord {
+            reason_code: reason.as_reason_code().to_string(),
+            detail: error.message.clone(),
+            remediation: browser_failure_remediation(reason).to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        if let Some(parent) = self.health_path.parent()
+            && let Err(parent_error) = std::fs::create_dir_all(parent)
+        {
+            tracing::debug!(
+                path = %parent.display(),
+                %parent_error,
+                "failed to create browser health directory"
+            );
+            return;
+        }
+
+        match serde_json::to_string_pretty(&record) {
+            Ok(json) => {
+                if let Err(write_error) = std::fs::write(&self.health_path, json) {
+                    tracing::debug!(
+                        path = %self.health_path.display(),
+                        %write_error,
+                        "failed to persist browser health issue"
+                    );
+                }
+            }
+            Err(serialize_error) => {
+                tracing::debug!(%serialize_error, "failed to serialize browser health issue");
+            }
         }
     }
 
@@ -1073,6 +1166,19 @@ impl BrowserContext {
 
     /// Launch the browser if not already running. Returns a status message.
     async fn ensure_launched(&self) -> Result<String, BrowserError> {
+        match self.ensure_launched_inner().await {
+            Ok(message) => {
+                self.clear_health_issue();
+                Ok(message)
+            }
+            Err(error) => {
+                self.record_health_issue(&error);
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_launched_inner(&self) -> Result<String, BrowserError> {
         {
             let mut state = self.state.lock().await;
             if state.browser.is_some() {
@@ -1094,11 +1200,7 @@ impl BrowserContext {
         };
 
         if persistent_profile {
-            let lock_file = user_data_dir.join("SingletonLock");
-            if lock_file.exists() {
-                tracing::debug!(path = %lock_file.display(), "removing stale Chrome SingletonLock");
-                let _ = std::fs::remove_file(&lock_file);
-            }
+            heal_profile_singletons(&user_data_dir)?;
         }
 
         let mut builder = ChromeConfig::builder()
@@ -1123,7 +1225,10 @@ impl BrowserContext {
         }
 
         let chrome_config = builder.build().map_err(|error| {
-            BrowserError::new(format!("failed to build browser config: {error}"))
+            BrowserError::with_reason(
+                BrowserFailureReason::LaunchFailed,
+                format!("failed to build browser config: {error}"),
+            )
         })?;
 
         tracing::info!(
@@ -1133,9 +1238,10 @@ impl BrowserContext {
             "launching chrome"
         );
 
-        let (browser, mut handler) = Browser::launch(chrome_config)
-            .await
-            .map_err(|error| BrowserError::new(format!("failed to launch browser: {error}")))?;
+        let (browser, mut handler) = Browser::launch(chrome_config).await.map_err(|error| {
+            let message = format!("failed to launch browser: {error}");
+            BrowserError::with_reason(classify_browser_runtime_failure(&message), message)
+        })?;
 
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
@@ -1183,7 +1289,8 @@ impl BrowserContext {
             .ok_or_else(|| BrowserError::new("browser not launched"))?;
 
         let pages = browser.pages().await.map_err(|error| {
-            BrowserError::new(format!("failed to enumerate existing tabs: {error}"))
+            let message = format!("failed to enumerate existing tabs: {error}");
+            BrowserError::with_reason(classify_browser_runtime_failure(&message), message)
         })?;
 
         let previous_ids: std::collections::HashSet<String> = state.pages.keys().cloned().collect();
@@ -2103,8 +2210,9 @@ pub fn register_browser_tools(
     };
 
     let secrets = runtime_config.secrets.load().as_ref().as_ref().cloned();
+    let health_path = runtime_config.identity_dir.join("data/browser_health.json");
 
-    let context = BrowserContext::new(state, config, screenshot_dir, secrets);
+    let context = BrowserContext::new(state, config, screenshot_dir, health_path, secrets);
 
     server
         .tool(BrowserLaunchTool {
@@ -2141,6 +2249,35 @@ pub fn register_browser_tools(
             context: context.clone(),
         })
         .tool(BrowserCloseTool { context })
+}
+
+pub fn load_browser_health(
+    runtime_config: &crate::config::RuntimeConfig,
+) -> Option<BrowserHealthRecord> {
+    let path = runtime_config.identity_dir.join("data/browser_health.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| serde_json::from_str::<BrowserHealthRecord>(&value).ok())
+}
+
+fn browser_failure_remediation(reason: BrowserFailureReason) -> &'static str {
+    match reason {
+        BrowserFailureReason::StaleProfileLock => {
+            "Retry the browser launch. The stale Chrome profile lock was cleaned up."
+        }
+        BrowserFailureReason::ActiveProfileInUse => {
+            "Close the other Chrome process using this profile or disable browser session persistence before retrying."
+        }
+        BrowserFailureReason::ExecutableNotFound => {
+            "Install Chrome/Chromium or set [browser].executable_path to a real browser binary."
+        }
+        BrowserFailureReason::WebsocketUnreachable => {
+            "Retry the browser launch and inspect whether Chrome started but never exposed its DevTools websocket."
+        }
+        BrowserFailureReason::LaunchFailed => {
+            "Inspect the browser launch logs and profile directory, then retry with a clean browser session if needed."
+        }
+    }
 }
 
 // Shared helpers
@@ -2275,6 +2412,73 @@ async fn resolve_chrome_executable(config: &BrowserConfig) -> Result<PathBuf, Br
     fetch_chrome(&config.chrome_cache_dir).await
 }
 
+fn heal_profile_singletons(user_data_dir: &Path) -> Result<(), BrowserError> {
+    let singleton_paths = browser_singleton_paths(user_data_dir);
+    let has_locks = singleton_paths.iter().any(|path| path.exists());
+    if !has_locks {
+        return Ok(());
+    }
+
+    if has_live_browser_process(user_data_dir) {
+        return Err(BrowserError::with_reason(
+            BrowserFailureReason::ActiveProfileInUse,
+            format!(
+                "Chrome profile '{}' is already in use by a live browser process",
+                user_data_dir.display()
+            ),
+        ));
+    }
+
+    for path in singleton_paths {
+        if !path.exists() {
+            continue;
+        }
+        tracing::debug!(path = %path.display(), "removing stale Chrome singleton artifact");
+        if let Err(error) = std::fs::remove_file(&path) {
+            return Err(BrowserError::with_reason(
+                BrowserFailureReason::LaunchFailed,
+                format!(
+                    "failed to remove stale browser singleton '{}': {error}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn browser_singleton_paths(user_data_dir: &Path) -> Vec<PathBuf> {
+    ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+        .into_iter()
+        .map(|name| user_data_dir.join(name))
+        .collect()
+}
+
+fn has_live_browser_process(user_data_dir: &Path) -> bool {
+    let profile = user_data_dir.to_string_lossy();
+    std::process::Command::new("ps")
+        .args(["-axo", "command="])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|stdout| stdout.lines().any(|line| line.contains(profile.as_ref())))
+}
+
+fn classify_browser_runtime_failure(message: &str) -> BrowserFailureReason {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("websocket")
+        || lower.contains("ws://")
+        || lower.contains("devtoolsactiveport")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+    {
+        BrowserFailureReason::WebsocketUnreachable
+    } else {
+        BrowserFailureReason::LaunchFailed
+    }
+}
+
 fn detect_chrome_from_env() -> Option<PathBuf> {
     for variable in ["CHROME", "CHROME_PATH"] {
         if let Ok(value) = std::env::var(variable) {
@@ -2291,24 +2495,32 @@ async fn fetch_chrome(cache_dir: &Path) -> Result<PathBuf, BrowserError> {
     tokio::fs::create_dir_all(cache_dir)
         .await
         .map_err(|error| {
-            BrowserError::new(format!(
-                "failed to create chrome cache dir {}: {error}",
-                cache_dir.display()
-            ))
+            BrowserError::with_reason(
+                BrowserFailureReason::LaunchFailed,
+                format!(
+                    "failed to create chrome cache dir {}: {error}",
+                    cache_dir.display()
+                ),
+            )
         })?;
 
     let options = BrowserFetcherOptions::builder()
         .with_path(cache_dir)
         .build()
         .map_err(|error| {
-            BrowserError::new(format!("failed to build browser fetcher options: {error}"))
+            BrowserError::with_reason(
+                BrowserFailureReason::LaunchFailed,
+                format!("failed to build browser fetcher options: {error}"),
+            )
         })?;
 
     let fetcher = BrowserFetcher::new(options);
-    let info = fetcher
-        .fetch()
-        .await
-        .map_err(|error| BrowserError::new(format!("failed to download chrome: {error}")))?;
+    let info = fetcher.fetch().await.map_err(|error| {
+        BrowserError::with_reason(
+            BrowserFailureReason::ExecutableNotFound,
+            format!("failed to download chrome: {error}"),
+        )
+    })?;
 
     tracing::info!(
         path = %info.executable_path.display(),

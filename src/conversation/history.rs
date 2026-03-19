@@ -1,5 +1,6 @@
 //! Conversation message persistence (SQLite).
 
+use crate::tooling::{ReceiptReference, SwarmMergeSummary, merge_receipt_references};
 use crate::{
     BranchId, ChannelId, RequestGroupMode, RequestGroupState, SourceManifest, TaskClass, WorkerId,
     WorkerOutcomeReceipt,
@@ -20,7 +21,7 @@ pub struct InterruptedWorkerRow {
     pub transcript: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestGroupRecord {
     pub id: String,
     pub agent_id: String,
@@ -35,6 +36,39 @@ pub struct RequestGroupRecord {
     pub completion_policy_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestGroupBranchRecord {
+    pub id: String,
+    pub description: String,
+    pub conclusion: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestGroupWorkerRecord {
+    pub id: String,
+    pub task: String,
+    pub status: String,
+    pub completed_at: Option<String>,
+    pub worker_type: String,
+    pub receipt: Option<ReceiptReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestGroupDetail {
+    pub request_group: RequestGroupRecord,
+    pub branches: Vec<RequestGroupBranchRecord>,
+    pub workers: Vec<RequestGroupWorkerRecord>,
+    pub merged: SwarmMergeSummary,
+}
+
+fn summarize_request_group_receipt(
+    worker_id: &str,
+    receipt: &WorkerOutcomeReceipt,
+) -> ReceiptReference {
+    crate::tooling::summarize_worker_receipt(worker_id.to_string(), receipt)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -466,6 +500,120 @@ impl ProcessRunLogger {
                 tracing::warn!(%error, request_group_id, "failed to update request group state");
             }
         });
+    }
+
+    /// Load recent request groups for an agent, newest first.
+    pub async fn list_request_groups(
+        &self,
+        agent_id: &str,
+        limit: i64,
+        channel_id: Option<&str>,
+        state: Option<&str>,
+    ) -> crate::error::Result<Vec<RequestGroupRecord>> {
+        let rows = sqlx::query_as::<_, RequestGroupRecord>(
+            "SELECT id, agent_id, channel_id, origin_message_id, origin_user_text, mode, state, \
+                    task_class, source_manifest_json, required_receipts_json, completion_policy_json, \
+                    created_at, updated_at \
+             FROM request_groups \
+             WHERE agent_id = ? \
+               AND (? IS NULL OR channel_id = ?) \
+               AND (? IS NULL OR state = ?) \
+             ORDER BY updated_at DESC \
+             LIMIT ?",
+        )
+        .bind(agent_id)
+        .bind(channel_id)
+        .bind(channel_id)
+        .bind(state)
+        .bind(state)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(rows)
+    }
+
+    /// Load one request-group with its branches, workers, and merged receipt summary.
+    pub async fn get_request_group_detail(
+        &self,
+        request_group_id: &str,
+    ) -> crate::error::Result<Option<RequestGroupDetail>> {
+        let request_group = sqlx::query_as::<_, RequestGroupRecord>(
+            "SELECT id, agent_id, channel_id, origin_message_id, origin_user_text, mode, state, \
+                    task_class, source_manifest_json, required_receipts_json, completion_policy_json, \
+                    created_at, updated_at \
+             FROM request_groups WHERE id = ?",
+        )
+        .bind(request_group_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        let Some(request_group) = request_group else {
+            return Ok(None);
+        };
+
+        let branch_rows = sqlx::query(
+            "SELECT id, description, conclusion, completed_at \
+             FROM branch_runs WHERE request_group_id = ? ORDER BY COALESCE(completed_at, started_at) ASC",
+        )
+        .bind(request_group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let branches = branch_rows
+            .into_iter()
+            .map(|row| RequestGroupBranchRecord {
+                id: row.try_get("id").unwrap_or_default(),
+                description: row.try_get("description").unwrap_or_default(),
+                conclusion: row.try_get("conclusion").ok(),
+                completed_at: row.try_get("completed_at").ok(),
+            })
+            .collect::<Vec<_>>();
+
+        let worker_rows = sqlx::query(
+            "SELECT id, task, status, completed_at, worker_type, outcome_receipt_json \
+             FROM worker_runs WHERE request_group_id = ? ORDER BY COALESCE(completed_at, started_at) ASC",
+        )
+        .bind(request_group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let workers = worker_rows
+            .into_iter()
+            .map(|row| {
+                let worker_id = row.try_get::<String, _>("id").unwrap_or_default();
+                let receipt = row
+                    .try_get::<String, _>("outcome_receipt_json")
+                    .ok()
+                    .and_then(|value| serde_json::from_str::<WorkerOutcomeReceipt>(&value).ok())
+                    .map(|receipt| summarize_request_group_receipt(&worker_id, &receipt));
+
+                RequestGroupWorkerRecord {
+                    id: worker_id,
+                    task: row.try_get("task").unwrap_or_default(),
+                    status: row.try_get("status").unwrap_or_default(),
+                    completed_at: row.try_get("completed_at").ok(),
+                    worker_type: row.try_get("worker_type").unwrap_or_default(),
+                    receipt,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let merged = merge_receipt_references(
+            &workers
+                .iter()
+                .filter_map(|worker| worker.receipt.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        Ok(Some(RequestGroupDetail {
+            request_group,
+            branches,
+            workers,
+            merged,
+        }))
     }
 
     /// Record a branch starting. Fire-and-forget.

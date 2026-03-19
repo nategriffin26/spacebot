@@ -326,6 +326,7 @@ impl Worker {
             self.deps.runtime_config.workspace_dir.clone(),
             self.deps.sandbox.clone(),
             mcp_tools,
+            self.deps.mcp_manager.clone(),
             self.deps.runtime_config.clone(),
         );
 

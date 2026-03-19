@@ -2,6 +2,8 @@
 
 pub mod capabilities;
 pub mod doctor;
+pub mod receipts;
+pub mod swarm;
 
 pub use capabilities::{
     CapabilityConfidence, CapabilityRecord, CapabilitySnapshot, CapabilityStatus,
@@ -9,3 +11,8 @@ pub use capabilities::{
     build_verified_capabilities,
 };
 pub use doctor::{DoctorDiagnosis, ToolDoctorReport, build_tool_doctor_report};
+pub use receipts::{ReceiptReference, summarize_worker_receipt};
+pub use swarm::{
+    SwarmCompletionPolicy, SwarmMergeSummary, SwarmPlan, SwarmRunSummary, SwarmShardResult,
+    SwarmShardSpec, merge_receipt_references,
+};

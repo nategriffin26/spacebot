@@ -3,8 +3,8 @@
 use super::state::ApiState;
 use super::{
     agents, bindings, channels, config, cortex, cron, factory, ingest, links, mcp, memories,
-    messaging, models, opencode_proxy, projects, providers, secrets, settings, skills, ssh, system,
-    tasks, tools, topics, webchat, workers,
+    messaging, models, opencode_proxy, projects, providers, request_groups, secrets, settings,
+    skills, ssh, system, tasks, tools, topics, webchat, workers,
 };
 
 use axum::Json;
@@ -87,6 +87,7 @@ pub async fn start_http_server(
             "/channels",
             get(channels::list_channels).delete(channels::delete_channel),
         )
+        .route("/channels/overview", get(channels::channel_overview))
         .route("/channels/archive", put(channels::set_channel_archive))
         .route("/channels/messages", get(channels::channel_messages))
         .route("/channels/status", get(channels::channel_status))
@@ -106,6 +107,14 @@ pub async fn start_http_server(
         .route("/agents/workers", get(workers::list_workers))
         .route("/agents/workers/detail", get(workers::worker_detail))
         .route(
+            "/agents/request-groups",
+            get(request_groups::list_request_groups),
+        )
+        .route(
+            "/agents/request-groups/detail",
+            get(request_groups::request_group_detail),
+        )
+        .route(
             "/opencode/{port}/{*path}",
             any(opencode_proxy::opencode_proxy),
         )
@@ -119,6 +128,7 @@ pub async fn start_http_server(
             get(memories::memory_graph_neighbors),
         )
         .route("/cortex/events", get(cortex::cortex_events))
+        .route("/cortex/summary", get(cortex::cortex_summary))
         .route("/cortex-chat/messages", get(cortex::cortex_chat_messages))
         .route("/cortex-chat/threads", get(cortex::cortex_chat_threads))
         .route(

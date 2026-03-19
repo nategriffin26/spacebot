@@ -10,6 +10,7 @@ use crate::agent::channel::{ChannelState, PendingBranchSpawn};
 use crate::agent::channel_prompt::{TemporalContext, build_worker_task_with_temporal_context};
 use crate::agent::worker::Worker;
 use crate::error::{AgentError, Error as SpacebotError};
+use crate::tooling::{SwarmPlan, SwarmShardSpec};
 use crate::tools::{BranchToolProfile, MemoryPersistenceContractState};
 use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, WorkerId};
 use futures::FutureExt as _;
@@ -158,6 +159,12 @@ struct BranchSpawnOptions {
     pending_worker_spawn: Option<PendingBranchSpawn>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SwarmDispatchResult {
+    pub request_group_id: Option<String>,
+    pub worker_ids: Vec<WorkerId>,
+}
+
 /// Spawn a branch from a ChannelState. Used by the BranchTool.
 pub async fn spawn_branch_from_state(
     state: &ChannelState,
@@ -269,6 +276,70 @@ pub async fn spawn_branch_and_spawn_from_state(
         },
     )
     .await
+}
+
+/// Spawn a coordinated multi-worker swarm against one request-group.
+pub async fn spawn_swarm_from_state(
+    state: &ChannelState,
+    plan: &SwarmPlan,
+) -> std::result::Result<SwarmDispatchResult, AgentError> {
+    if plan.shards.is_empty() {
+        return Err(AgentError::Other(anyhow::anyhow!(
+            "swarm plan requires at least one shard"
+        )));
+    }
+
+    ensure_dispatch_readiness(state, "swarm");
+    let request_group_id = state.ensure_request_group().await;
+    if let Some(request_group_id) = &request_group_id {
+        let required_receipts_json = serde_json::to_string(&serde_json::json!({
+            "required": true,
+            "summary": plan.summary,
+            "required_shards": plan
+                .shards
+                .iter()
+                .filter(|shard| shard.required)
+                .map(|shard| shard.key.clone())
+                .collect::<Vec<_>>(),
+        }))
+        .ok();
+        let completion_policy_json = serde_json::to_string(plan).ok();
+        state.process_run_logger.log_request_group_state(
+            request_group_id,
+            crate::RequestGroupState::Running,
+            required_receipts_json,
+            completion_policy_json,
+        );
+    }
+
+    let mut worker_ids = Vec::with_capacity(plan.shards.len());
+    for SwarmShardSpec {
+        key: _,
+        task,
+        suggested_skills,
+        topic_ids,
+        interactive,
+        required: _,
+    } in &plan.shards
+    {
+        let worker_id = spawn_worker_from_state(
+            state,
+            task,
+            *interactive,
+            &suggested_skills
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            topic_ids,
+        )
+        .await?;
+        worker_ids.push(worker_id);
+    }
+
+    Ok(SwarmDispatchResult {
+        request_group_id,
+        worker_ids,
+    })
 }
 
 fn ensure_dispatch_readiness(state: &ChannelState, dispatch_type: &'static str) {

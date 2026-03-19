@@ -1319,6 +1319,31 @@ pub fn search_mailbox(
     Ok(results)
 }
 
+/// Load mailbox history directly from IMAP for a set of message IDs.
+pub fn fetch_mailbox_history_by_message_ids(
+    config: &EmailConfig,
+    message_ids: Vec<String>,
+    limit: usize,
+) -> crate::Result<Vec<HistoryMessage>> {
+    let history_config = EmailPollConfig {
+        imap_host: config.imap_host.clone(),
+        imap_port: config.imap_port,
+        imap_username: config.imap_username.clone(),
+        imap_password: config.imap_password.clone(),
+        imap_use_tls: config.imap_use_tls,
+        from_address: config.from_address.clone(),
+        smtp_username: config.smtp_username.clone(),
+        folders: config.folders.clone(),
+        poll_interval: Duration::from_secs(config.poll_interval_secs.max(5)),
+        allowed_senders: config.allowed_senders.clone(),
+        max_body_bytes: config.max_body_bytes.max(1024),
+        runtime_key: "email".to_string(),
+    };
+
+    fetch_history_from_imap(&history_config, message_ids, limit)
+        .map_err(|error| anyhow::anyhow!(error).into())
+}
+
 fn sort_and_limit_search_hits(
     mut ranked_results: Vec<(i64, EmailSearchHit)>,
     limit: usize,

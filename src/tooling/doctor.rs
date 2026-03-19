@@ -29,7 +29,10 @@ fn diagnosis_for_reason(record: &CapabilityRecord) -> Option<(String, String, St
         "invalid_config" => "invalid_config",
         "binary_missing" => "binary_missing",
         "auth_missing" => "auth_missing",
-        "browser_profile_issue" | "stale_profile_lock" => "browser_profile_issue",
+        "browser_profile_issue" | "stale_profile_lock" | "active_profile_in_use" => {
+            "browser_profile_issue"
+        }
+        "websocket_unreachable" | "launch_failed" | "executable_not_found" => "browser_launch",
         "mcp_startup_failure" | "configured_but_not_connected" => "mcp_startup_failure",
         "naming_mismatch" => "naming_mismatch",
         "prompt_runtime_truth_mismatch" => "prompt_runtime_truth_mismatch",

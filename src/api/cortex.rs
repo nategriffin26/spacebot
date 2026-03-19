@@ -4,6 +4,7 @@ use crate::agent::cortex::{CortexEvent, CortexLogger};
 use crate::agent::cortex_chat::{
     CortexChatEvent, CortexChatMessage, CortexChatSendError, CortexChatStore, CortexChatThread,
 };
+use crate::memory::{SearchConfig, SearchMode};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -18,6 +19,23 @@ use std::sync::Arc;
 pub(super) struct CortexEventsResponse {
     events: Vec<CortexEvent>,
     total: i64,
+}
+
+#[derive(Serialize)]
+pub(super) struct CortexSummaryResponse {
+    recent_events: Vec<CortexEvent>,
+    autonomy_cycles: Vec<CortexEvent>,
+    recent_findings: Vec<AutonomyFindingSummary>,
+}
+
+#[derive(Serialize)]
+pub(super) struct AutonomyFindingSummary {
+    id: String,
+    memory_type: String,
+    source: Option<String>,
+    importance: f32,
+    created_at: String,
+    content: String,
 }
 
 #[derive(Serialize)]
@@ -57,10 +75,23 @@ pub(super) struct CortexEventsQuery {
     offset: i64,
     #[serde(default)]
     event_type: Option<String>,
+    #[serde(default)]
+    include_heartbeat: bool,
 }
 
 fn default_cortex_events_limit() -> i64 {
     50
+}
+
+#[derive(Deserialize)]
+pub(super) struct CortexSummaryQuery {
+    agent_id: String,
+    #[serde(default = "default_cortex_summary_limit")]
+    limit: i64,
+}
+
+fn default_cortex_summary_limit() -> i64 {
+    10
 }
 
 fn map_cortex_chat_send_error(error: &CortexChatSendError) -> StatusCode {
@@ -234,13 +265,20 @@ pub(super) async fn cortex_events(
     let limit = query.limit.min(200);
     let event_type_ref = query.event_type.as_deref();
 
-    let events = logger
-        .load_events(limit, query.offset, event_type_ref)
+    let mut events = logger
+        .load_events(limit.saturating_mul(2), query.offset, event_type_ref)
         .await
         .map_err(|error| {
             tracing::warn!(%error, agent_id = %query.agent_id, "failed to load cortex events");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    if !query.include_heartbeat && event_type_ref.is_none() {
+        events.retain(|event| event.event_type != "heartbeat");
+        events.truncate(limit as usize);
+    } else if events.len() > limit as usize {
+        events.truncate(limit as usize);
+    }
 
     let total = logger.count_events(event_type_ref).await.map_err(|error| {
         tracing::warn!(%error, agent_id = %query.agent_id, "failed to count cortex events");
@@ -248,6 +286,77 @@ pub(super) async fn cortex_events(
     })?;
 
     Ok(Json(CortexEventsResponse { events, total }))
+}
+
+pub(super) async fn cortex_summary(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<CortexSummaryQuery>,
+) -> Result<Json<CortexSummaryResponse>, StatusCode> {
+    let pools = state.agent_pools.load();
+    let pool = pools.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let logger = CortexLogger::new(pool.clone());
+    let limit = query.limit.clamp(1, 50);
+
+    let recent_events = logger
+        .load_events(limit.saturating_mul(3), 0, None)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, agent_id = %query.agent_id, "failed to load cortex summary events");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .into_iter()
+        .filter(|event| event.event_type != "heartbeat")
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+
+    let autonomy_cycles = logger
+        .load_events(limit.saturating_mul(4), 0, None)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, agent_id = %query.agent_id, "failed to load autonomy cycle events");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .into_iter()
+        .filter(|event| event.event_type.starts_with("autonomy_cycle_"))
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+
+    let memory_searches = state.memory_searches.load();
+    let memory_search = memory_searches
+        .get(&query.agent_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let findings = memory_search
+        .search(
+            "",
+            &SearchConfig {
+                mode: SearchMode::Recent,
+                source: Some("cortex:autonomy".to_string()),
+                max_results: limit as usize,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, agent_id = %query.agent_id, "failed to load autonomy findings");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(CortexSummaryResponse {
+        recent_events,
+        autonomy_cycles,
+        recent_findings: findings
+            .into_iter()
+            .map(|finding| AutonomyFindingSummary {
+                id: finding.memory.id,
+                memory_type: finding.memory.memory_type.to_string(),
+                source: finding.memory.source,
+                importance: finding.memory.importance,
+                created_at: finding.memory.created_at.to_rfc3339(),
+                content: finding.memory.content,
+            })
+            .collect(),
+    }))
 }
 
 #[cfg(test)]

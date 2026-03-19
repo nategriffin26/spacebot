@@ -4,6 +4,7 @@ use crate::config::{McpServerConfig, McpTransport};
 
 use anyhow::{Context as _, Result, anyhow};
 use axum::http::{HeaderName, HeaderValue};
+use reqwest::Url;
 use rmcp::ClientHandler;
 use rmcp::service::{NotificationContext, RoleClient, RunningService, ServiceError};
 use std::borrow::Cow;
@@ -31,6 +32,135 @@ pub struct McpServerStatus {
     pub enabled: bool,
     pub transport: String,
     pub state: McpConnectionState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpValidationIssue {
+    pub reason_code: String,
+    pub detail: String,
+    pub remediation: String,
+}
+
+pub fn validate_mcp_server_config(config: &McpServerConfig) -> Option<McpValidationIssue> {
+    match &config.transport {
+        McpTransport::Stdio { command, args, .. } => {
+            if command.trim().is_empty() {
+                return Some(McpValidationIssue {
+                    reason_code: "invalid_config".to_string(),
+                    detail: format!("MCP server '{}' has an empty stdio command", config.name),
+                    remediation: "Set a real executable in `command` for stdio MCP servers."
+                        .to_string(),
+                });
+            }
+            validate_chrome_devtools_mode(config, args)
+        }
+        McpTransport::Http { url, .. } => {
+            if Url::parse(url).is_err() {
+                return Some(McpValidationIssue {
+                    reason_code: "invalid_config".to_string(),
+                    detail: format!("MCP server '{}' has an invalid URL '{}'", config.name, url),
+                    remediation:
+                        "Set `url` to a valid streamable HTTP endpoint for this MCP server."
+                            .to_string(),
+                });
+            }
+
+            if is_chrome_devtools_server(config) {
+                return Some(McpValidationIssue {
+                    reason_code: "invalid_config".to_string(),
+                    detail: "Chrome DevTools MCP must run as a stdio subprocess, not HTTP."
+                        .to_string(),
+                    remediation: "Use `transport = \"stdio\"` with `command = \"npx\"` and the chrome-devtools-mcp package."
+                        .to_string(),
+                });
+            }
+
+            None
+        }
+    }
+}
+
+fn validate_chrome_devtools_mode(
+    config: &McpServerConfig,
+    args: &[String],
+) -> Option<McpValidationIssue> {
+    if !is_chrome_devtools_server(config) {
+        return None;
+    }
+
+    let auto_connect = has_flag(args, "--autoConnect");
+    let browser_url = flag_value(args, "--browser-url");
+
+    if auto_connect && browser_url.is_some() {
+        return Some(McpValidationIssue {
+            reason_code: "invalid_config".to_string(),
+            detail: "Chrome DevTools MCP cannot use `--autoConnect` and `--browser-url` together."
+                .to_string(),
+            remediation: "Choose exactly one mode: `--autoConnect` for interactive Chrome attach, or `--browser-url=http://127.0.0.1:9222` for remote-debugging attach."
+                .to_string(),
+        });
+    }
+
+    if !auto_connect && browser_url.is_none() {
+        return Some(McpValidationIssue {
+            reason_code: "invalid_config".to_string(),
+            detail: "Chrome DevTools MCP is missing an attach mode."
+                .to_string(),
+            remediation: "Add either `--autoConnect` or `--browser-url=http://127.0.0.1:9222` to the server args."
+                .to_string(),
+        });
+    }
+
+    if let Some(url) = browser_url
+        && Url::parse(&url).is_err()
+    {
+        return Some(McpValidationIssue {
+            reason_code: "invalid_config".to_string(),
+            detail: format!("Chrome DevTools MCP has an invalid --browser-url value: {url}"),
+            remediation: "Use a valid DevTools endpoint such as http://127.0.0.1:9222.".to_string(),
+        });
+    }
+
+    None
+}
+
+fn is_chrome_devtools_server(config: &McpServerConfig) -> bool {
+    if config.name.eq_ignore_ascii_case("chrome_devtools") {
+        return true;
+    }
+
+    match &config.transport {
+        McpTransport::Stdio { command, args, .. } => {
+            command.contains("chrome-devtools-mcp")
+                || args
+                    .iter()
+                    .any(|value| value.contains("chrome-devtools-mcp"))
+        }
+        McpTransport::Http { .. } => false,
+    }
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|value| value == flag)
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let inline_prefix = format!("{flag}=");
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix(&inline_prefix) {
+            return Some(value.to_string());
+        }
+        if arg == flag {
+            return args.get(index + 1).cloned();
+        }
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -494,6 +624,13 @@ pub struct McpManager {
     configs: RwLock<Vec<McpServerConfig>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpToolMetadata {
+    pub server_name: String,
+    pub tool_name: String,
+    pub description: String,
+}
+
 impl McpManager {
     pub fn new(configs: Vec<McpServerConfig>) -> Self {
         Self {
@@ -606,6 +743,54 @@ impl McpManager {
         }
 
         names
+    }
+
+    /// Return tool metadata for all connected MCP servers.
+    pub async fn list_connected_tools(&self) -> Vec<McpToolMetadata> {
+        let connections = self
+            .connections
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut tools = Vec::new();
+        for connection in connections {
+            if !connection.is_connected().await {
+                continue;
+            }
+
+            let server_name = connection.name().to_string();
+            for tool in connection.list_tools().await {
+                tools.push(McpToolMetadata {
+                    server_name: server_name.clone(),
+                    tool_name: tool.name.into_owned(),
+                    description: tool
+                        .description
+                        .map(|value| value.into_owned())
+                        .unwrap_or_default(),
+                });
+            }
+        }
+
+        tools
+    }
+
+    /// Call a specific tool on a connected MCP server.
+    pub async fn call_tool_on_server(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<rmcp::model::CallToolResult> {
+        let connection = {
+            let connections = self.connections.read().await;
+            connections.get(server_name).cloned()
+        }
+        .ok_or_else(|| anyhow!("mcp server '{}' is not registered", server_name))?;
+
+        connection.call_tool(tool_name, arguments).await
     }
 
     /// Return the names of MCP servers that are currently connected.
@@ -770,6 +955,7 @@ impl McpManager {
 
         let mut statuses = Vec::with_capacity(configs.len());
         for config in configs {
+            let validation_issue = validate_mcp_server_config(&config);
             let state = if let Some(connection) = connections.get(&config.name) {
                 connection.state().await
             } else {
@@ -781,6 +967,11 @@ impl McpManager {
                 enabled: config.enabled,
                 transport: config.transport.kind().to_string(),
                 state,
+                reason_code: validation_issue
+                    .as_ref()
+                    .map(|issue| issue.reason_code.clone()),
+                detail: validation_issue.as_ref().map(|issue| issue.detail.clone()),
+                remediation: validation_issue.map(|issue| issue.remediation),
             });
         }
 
@@ -933,5 +1124,66 @@ mod tests {
         assert_eq!(interpolate_env_placeholders("no-vars-here"), "no-vars-here");
         assert_eq!(interpolate_env_placeholders("${"), "${");
         assert_eq!(interpolate_env_placeholders("${}"), "${}");
+    }
+
+    #[test]
+    fn validate_chrome_devtools_rejects_both_attach_modes() {
+        let config = McpServerConfig {
+            name: "chrome_devtools".into(),
+            transport: McpTransport::Stdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "chrome-devtools-mcp@latest".into(),
+                    "--autoConnect".into(),
+                    "--browser-url=http://127.0.0.1:9222".into(),
+                ],
+                env: HashMap::new(),
+            },
+            enabled: true,
+        };
+
+        let issue = validate_mcp_server_config(&config).expect("config should be rejected");
+        assert_eq!(issue.reason_code, "invalid_config");
+        assert!(
+            issue
+                .detail
+                .contains("cannot use `--autoConnect` and `--browser-url` together")
+        );
+    }
+
+    #[test]
+    fn validate_chrome_devtools_requires_one_attach_mode() {
+        let config = McpServerConfig {
+            name: "chrome_devtools".into(),
+            transport: McpTransport::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                env: HashMap::new(),
+            },
+            enabled: true,
+        };
+
+        let issue = validate_mcp_server_config(&config).expect("config should be rejected");
+        assert!(issue.detail.contains("missing an attach mode"));
+    }
+
+    #[test]
+    fn validate_chrome_devtools_accepts_browser_url_mode() {
+        let config = McpServerConfig {
+            name: "chrome_devtools".into(),
+            transport: McpTransport::Stdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "chrome-devtools-mcp@latest".into(),
+                    "--browser-url=http://127.0.0.1:9222".into(),
+                ],
+                env: HashMap::new(),
+            },
+            enabled: true,
+        };
+
+        assert!(validate_mcp_server_config(&config).is_none());
     }
 }

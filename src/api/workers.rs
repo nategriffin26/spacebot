@@ -77,6 +77,8 @@ pub(super) struct WorkerDetailResponse {
     receipt_present: bool,
     receipt: Option<crate::WorkerOutcomeReceipt>,
     terminal_reason: Option<String>,
+    retry_count: Option<u32>,
+    merge_ready: Option<bool>,
     /// OpenCode session ID (for workers with an embeddable web UI).
     opencode_session_id: Option<String>,
     /// OpenCode server port (for workers with an embeddable web UI).
@@ -204,6 +206,8 @@ pub(super) async fn worker_detail(
         .as_ref()
         .and_then(|receipt| receipt.terminal_reason)
         .map(|value| value.as_str().to_string());
+    let retry_count = receipt.as_ref().map(|receipt| receipt.retries_attempted);
+    let merge_ready = receipt.as_ref().map(|receipt| receipt.merge_ready);
 
     Ok(Json(WorkerDetailResponse {
         id: detail.id,
@@ -232,6 +236,8 @@ pub(super) async fn worker_detail(
         receipt_present: receipt.is_some(),
         receipt,
         terminal_reason,
+        retry_count,
+        merge_ready,
         opencode_session_id: detail.opencode_session_id,
         opencode_port: detail.opencode_port,
         interactive: detail.interactive,

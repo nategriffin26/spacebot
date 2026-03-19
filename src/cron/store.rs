@@ -2,6 +2,7 @@
 
 use crate::cron::scheduler::CronConfig;
 use crate::error::Result;
+use crate::tooling::ReceiptReference;
 use anyhow::Context as _;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -10,6 +11,20 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct CronStore {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CronExecutionRecord {
+    pub cron_id: String,
+    pub success: bool,
+    pub result_summary: Option<String>,
+    pub channel_id: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub delivered: Option<bool>,
+    pub result_count: Option<u32>,
+    pub worker_ids: Vec<String>,
+    pub branch_ids: Vec<String>,
+    pub receipt_refs: Vec<ReceiptReference>,
 }
 
 impl CronStore {
@@ -123,24 +138,35 @@ impl CronStore {
     }
 
     /// Log a cron job execution result.
-    pub async fn log_execution(
-        &self,
-        cron_id: &str,
-        success: bool,
-        result_summary: Option<&str>,
-    ) -> Result<()> {
+    pub async fn log_execution(&self, record: CronExecutionRecord) -> Result<()> {
         let execution_id = uuid::Uuid::new_v4().to_string();
+        let worker_ids_json = serde_json::to_string(&record.worker_ids)
+            .context("failed to serialize cron worker ids")?;
+        let branch_ids_json = serde_json::to_string(&record.branch_ids)
+            .context("failed to serialize cron branch ids")?;
+        let receipt_refs_json = serde_json::to_string(&record.receipt_refs)
+            .context("failed to serialize cron receipt refs")?;
 
         sqlx::query(
             r#"
-            INSERT INTO cron_executions (id, cron_id, success, result_summary)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO cron_executions (
+                id, cron_id, success, result_summary, channel_id, terminal_reason,
+                delivered, result_count, worker_ids_json, branch_ids_json, receipt_refs_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&execution_id)
-        .bind(cron_id)
-        .bind(success as i64)
-        .bind(result_summary)
+        .bind(&record.cron_id)
+        .bind(record.success as i64)
+        .bind(record.result_summary.as_deref())
+        .bind(record.channel_id.as_deref())
+        .bind(record.terminal_reason.as_deref())
+        .bind(record.delivered.map(i64::from))
+        .bind(record.result_count.map(i64::from))
+        .bind(worker_ids_json)
+        .bind(branch_ids_json)
+        .bind(receipt_refs_json)
         .execute(&self.pool)
         .await
         .context("failed to log cron execution")?;
@@ -198,7 +224,8 @@ impl CronStore {
     ) -> Result<Vec<CronExecutionEntry>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, executed_at, success, result_summary
+            SELECT id, cron_id, executed_at, success, result_summary, channel_id, terminal_reason,
+                   delivered, result_count, worker_ids_json, branch_ids_json, receipt_refs_json
             FROM cron_executions
             WHERE cron_id = ?
             ORDER BY executed_at DESC
@@ -213,12 +240,7 @@ impl CronStore {
 
         let entries = rows
             .into_iter()
-            .map(|row| CronExecutionEntry {
-                id: row.try_get("id").unwrap_or_default(),
-                executed_at: row.try_get("executed_at").unwrap_or_default(),
-                success: row.try_get::<i64, _>("success").unwrap_or(0) != 0,
-                result_summary: row.try_get("result_summary").ok(),
-            })
+            .map(|row| CronExecutionEntry::from_row(&row))
             .collect();
 
         Ok(entries)
@@ -228,7 +250,8 @@ impl CronStore {
     pub async fn load_all_executions(&self, limit: i64) -> Result<Vec<CronExecutionEntry>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, cron_id, executed_at, success, result_summary
+            SELECT id, cron_id, executed_at, success, result_summary, channel_id, terminal_reason,
+                   delivered, result_count, worker_ids_json, branch_ids_json, receipt_refs_json
             FROM cron_executions
             ORDER BY executed_at DESC
             LIMIT ?
@@ -241,12 +264,7 @@ impl CronStore {
 
         let entries = rows
             .into_iter()
-            .map(|row| CronExecutionEntry {
-                id: row.try_get("id").unwrap_or_default(),
-                executed_at: row.try_get("executed_at").unwrap_or_default(),
-                success: row.try_get::<i64, _>("success").unwrap_or(0) != 0,
-                result_summary: row.try_get("result_summary").ok(),
-            })
+            .map(|row| CronExecutionEntry::from_row(&row))
             .collect();
 
         Ok(entries)
@@ -318,9 +336,52 @@ impl CronStore {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CronExecutionEntry {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_id: Option<String>,
     pub executed_at: String,
     pub success: bool,
     pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branch_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_refs: Vec<ReceiptReference>,
+}
+
+impl CronExecutionEntry {
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Self {
+        Self {
+            id: row.try_get("id").unwrap_or_default(),
+            cron_id: row.try_get("cron_id").ok(),
+            executed_at: row.try_get("executed_at").unwrap_or_default(),
+            success: row.try_get::<i64, _>("success").unwrap_or(0) != 0,
+            result_summary: row.try_get("result_summary").ok(),
+            channel_id: row.try_get("channel_id").ok(),
+            terminal_reason: row.try_get("terminal_reason").ok(),
+            delivered: row
+                .try_get::<Option<i64>, _>("delivered")
+                .ok()
+                .flatten()
+                .map(|value| value != 0),
+            result_count: row
+                .try_get::<Option<i64>, _>("result_count")
+                .ok()
+                .flatten()
+                .and_then(|value| u32::try_from(value).ok()),
+            worker_ids: decode_json_list(row.try_get("worker_ids_json").ok()),
+            branch_ids: decode_json_list(row.try_get("branch_ids_json").ok()),
+            receipt_refs: decode_json_list(row.try_get("receipt_refs_json").ok()),
+        }
+    }
 }
 
 /// Execution statistics for a cron job.
@@ -332,3 +393,11 @@ pub struct CronExecutionStats {
 }
 
 use sqlx::Row as _;
+
+fn decode_json_list<T>(raw: Option<String>) -> Vec<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    raw.and_then(|value| serde_json::from_str::<Vec<T>>(&value).ok())
+        .unwrap_or_default()
+}

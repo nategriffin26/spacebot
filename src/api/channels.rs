@@ -26,6 +26,27 @@ pub(super) struct ChannelsResponse {
     channels: Vec<ChannelResponse>,
 }
 
+#[derive(Serialize)]
+pub(super) struct ChannelOverviewResponse {
+    channels: Vec<ChannelOverviewItem>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ChannelOverviewItem {
+    agent_id: String,
+    id: String,
+    platform: String,
+    display_name: Option<String>,
+    persisted_active: bool,
+    live: bool,
+    lifecycle_state: String,
+    active_workers: usize,
+    active_branches: usize,
+    completed_items: usize,
+    last_activity_at: String,
+    created_at: String,
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct ListChannelsQuery {
     #[serde(default)]
@@ -131,6 +152,80 @@ pub(super) async fn list_channels(
 
     Json(ChannelsResponse {
         channels: all_channels,
+    })
+}
+
+/// Merge persisted channel rows with live StatusBlock state so operators can
+/// see whether a channel is active in memory, only persisted on disk, or archived.
+pub(super) async fn channel_overview(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ListChannelsQuery>,
+) -> Json<ChannelOverviewResponse> {
+    let pools = state.agent_pools.load();
+    let mut collected_channels: Vec<AgentChannel> = Vec::new();
+    let is_active_filter = resolve_is_active_filter(&query);
+
+    for (agent_id, pool) in pools.iter() {
+        if query.agent_id.as_deref().is_some_and(|id| id != agent_id) {
+            continue;
+        }
+        let store = ChannelStore::new(pool.clone());
+        if let Ok(channels) = store.list(is_active_filter).await {
+            for channel in channels {
+                collected_channels.push((agent_id.clone(), channel));
+            }
+        }
+    }
+
+    sort_channels_newest_first(&mut collected_channels);
+
+    let live_snapshot: HashMap<String, (usize, usize, usize)> = {
+        let blocks = state.channel_status_blocks.read().await;
+        let mut map = HashMap::new();
+        for (channel_id, status_block) in blocks.iter() {
+            let block = status_block.read().await;
+            map.insert(
+                channel_id.clone(),
+                (
+                    block.active_workers.len(),
+                    block.active_branches.len(),
+                    block.completed_items.len(),
+                ),
+            );
+        }
+        map
+    };
+
+    Json(ChannelOverviewResponse {
+        channels: collected_channels
+            .into_iter()
+            .map(|(agent_id, channel)| {
+                let live_state = live_snapshot.get(&channel.id).cloned().unwrap_or_default();
+                let live = live_snapshot.contains_key(&channel.id);
+                let lifecycle_state = if live && channel.is_active {
+                    "live_active"
+                } else if channel.is_active {
+                    "persisted_idle"
+                } else {
+                    "archived"
+                };
+
+                ChannelOverviewItem {
+                    agent_id,
+                    id: channel.id,
+                    platform: channel.platform,
+                    display_name: channel.display_name,
+                    persisted_active: channel.is_active,
+                    live,
+                    lifecycle_state: lifecycle_state.to_string(),
+                    active_workers: live_state.0,
+                    active_branches: live_state.1,
+                    completed_items: live_state.2,
+                    last_activity_at: channel.last_activity_at.to_rfc3339(),
+                    created_at: channel.created_at.to_rfc3339(),
+                }
+            })
+            .collect(),
     })
 }
 

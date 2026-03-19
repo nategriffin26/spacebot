@@ -129,6 +129,7 @@ fn worker_tool_names(
         "set_status".to_string(),
         "record_receipt".to_string(),
         "read_skill".to_string(),
+        "personal_ops".to_string(),
     ];
 
     if secrets_enabled {
@@ -227,6 +228,51 @@ fn opencode_path_status(path: &str) -> (CapabilityStatus, Option<String>, Option
             Some(format!(
                 "Install or expose the OpenCode binary at '{resolved}'."
             )),
+        )
+    }
+}
+
+fn email_bundle_status(
+    runtime_config: &RuntimeConfig,
+) -> (CapabilityStatus, Option<String>, Option<String>) {
+    match crate::config::Config::load_for_instance(&runtime_config.instance_dir)
+        .ok()
+        .and_then(|config| config.messaging.email)
+    {
+        Some(email) if email.enabled => (CapabilityStatus::Available, None, None),
+        Some(_) => (
+            CapabilityStatus::Unavailable,
+            Some("disabled_in_config".to_string()),
+            Some("Enable the email adapter to use personal_ops mail actions.".to_string()),
+        ),
+        None => (
+            CapabilityStatus::Unavailable,
+            Some("not_configured".to_string()),
+            Some("Configure messaging.email to expose mail personal-ops actions.".to_string()),
+        ),
+    }
+}
+
+fn connected_mcp_bundle_status(
+    connected_mcp_tool_names: &[String],
+    keywords: &[&str],
+    remediation: &str,
+) -> (CapabilityStatus, Option<String>, Option<String>) {
+    let combined = connected_mcp_tool_names
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let available = combined
+        .iter()
+        .any(|value| keywords.iter().any(|keyword| value.contains(keyword)));
+
+    if available {
+        (CapabilityStatus::Available, None, None)
+    } else {
+        (
+            CapabilityStatus::Degraded,
+            Some("bundle_unavailable".to_string()),
+            Some(remediation.to_string()),
         )
     }
 }
@@ -367,6 +413,38 @@ pub fn build_capability_snapshot(
             source: None,
             last_verified_at: None,
         });
+    } else if let Some(health) = crate::tools::browser::load_browser_health(runtime_config) {
+        capabilities.push(CapabilityRecord {
+            id: "bundle:browser".to_string(),
+            name: "browser".to_string(),
+            subject: CapabilitySubject::Bundle,
+            status: CapabilityStatus::Degraded,
+            process_types: vec![ProcessType::Worker],
+            invocation_path: "browser_*".to_string(),
+            confidence: CapabilityConfidence::DerivedBundle,
+            reason_code: Some(health.reason_code),
+            detail: Some(health.detail),
+            remediation: Some(health.remediation),
+            source: Some("browser_runtime".to_string()),
+            last_verified_at: Some(health.updated_at),
+        });
+    } else {
+        capabilities.push(CapabilityRecord {
+            id: "bundle:browser".to_string(),
+            name: "browser".to_string(),
+            subject: CapabilitySubject::Bundle,
+            status: CapabilityStatus::Available,
+            process_types: vec![ProcessType::Worker],
+            invocation_path: "browser_*".to_string(),
+            confidence: CapabilityConfidence::DerivedBundle,
+            reason_code: None,
+            detail: Some(
+                "browser tools are enabled and no recent launch issue is recorded".to_string(),
+            ),
+            remediation: None,
+            source: Some("browser_runtime".to_string()),
+            last_verified_at: Some(now.clone()),
+        });
     }
 
     if runtime_config.brave_search_key.load().is_none() {
@@ -423,6 +501,109 @@ pub fn build_capability_snapshot(
             .then(|| now.clone()),
     });
 
+    let (mail_status, mail_reason, mail_remediation) = email_bundle_status(runtime_config);
+    capabilities.push(CapabilityRecord {
+        id: "bundle:personal_ops_mail".to_string(),
+        name: "personal_ops_mail".to_string(),
+        subject: CapabilitySubject::Bundle,
+        status: mail_status,
+        process_types: vec![ProcessType::Worker],
+        invocation_path: "personal_ops(action=mail_search|mail_read_thread)".to_string(),
+        confidence: CapabilityConfidence::DerivedBundle,
+        reason_code: mail_reason,
+        detail: Some("typed mailbox search and thread-read operations".to_string()),
+        remediation: mail_remediation,
+        source: Some("runtime_config".to_string()),
+        last_verified_at: (mail_status == CapabilityStatus::Available).then(|| now.clone()),
+    });
+
+    let (calendar_status, calendar_reason, calendar_remediation) = connected_mcp_bundle_status(
+        connected_mcp_tool_names,
+        &["calendar", "event", "gcal"],
+        "Connect a calendar-capable MCP server to use personal_ops calendar actions.",
+    );
+    capabilities.push(CapabilityRecord {
+        id: "bundle:personal_ops_calendar".to_string(),
+        name: "personal_ops_calendar".to_string(),
+        subject: CapabilitySubject::Bundle,
+        status: calendar_status,
+        process_types: vec![ProcessType::Worker],
+        invocation_path: "personal_ops(action=calendar_search|calendar_create)".to_string(),
+        confidence: CapabilityConfidence::DerivedBundle,
+        reason_code: calendar_reason,
+        detail: Some("typed calendar search/create actions over MCP".to_string()),
+        remediation: calendar_remediation,
+        source: Some("mcp_runtime".to_string()),
+        last_verified_at: (calendar_status == CapabilityStatus::Available).then(|| now.clone()),
+    });
+
+    let (drive_status, drive_reason, drive_remediation) = connected_mcp_bundle_status(
+        connected_mcp_tool_names,
+        &["drive", "gdrive", "docs"],
+        "Connect a drive-capable MCP server to use personal_ops drive actions.",
+    );
+    capabilities.push(CapabilityRecord {
+        id: "bundle:personal_ops_drive".to_string(),
+        name: "personal_ops_drive".to_string(),
+        subject: CapabilitySubject::Bundle,
+        status: drive_status,
+        process_types: vec![ProcessType::Worker],
+        invocation_path: "personal_ops(action=drive_list|drive_export|drive_sync)".to_string(),
+        confidence: CapabilityConfidence::DerivedBundle,
+        reason_code: drive_reason,
+        detail: Some("typed drive list/export/sync actions over MCP".to_string()),
+        remediation: drive_remediation,
+        source: Some("mcp_runtime".to_string()),
+        last_verified_at: (drive_status == CapabilityStatus::Available).then(|| now.clone()),
+    });
+
+    let (bookmark_status, bookmark_reason, bookmark_remediation) = connected_mcp_bundle_status(
+        connected_mcp_tool_names,
+        &["bookmark", "bookmarks", "raindrop", "pocket", "save"],
+        "Connect a bookmark-capable MCP server to use personal_ops bookmark ingest.",
+    );
+    capabilities.push(CapabilityRecord {
+        id: "bundle:personal_ops_bookmark_ingest".to_string(),
+        name: "personal_ops_bookmark_ingest".to_string(),
+        subject: CapabilitySubject::Bundle,
+        status: bookmark_status,
+        process_types: vec![ProcessType::Worker],
+        invocation_path: "personal_ops(action=bookmark_ingest)".to_string(),
+        confidence: CapabilityConfidence::DerivedBundle,
+        reason_code: bookmark_reason,
+        detail: Some("typed bookmark ingest over MCP".to_string()),
+        remediation: bookmark_remediation,
+        source: Some("mcp_runtime".to_string()),
+        last_verified_at: (bookmark_status == CapabilityStatus::Available).then(|| now.clone()),
+    });
+
+    capabilities.push(CapabilityRecord {
+        id: "bundle:personal_ops_browser_auth".to_string(),
+        name: "personal_ops_browser_auth".to_string(),
+        subject: CapabilitySubject::Bundle,
+        status: if browser.enabled {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable
+        },
+        process_types: vec![ProcessType::Worker],
+        invocation_path: "personal_ops(action=browser_auth_status)".to_string(),
+        confidence: CapabilityConfidence::DerivedBundle,
+        reason_code: if browser.enabled {
+            None
+        } else {
+            Some("disabled_in_config".to_string())
+        },
+        detail: Some("browser-auth readiness and persistent-profile health".to_string()),
+        remediation: if browser.enabled {
+            None
+        } else {
+            Some("Enable [browser].enabled to inspect browser auth status.".to_string())
+        },
+        source: Some("browser_runtime".to_string()),
+        last_verified_at: browser.enabled.then(|| now.clone()),
+    });
+
     for skill in runtime_config.skills.load().list() {
         let source = match skill.source {
             crate::skills::SkillSource::Instance => "instance",
@@ -450,6 +631,24 @@ pub fn build_capability_snapshot(
         .iter()
         .filter(|server| server.enabled)
     {
+        if let Some(issue) = crate::mcp::validate_mcp_server_config(server) {
+            capabilities.push(CapabilityRecord {
+                id: format!("mcp:{}", server.name),
+                name: server.name.clone(),
+                subject: CapabilitySubject::McpServer,
+                status: CapabilityStatus::Degraded,
+                process_types: vec![ProcessType::Worker],
+                invocation_path: format!("mcp:{}", server.name),
+                confidence: CapabilityConfidence::ConfiguredButNotConnected,
+                reason_code: Some(issue.reason_code),
+                detail: Some(issue.detail),
+                remediation: Some(issue.remediation),
+                source: Some("config_validation".to_string()),
+                last_verified_at: None,
+            });
+            continue;
+        }
+
         let connected = connected_mcp_servers
             .iter()
             .any(|name| name == &server.name);

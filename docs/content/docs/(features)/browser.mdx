@@ -7,6 +7,8 @@ description: Headless Chrome automation for workers via CDP and the ref system.
 
 Browser automation for Spacebot workers via headless Chrome. Workers can navigate websites, interact with page elements, take screenshots, and extract content. Built on [chromiumoxide](https://github.com/mattsse/chromiumoxide), which drives Chrome over the DevTools Protocol (CDP).
 
+When `browser.persist_session = true`, Spacebot now distinguishes a stale Chrome profile lock from a live conflicting browser session. Stale singleton files are cleaned up automatically; a genuinely active profile reports a structured health error instead of being clobbered.
+
 If you need Spacebot to attach to an already running Chrome session instead of launching its own browser process, use [MCP](/docs/mcp) with `chrome-devtools-mcp`. The built-in browser tool does not currently attach to a manually started Chrome instance.
 
 ## Why Worker-Only

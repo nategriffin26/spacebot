@@ -1,7 +1,8 @@
 //! Higher-level channel work action tool.
 
 use crate::agent::channel::ChannelState;
-use crate::agent::channel_dispatch::spawn_branch_and_spawn_from_state;
+use crate::agent::channel_dispatch::{spawn_branch_and_spawn_from_state, spawn_swarm_from_state};
+use crate::tooling::{SwarmCompletionPolicy, SwarmPlan, SwarmShardSpec};
 use crate::tools::TurnActionTracker;
 use crate::{BranchId, WorkerId};
 
@@ -58,9 +59,30 @@ pub struct WorkArgs {
     /// choose a direct worker spawn.
     #[serde(default)]
     pub prefer_preparation: bool,
+    /// Optional shard list for orchestrated multi-worker execution.
+    #[serde(default)]
+    pub shards: Vec<WorkShardArgs>,
     /// Optional cancellation reason.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WorkShardArgs {
+    pub key: String,
+    pub task: String,
+    #[serde(default)]
+    pub suggested_skills: Vec<String>,
+    #[serde(default)]
+    pub topic_ids: Vec<String>,
+    #[serde(default)]
+    pub interactive: bool,
+    #[serde(default = "default_required_shard")]
+    pub required: bool,
+}
+
+const fn default_required_shard() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +150,22 @@ impl Tool for WorkTool {
                         "default": false,
                         "description": "Force a prep branch before execution."
                     },
+                    "shards": {
+                        "type": "array",
+                        "description": "Optional multi-lane worker plan for one coordinated swarm run.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": { "type": "string" },
+                                "task": { "type": "string" },
+                                "suggested_skills": { "type": "array", "items": { "type": "string" } },
+                                "topic_ids": { "type": "array", "items": { "type": "string" } },
+                                "interactive": { "type": "boolean", "default": false },
+                                "required": { "type": "boolean", "default": true }
+                            },
+                            "required": ["key", "task"]
+                        }
+                    },
                     "reason": {
                         "type": "string",
                         "description": "Optional cancel reason."
@@ -151,6 +189,10 @@ impl Tool for WorkTool {
 
 impl WorkTool {
     async fn start_work(&self, args: WorkArgs) -> Result<WorkOutput, WorkError> {
+        if !args.shards.is_empty() {
+            return self.start_swarm(args).await;
+        }
+
         let task = args
             .task
             .as_deref()
@@ -238,6 +280,64 @@ impl WorkTool {
                 format!("Started worker {worker_id} for: {task}")
             },
             worker_id: Some(worker_id),
+            branch_id: None,
+        })
+    }
+
+    async fn start_swarm(&self, args: WorkArgs) -> Result<WorkOutput, WorkError> {
+        let task = args
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("multi-lane work");
+
+        let shards = args
+            .shards
+            .into_iter()
+            .map(|shard| {
+                if shard.key.trim().is_empty() || shard.task.trim().is_empty() {
+                    return Err(WorkError(
+                        "each shard requires a non-empty key and task".to_string(),
+                    ));
+                }
+
+                Ok(SwarmShardSpec {
+                    key: shard.key.trim().to_string(),
+                    task: shard.task.trim().to_string(),
+                    suggested_skills: shard.suggested_skills,
+                    topic_ids: shard.topic_ids,
+                    interactive: shard.interactive,
+                    required: shard.required,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let plan = SwarmPlan {
+            summary: task.to_string(),
+            shards,
+            completion_policy: SwarmCompletionPolicy::default(),
+        };
+
+        let dispatch = spawn_swarm_from_state(&self.state, &plan)
+            .await
+            .map_err(|error| WorkError(error.to_string()))?;
+        self.turn_action_tracker.mark_action("work:start:swarm");
+
+        Ok(WorkOutput {
+            success: true,
+            action: "start".to_string(),
+            dispatch: "swarm".to_string(),
+            message: format!(
+                "Started swarm run for {} shard(s){}.",
+                dispatch.worker_ids.len(),
+                dispatch
+                    .request_group_id
+                    .as_ref()
+                    .map(|value| format!(" in request group {value}"))
+                    .unwrap_or_default()
+            ),
+            worker_id: dispatch.worker_ids.first().copied(),
             branch_id: None,
         })
     }

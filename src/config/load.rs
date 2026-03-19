@@ -373,11 +373,17 @@ fn parse_mcp_server_config(raw: TomlMcpServerConfig) -> Result<McpServerConfig> 
         }
     };
 
-    Ok(McpServerConfig {
+    let config = McpServerConfig {
         name: raw.name,
         transport,
         enabled: raw.enabled,
-    })
+    };
+
+    if let Some(issue) = crate::mcp::validate_mcp_server_config(&config) {
+        return Err(ConfigError::Invalid(issue.detail).into());
+    }
+
+    Ok(config)
 }
 
 impl Config {

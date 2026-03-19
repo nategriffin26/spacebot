@@ -42,6 +42,8 @@ pub(super) struct McpServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
 }
 
@@ -99,6 +101,45 @@ fn ensure_configured_mcp_tables_mut(doc: &mut DocumentMut) -> Option<&mut ArrayO
     defaults.get_mut("mcp")?.as_array_of_tables_mut()
 }
 
+fn build_server_config(
+    request: &CreateMcpServerRequest,
+) -> Result<crate::config::McpServerConfig, String> {
+    let transport = match request.transport.as_str() {
+        "stdio" => crate::config::McpTransport::Stdio {
+            command: request
+                .command
+                .clone()
+                .ok_or_else(|| "stdio MCP servers require `command`".to_string())?,
+            args: request.args.clone(),
+            env: request.env.clone(),
+        },
+        "http" => crate::config::McpTransport::Http {
+            url: request
+                .url
+                .clone()
+                .ok_or_else(|| "http MCP servers require `url`".to_string())?,
+            headers: request.headers.clone(),
+        },
+        other => {
+            return Err(format!(
+                "invalid transport '{other}', expected 'stdio' or 'http'"
+            ));
+        }
+    };
+
+    let config = crate::config::McpServerConfig {
+        name: request.name.clone(),
+        transport,
+        enabled: request.enabled,
+    };
+
+    if let Some(issue) = crate::mcp::validate_mcp_server_config(&config) {
+        return Err(issue.detail);
+    }
+
+    Ok(config)
+}
+
 /// GET /api/mcp/servers — list configured MCP servers from config.toml.
 pub(super) async fn list_mcp_servers(
     State(state): State<Arc<ApiState>>,
@@ -149,6 +190,7 @@ pub(super) async fn list_mcp_servers(
             enabled,
             state: state_str,
             reason_code: None,
+            detail: None,
             remediation: None,
         });
     }
@@ -165,6 +207,13 @@ pub(super) async fn create_mcp_server(
         return Ok(Json(MutationResponse {
             success: false,
             message: "Server name cannot be empty".into(),
+        }));
+    }
+
+    if let Err(message) = build_server_config(&request) {
+        return Ok(Json(MutationResponse {
+            success: false,
+            message,
         }));
     }
 
@@ -249,6 +298,13 @@ pub(super) async fn update_mcp_server(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateMcpServerRequest>,
 ) -> Result<Json<MutationResponse>, StatusCode> {
+    if let Err(message) = build_server_config(&request) {
+        return Ok(Json(MutationResponse {
+            success: false,
+            message,
+        }));
+    }
+
     let config_path = state.config_path.read().await.clone();
     if !config_path.exists() {
         return Ok(Json(MutationResponse {
@@ -420,10 +476,16 @@ pub(super) async fn mcp_status(State(state): State<Arc<ApiState>>) -> Json<Vec<M
             .map(|s| McpServerInfo {
                 reason_code: capability_lookup
                     .get(&s.name)
-                    .and_then(|record| record.reason_code.clone()),
+                    .and_then(|record| record.reason_code.clone())
+                    .or(s.reason_code),
+                detail: capability_lookup
+                    .get(&s.name)
+                    .and_then(|record| record.detail.clone())
+                    .or(s.detail),
                 remediation: capability_lookup
                     .get(&s.name)
-                    .and_then(|record| record.remediation.clone()),
+                    .and_then(|record| record.remediation.clone())
+                    .or(s.remediation),
                 name: s.name,
                 transport: s.transport,
                 enabled: s.enabled,

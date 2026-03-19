@@ -98,6 +98,12 @@ args = [
 
 That requires Chrome 144+ and a one-time enablement flow in `chrome://inspect/#remote-debugging`.
 
+Spacebot now validates this configuration on write/load:
+
+- `chrome_devtools` must use `transport = "stdio"`
+- choose exactly one attach mode: `--autoConnect` or `--browser-url=...`
+- invalid combinations are rejected up front instead of surfacing later as a generic MCP startup failure
+
 ## When To Use Built-in Browser vs MCP
 
 - Use the built-in browser tool when Spacebot should launch and own its own Chrome instance.

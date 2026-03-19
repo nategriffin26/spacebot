@@ -44,6 +44,7 @@ pub mod memory_delete;
 pub mod memory_persistence_complete;
 pub mod memory_recall;
 pub mod memory_save;
+pub mod personal_ops;
 pub mod project_manage;
 pub mod react;
 pub mod read_skill;
@@ -117,6 +118,7 @@ pub use memory_recall::{
 pub use memory_save::{
     AssociationInput, MemorySaveArgs, MemorySaveError, MemorySaveOutput, MemorySaveTool,
 };
+pub use personal_ops::{PersonalOpsArgs, PersonalOpsError, PersonalOpsOutput, PersonalOpsTool};
 pub use project_manage::{
     ProjectManageArgs, ProjectManageError, ProjectManageOutput, ProjectManageTool,
 };
@@ -686,6 +688,7 @@ pub fn create_worker_tool_server(
     workspace: PathBuf,
     sandbox: Arc<Sandbox>,
     mcp_tools: Vec<McpToolAdapter>,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     runtime_config: Arc<RuntimeConfig>,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
@@ -703,7 +706,11 @@ pub fn create_worker_tool_server(
             status_tool
         })
         .tool(RecordReceiptTool::new(worker_id, run_logger))
-        .tool(ReadSkillTool::new(runtime_config.clone()));
+        .tool(ReadSkillTool::new(runtime_config.clone()))
+        .tool(PersonalOpsTool::new(
+            runtime_config.clone(),
+            mcp_manager.clone(),
+        ));
 
     server = register_file_tools(server, workspace, sandbox);
 
@@ -746,6 +753,7 @@ pub fn list_worker_tool_names(
         SetStatusTool::NAME.to_string(),
         RecordReceiptTool::NAME.to_string(),
         ReadSkillTool::NAME.to_string(),
+        PersonalOpsTool::NAME.to_string(),
     ];
 
     if secrets_enabled {

@@ -1,0 +1,11 @@
+Use typed personal-ops actions instead of raw shell or generic MCP spelunking when the task is about calendar, mail, drive, bookmarks, or browser-auth readiness.
+
+Available actions:
+- `mail_search` — search the configured mailbox through IMAP
+- `mail_read_thread` — load a thread/history by message ID
+- `calendar_search` / `calendar_create` — routed to connected calendar MCP tools
+- `drive_list` / `drive_export` / `drive_sync` — routed to connected drive MCP tools
+- `bookmark_ingest` — routed to connected bookmark-capable MCP tools
+- `browser_auth_status` — inspect browser profile/auth readiness
+
+Mutation actions (`calendar_create`, `drive_sync`, `bookmark_ingest`) require `confirm_mutation=true` so the runtime can respect autonomy approval boundaries.
