@@ -3365,6 +3365,26 @@ pub fn spawn_autonomy_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutonomyCycleDecision {
+    Run,
+    SkipDisabled,
+    SkipNotReady,
+}
+
+fn autonomy_cycle_decision(
+    config: crate::config::CortexConfig,
+    readiness: crate::config::WorkReadiness,
+) -> AutonomyCycleDecision {
+    if !config.autonomy_enabled {
+        return AutonomyCycleDecision::SkipDisabled;
+    }
+    if !readiness.ready {
+        return AutonomyCycleDecision::SkipNotReady;
+    }
+    AutonomyCycleDecision::Run
+}
+
 async fn run_autonomy_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow::Result<()> {
     tracing::info!("cortex autonomy loop started");
     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -3374,8 +3394,24 @@ async fn run_autonomy_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow::R
         tokio::time::sleep(Duration::from_secs(config.autonomy_interval_secs.max(60))).await;
 
         let config = **deps.runtime_config.cortex.load();
-        if !config.autonomy_enabled {
-            continue;
+        let readiness = deps.runtime_config.work_readiness();
+        match autonomy_cycle_decision(config, readiness) {
+            AutonomyCycleDecision::Run => {}
+            AutonomyCycleDecision::SkipDisabled => continue,
+            AutonomyCycleDecision::SkipNotReady => {
+                logger.log(
+                    "autonomy_cycle_skipped_not_ready",
+                    "Autonomy cycle skipped while runtime is not ready for work",
+                    Some(serde_json::json!({
+                        "reason": readiness.reason.map(|reason| reason.as_str()),
+                        "warmup_state": format!("{:?}", readiness.warmup_state).to_lowercase(),
+                        "embedding_ready": readiness.embedding_ready,
+                        "bulletin_age_secs": readiness.bulletin_age_secs,
+                        "stale_after_secs": readiness.stale_after_secs,
+                    })),
+                );
+                continue;
+            }
         }
 
         if let Err(error) = run_one_autonomy_cycle(deps, logger, config).await {
@@ -4147,10 +4183,11 @@ async fn sync_one_topic(
 #[cfg(test)]
 mod tests {
     use super::{
-        BULLETIN_REFRESH_CIRCUIT_OPEN_SECS, BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD, BranchTracker,
-        BulletinRefreshOutcome, CortexReceiverOutcome, HealthRuntimeState,
-        MAINTENANCE_TASK_CANCEL_GRACE_SECS, MaintenanceTimeoutAction, ReceiverClosedBehavior,
-        Signal, WorkerTracker, apply_cancelled_warmup_status, build_kill_targets,
+        AutonomyCycleDecision, BULLETIN_REFRESH_CIRCUIT_OPEN_SECS,
+        BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD, BranchTracker, BulletinRefreshOutcome,
+        CortexReceiverOutcome, HealthRuntimeState, MAINTENANCE_TASK_CANCEL_GRACE_SECS,
+        MaintenanceTimeoutAction, ReceiverClosedBehavior, Signal, WorkerTracker,
+        apply_cancelled_warmup_status, autonomy_cycle_decision, build_kill_targets,
         claim_detached_completion, detached_timeout_transition, handle_cortex_receiver_result,
         has_completed_initial_warmup, is_cancelled_control_result, is_terminal_control_result,
         maintenance_task_timeout, maintenance_timeout_action, maybe_close_bulletin_refresh_circuit,
@@ -4376,6 +4413,69 @@ mod tests {
         let text = "a".repeat(200);
         let summary = summarize_signal_text(&text);
         assert_eq!(summary.chars().count(), crate::EVENT_SUMMARY_MAX_CHARS);
+    }
+
+    fn test_work_readiness(
+        ready: bool,
+        reason: Option<crate::config::WorkReadinessReason>,
+    ) -> crate::config::WorkReadiness {
+        crate::config::WorkReadiness {
+            ready,
+            reason,
+            warmup_state: if ready {
+                crate::config::WarmupState::Warm
+            } else {
+                crate::config::WarmupState::Cold
+            },
+            embedding_ready: ready,
+            bulletin_age_secs: ready.then_some(10),
+            stale_after_secs: 120,
+        }
+    }
+
+    #[test]
+    fn autonomy_cycle_decision_skips_when_disabled() {
+        let config = crate::config::CortexConfig {
+            autonomy_enabled: false,
+            ..crate::config::CortexConfig::default()
+        };
+
+        assert_eq!(
+            autonomy_cycle_decision(config, test_work_readiness(true, None)),
+            AutonomyCycleDecision::SkipDisabled
+        );
+    }
+
+    #[test]
+    fn autonomy_cycle_decision_skips_when_runtime_not_ready() {
+        let config = crate::config::CortexConfig {
+            autonomy_enabled: true,
+            ..crate::config::CortexConfig::default()
+        };
+
+        assert_eq!(
+            autonomy_cycle_decision(
+                config,
+                test_work_readiness(
+                    false,
+                    Some(crate::config::WorkReadinessReason::BulletinStale)
+                ),
+            ),
+            AutonomyCycleDecision::SkipNotReady
+        );
+    }
+
+    #[test]
+    fn autonomy_cycle_decision_runs_when_enabled_and_ready() {
+        let config = crate::config::CortexConfig {
+            autonomy_enabled: true,
+            ..crate::config::CortexConfig::default()
+        };
+
+        assert_eq!(
+            autonomy_cycle_decision(config, test_work_readiness(true, None)),
+            AutonomyCycleDecision::Run
+        );
     }
 
     #[test]

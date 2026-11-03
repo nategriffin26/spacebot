@@ -338,6 +338,5 @@ The channel itself has no task tools — it always branches to manage tasks. Thi
 - **Cortex todo-promotion loop** — the cortex loop that scans `Todo` memories and promotes them to `pending_approval` tasks. The data model and execution path are ready; the promotion evaluation prompt and loop are not yet built.
 - **Drag-and-drop** — the kanban board has quick action buttons but no drag-and-drop between columns yet.
 - **Activity timeline** — the detail dialog doesn't show a history of status changes, approvals, and worker events.
-- **Task count badge** — the Tasks tab doesn't show a badge with the pending approval count yet.
 - **Task archival** — done tasks accumulate indefinitely. Options: auto-archive after N days, a separate `archived` status, or UI filtering (currently, done tasks are shown in the Done column).
 - **Rejection feedback** — when a human deletes a pending task, that signal isn't fed back to the cortex. Saving it as a memory would help the cortex learn what's not actionable.

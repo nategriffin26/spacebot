@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import {
 	api,
+	type AutonomyFindingSummary,
 	type CortexEvent,
 	type CortexEventType,
 } from "@/api/client";
@@ -12,7 +13,7 @@ import { useViewport } from "@/hooks/useViewport";
 import { formatTimeAgo } from "@/lib/format";
 import { IdeaIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { FilterButton, Button } from "@/ui";
+import { FilterButton, Button, Badge } from "@/ui";
 
 const PAGE_SIZE = 50;
 
@@ -30,6 +31,10 @@ const EVENT_CATEGORY_COLORS: Record<string, string> = {
 	circuit_breaker_tripped: "bg-amber-500/15 text-amber-400",
 	observation_created: "bg-cyan-500/15 text-cyan-400",
 	health_check: "bg-blue-500/15 text-blue-400",
+	autonomy_cycle_started: "bg-cyan-500/15 text-cyan-400",
+	autonomy_cycle_completed: "bg-emerald-500/15 text-emerald-400",
+	autonomy_cycle_failed: "bg-red-500/15 text-red-400",
+	autonomy_cycle_skipped_not_ready: "bg-amber-500/15 text-amber-400",
 };
 
 /** Groups for the filter pills — reduces clutter vs showing all 13 types. */
@@ -38,6 +43,7 @@ const FILTER_GROUPS: { label: string; types: CortexEventType[] }[] = [
 	{ label: "Maintenance", types: ["maintenance_run", "memory_merged", "memory_decayed", "memory_pruned"] },
 	{ label: "Health", types: ["worker_killed", "branch_killed", "circuit_breaker_tripped", "health_check"] },
 	{ label: "Consolidation", types: ["association_created", "contradiction_flagged", "observation_created"] },
+	{ label: "Autonomy", types: ["autonomy_cycle_started", "autonomy_cycle_completed", "autonomy_cycle_failed", "autonomy_cycle_skipped_not_ready"] },
 ];
 
 function EventTypeBadge({ eventType }: { eventType: string }) {
@@ -61,6 +67,43 @@ function DetailsPanel({ details }: { details: Record<string, unknown> }) {
 					</span>
 				</div>
 			))}
+		</div>
+	);
+}
+
+function SummaryStat({
+	label,
+	value,
+	subtitle,
+}: {
+	label: string;
+	value: string;
+	subtitle: string;
+}) {
+	return (
+		<div className="rounded-lg border border-app-line/50 bg-app-darkBox/30 p-3">
+			<p className="text-tiny uppercase tracking-[0.16em] text-ink-faint">{label}</p>
+			<p className="mt-2 font-plex text-xl text-ink">{value}</p>
+			<p className="mt-1 text-xs text-ink-faint">{subtitle}</p>
+		</div>
+	);
+}
+
+function FindingRow({ finding }: { finding: AutonomyFindingSummary }) {
+	return (
+		<div className="rounded-lg border border-app-line/40 bg-app-darkBox/20 p-3">
+			<div className="flex flex-wrap items-center gap-2">
+				<Badge variant="blue">finding</Badge>
+				<span className="text-tiny text-ink-faint">{finding.memory_type}</span>
+				<span className="text-tiny text-ink-faint">
+					{finding.importance.toFixed(2)} importance
+				</span>
+			</div>
+			<p className="mt-2 line-clamp-3 text-sm text-ink-dull">{finding.content}</p>
+			<p className="mt-2 text-tiny text-ink-faint">
+				{formatTimeAgo(finding.created_at)}
+				{finding.source ? ` • ${finding.source}` : ""}
+			</p>
 		</div>
 	);
 }
@@ -96,6 +139,11 @@ export function AgentCortex({ agentId }: AgentCortexProps) {
 			}),
 		staleTime: 5_000,
 	});
+	const summaryQuery = useQuery({
+		queryKey: ["cortex-summary", agentId],
+		queryFn: () => api.cortexSummary(agentId, 6),
+		staleTime: 5_000,
+	});
 
 	// Client-side filter for group selections
 	// Group mode fetches latest 200 from server then filters client-side — pagination is
@@ -120,6 +168,87 @@ export function AgentCortex({ agentId }: AgentCortexProps) {
 
 	const primary = (
 		<div className="flex h-full flex-col overflow-hidden">
+				<div className="border-b border-app-line/50 bg-app-darkBox/10 px-3 py-3 md:px-6">
+					<div className="grid gap-3 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+						<div className="grid gap-3 md:grid-cols-3">
+							<SummaryStat
+								label="Recent Events"
+								value={String(summaryQuery.data?.recent_events.length ?? 0)}
+								subtitle={
+									summaryQuery.data?.recent_events[0]
+										? `Latest ${formatTimeAgo(summaryQuery.data.recent_events[0].created_at)}`
+										: "No recent cortex events"
+								}
+							/>
+							<SummaryStat
+								label="Autonomy Cycles"
+								value={String(summaryQuery.data?.autonomy_cycles.length ?? 0)}
+								subtitle={
+									summaryQuery.data?.autonomy_cycles[0]
+										? summaryQuery.data.autonomy_cycles[0].event_type.replace(/_/g, " ")
+										: "No recent autonomy activity"
+								}
+							/>
+							<SummaryStat
+								label="Findings"
+								value={String(summaryQuery.data?.recent_findings.length ?? 0)}
+								subtitle={
+									summaryQuery.data?.recent_findings[0]
+										? `Latest ${formatTimeAgo(summaryQuery.data.recent_findings[0].created_at)}`
+										: "No autonomy findings saved"
+								}
+							/>
+						</div>
+						<div className="grid gap-3 md:grid-cols-2">
+							<div className="rounded-lg border border-app-line/50 bg-app-darkBox/30 p-3">
+								<div className="mb-3 flex items-center justify-between gap-2">
+									<h3 className="text-sm font-medium text-ink">Autonomy</h3>
+									<span className="text-tiny text-ink-faint">Latest cycles</span>
+								</div>
+								{summaryQuery.isLoading ? (
+									<p className="text-sm text-ink-faint">Loading autonomy summary...</p>
+								) : summaryQuery.isError ? (
+									<p className="text-sm text-red-400">Failed to load autonomy summary.</p>
+								) : summaryQuery.data?.autonomy_cycles.length ? (
+									<div className="space-y-2">
+										{summaryQuery.data.autonomy_cycles.map((event) => (
+											<div key={event.id} className="rounded-md border border-app-line/40 bg-app-darkBox/20 p-3">
+												<div className="flex flex-wrap items-center gap-2">
+													<EventTypeBadge eventType={event.event_type} />
+													<span className="text-tiny text-ink-faint">
+														{formatTimeAgo(event.created_at)}
+													</span>
+												</div>
+												<p className="mt-2 text-sm text-ink-dull">{event.summary}</p>
+											</div>
+										))}
+									</div>
+								) : (
+									<p className="text-sm text-ink-faint">No autonomy cycle events yet.</p>
+								)}
+							</div>
+							<div className="rounded-lg border border-app-line/50 bg-app-darkBox/30 p-3">
+								<div className="mb-3 flex items-center justify-between gap-2">
+									<h3 className="text-sm font-medium text-ink">Findings</h3>
+									<span className="text-tiny text-ink-faint">Recent saved observations</span>
+								</div>
+								{summaryQuery.isLoading ? (
+									<p className="text-sm text-ink-faint">Loading autonomy findings...</p>
+								) : summaryQuery.isError ? (
+									<p className="text-sm text-red-400">Failed to load autonomy findings.</p>
+								) : summaryQuery.data?.recent_findings.length ? (
+									<div className="space-y-2">
+										{summaryQuery.data.recent_findings.map((finding) => (
+											<FindingRow key={finding.id} finding={finding} />
+										))}
+									</div>
+								) : (
+									<p className="text-sm text-ink-faint">No autonomy findings recorded yet.</p>
+								)}
+							</div>
+						</div>
+					</div>
+				</div>
 				{/* Filter bar */}
 				<div className="flex flex-wrap items-center gap-1.5 border-b border-app-line/50 bg-app-darkBox/20 px-3 py-2 md:px-6">
 					<button

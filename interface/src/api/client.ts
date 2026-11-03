@@ -556,7 +556,11 @@ export type CortexEventType =
 	| "branch_killed"
 	| "circuit_breaker_tripped"
 	| "observation_created"
-	| "health_check";
+	| "health_check"
+	| "autonomy_cycle_started"
+	| "autonomy_cycle_completed"
+	| "autonomy_cycle_failed"
+	| "autonomy_cycle_skipped_not_ready";
 
 export const CORTEX_EVENT_TYPES: CortexEventType[] = [
 	"bulletin_generated", "bulletin_failed",
@@ -564,6 +568,8 @@ export const CORTEX_EVENT_TYPES: CortexEventType[] = [
 	"association_created", "contradiction_flagged",
 	"worker_killed", "branch_killed", "circuit_breaker_tripped",
 	"observation_created", "health_check",
+	"autonomy_cycle_started", "autonomy_cycle_completed",
+	"autonomy_cycle_failed", "autonomy_cycle_skipped_not_ready",
 ];
 
 export interface CortexEvent {
@@ -583,6 +589,93 @@ export interface CortexEventsParams {
 	limit?: number;
 	offset?: number;
 	event_type?: CortexEventType;
+}
+
+export interface AutonomyFindingSummary {
+	id: string;
+	memory_type: string;
+	source: string | null;
+	importance: number;
+	created_at: string;
+	content: string;
+}
+
+export interface CortexSummaryResponse {
+	recent_events: CortexEvent[];
+	autonomy_cycles: CortexEvent[];
+	recent_findings: AutonomyFindingSummary[];
+}
+
+export type CapabilitySubject = "tool" | "skill" | "mcp_server" | "bundle";
+export type CapabilityStatus = "available" | "degraded" | "unavailable";
+export type CapabilityConfidence =
+	| "runtime_verified_now"
+	| "remembered_from_prior_session"
+	| "configured_but_not_connected"
+	| "prompt_visible_only"
+	| "derived_bundle";
+
+export interface CapabilityRecord {
+	id: string;
+	name: string;
+	subject: CapabilitySubject;
+	status: CapabilityStatus;
+	process_types: string[];
+	invocation_path: string;
+	confidence: CapabilityConfidence;
+	reason_code: string | null;
+	detail: string | null;
+	remediation: string | null;
+	source: string | null;
+	last_verified_at: string | null;
+}
+
+export interface ProcessCapabilitySummary {
+	process_type: string;
+	available_tools: string[];
+}
+
+export interface ToolingSummary {
+	available: number;
+	degraded: number;
+	unavailable: number;
+}
+
+export interface CapabilitySnapshot {
+	agent_id: string;
+	generated_at: string;
+	capabilities: CapabilityRecord[];
+	process_summaries: ProcessCapabilitySummary[];
+	summary: ToolingSummary;
+}
+
+export interface DoctorDiagnosis {
+	class: string;
+	summary: string;
+	remediation: string;
+	capability_ids: string[];
+}
+
+export interface ToolDoctorReport {
+	diagnoses: DoctorDiagnosis[];
+	degraded_count: number;
+	unavailable_count: number;
+}
+
+export interface AgentToolsResponse {
+	snapshot: CapabilitySnapshot;
+	doctor: ToolDoctorReport;
+}
+
+export interface BinaryEntry {
+	name: string;
+	size: number;
+	modified: string | null;
+}
+
+export interface ToolBinariesResponse {
+	tools_bin: string;
+	binaries: BinaryEntry[];
 }
 
 // -- Cortex Chat --
@@ -1820,6 +1913,15 @@ export const api = {
 		if (params.event_type) search.set("event_type", params.event_type);
 		return fetchJson<CortexEventsResponse>(`/cortex/events?${search}`);
 	},
+	cortexSummary: (agentId: string, limit = 10) =>
+		fetchJson<CortexSummaryResponse>(
+			`/cortex/summary?agent_id=${encodeURIComponent(agentId)}&limit=${limit}`,
+		),
+	agentTools: (agentId: string) =>
+		fetchJson<AgentToolsResponse>(
+			`/agents/tools?agent_id=${encodeURIComponent(agentId)}`,
+		),
+	toolBinaries: () => fetchJson<ToolBinariesResponse>("/agents/tools/bin"),
 	cortexChatMessages: (agentId: string, threadId?: string, limit = 50) => {
 		const search = new URLSearchParams({ agent_id: agentId, limit: String(limit) });
 		if (threadId) search.set("thread_id", threadId);

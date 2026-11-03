@@ -4,6 +4,7 @@ use crate::config::RuntimeConfig;
 use crate::self_awareness::VerifiedCapability;
 use crate::{ProcessType, TaskClass};
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,9 +37,21 @@ impl CapabilityStatus {
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityConfidence {
     RuntimeVerifiedNow,
+    RememberedFromPriorSession,
     ConfiguredButNotConnected,
     PromptVisibleOnly,
     DerivedBundle,
+}
+
+fn previous_verified_capabilities(
+    agent_id: &str,
+    runtime_config: &RuntimeConfig,
+) -> HashMap<String, VerifiedCapability> {
+    crate::self_awareness::load_verified_capabilities(agent_id, runtime_config)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (entry.capability_name.clone(), entry))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +382,7 @@ pub fn build_capability_snapshot(
 ) -> CapabilitySnapshot {
     let now = chrono::Utc::now().to_rfc3339();
     let mut capabilities = Vec::new();
+    let previous_capabilities = previous_verified_capabilities(agent_id, runtime_config);
 
     push_static_tools(
         &mut capabilities,
@@ -657,21 +671,18 @@ pub fn build_capability_snapshot(
         } else {
             CapabilityStatus::Degraded
         };
-        let (reason_code, remediation, detail) = if connected {
+        let previous = previous_capabilities.get(&server.name);
+        let (reason_code, remediation, detail, source, last_verified_at) = if connected {
             (
                 None,
                 None,
                 Some(format!("transport={}", server.transport.kind())),
+                None,
+                Some(now.clone()),
             )
         } else {
-            let previous =
-                crate::self_awareness::load_verified_capabilities(agent_id, runtime_config)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|entry| entry.capability_name == server.name)
-                    .and_then(|entry| entry.failure_reason);
-            let (reason_code, remediation) = previous
-                .as_deref()
+            let failure_reason = previous.and_then(|entry| entry.failure_reason.as_deref());
+            let (reason_code, remediation) = failure_reason
                 .map(classify_mcp_failure)
                 .map(|(code, remediation)| (Some(code.to_string()), Some(remediation)))
                 .unwrap_or((
@@ -682,7 +693,21 @@ pub fn build_capability_snapshot(
                 reason_code,
                 remediation,
                 Some(format!("configured transport={}", server.transport.kind())),
+                previous
+                    .and_then(|entry| entry.last_verified_at.as_ref())
+                    .map(|_| "capability_registry".to_string()),
+                previous.and_then(|entry| entry.last_verified_at.clone()),
             )
+        };
+        let confidence = if connected {
+            CapabilityConfidence::RuntimeVerifiedNow
+        } else if previous
+            .and_then(|entry| entry.last_verified_at.as_ref())
+            .is_some()
+        {
+            CapabilityConfidence::RememberedFromPriorSession
+        } else {
+            CapabilityConfidence::ConfiguredButNotConnected
         };
 
         capabilities.push(CapabilityRecord {
@@ -692,16 +717,12 @@ pub fn build_capability_snapshot(
             status,
             process_types: vec![ProcessType::Worker],
             invocation_path: format!("mcp:{}", server.name),
-            confidence: if connected {
-                CapabilityConfidence::RuntimeVerifiedNow
-            } else {
-                CapabilityConfidence::ConfiguredButNotConnected
-            },
+            confidence,
             reason_code,
             detail,
             remediation,
-            source: None,
-            last_verified_at: connected.then(|| now.clone()),
+            source,
+            last_verified_at,
         });
     }
 
@@ -792,5 +813,150 @@ impl TaskClass {
                 | Self::SimpleBoundedExecution
                 | Self::Coding
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AgentConfig, DefaultsConfig, McpServerConfig, McpTransport, RuntimeConfig,
+    };
+    use tempfile::tempdir;
+
+    fn test_runtime_config(
+        instance_dir: &std::path::Path,
+        mcp: Vec<McpServerConfig>,
+    ) -> RuntimeConfig {
+        let defaults = DefaultsConfig::default();
+        let agent_config = AgentConfig {
+            id: "test-agent".to_string(),
+            default: true,
+            display_name: None,
+            role: None,
+            gradient_start: None,
+            gradient_end: None,
+            workspace: None,
+            routing: None,
+            max_concurrent_branches: None,
+            max_concurrent_workers: None,
+            max_turns: None,
+            branch_max_turns: None,
+            context_window: None,
+            compaction: None,
+            memory_persistence: None,
+            coalesce: None,
+            ingestion: None,
+            cortex: None,
+            warmup: None,
+            browser: None,
+            channel: None,
+            rig_alignment: None,
+            mcp: Some(mcp),
+            brave_search_key: None,
+            cron_timezone: None,
+            user_timezone: None,
+            sandbox: None,
+            projects: None,
+            cron: Vec::new(),
+        };
+        let resolved = agent_config.resolve(instance_dir, &defaults);
+        std::fs::create_dir_all(&resolved.data_dir).expect("failed to create agent data dir");
+        std::fs::create_dir_all(&resolved.workspace).expect("failed to create workspace dir");
+        std::fs::create_dir_all(&resolved.identity_dir).expect("failed to create identity dir");
+        RuntimeConfig::new(
+            instance_dir,
+            &resolved,
+            &defaults,
+            crate::prompts::PromptEngine::new("en").expect("prompt engine"),
+            crate::identity::Identity::default(),
+            crate::skills::SkillSet::default(),
+        )
+    }
+
+    #[test]
+    fn disconnected_mcp_server_uses_prior_session_confidence_when_registry_has_verification() {
+        let temp_dir = tempdir().expect("tempdir");
+        let runtime_config = test_runtime_config(
+            temp_dir.path(),
+            vec![McpServerConfig {
+                name: "calendar".to_string(),
+                transport: McpTransport::Stdio {
+                    command: "calendar-mcp".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+                enabled: true,
+            }],
+        );
+        let registry_path = runtime_config
+            .instance_dir
+            .join("agents/test-agent/data/capabilities_registry.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_string_pretty(&vec![VerifiedCapability {
+                capability_name: "calendar".to_string(),
+                category: "mcp".to_string(),
+                invocation_path: "mcp:calendar".to_string(),
+                required_secrets_present: true,
+                health_state: "verified".to_string(),
+                last_verified_at: Some("2026-03-18T12:00:00Z".to_string()),
+                last_failure_at: None,
+                failure_reason: None,
+                note: Some("previously connected".to_string()),
+            }])
+            .expect("registry json"),
+        )
+        .expect("registry write");
+
+        let snapshot = build_capability_snapshot("test-agent", &runtime_config, &[], &[]);
+        let capability = snapshot
+            .capabilities
+            .iter()
+            .find(|record| record.id == "mcp:calendar")
+            .expect("calendar capability");
+
+        assert_eq!(capability.status, CapabilityStatus::Degraded);
+        assert_eq!(
+            capability.confidence,
+            CapabilityConfidence::RememberedFromPriorSession
+        );
+        assert_eq!(capability.source.as_deref(), Some("capability_registry"));
+        assert_eq!(
+            capability.last_verified_at.as_deref(),
+            Some("2026-03-18T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn disconnected_mcp_server_without_registry_stays_configured_only() {
+        let temp_dir = tempdir().expect("tempdir");
+        let runtime_config = test_runtime_config(
+            temp_dir.path(),
+            vec![McpServerConfig {
+                name: "calendar".to_string(),
+                transport: McpTransport::Stdio {
+                    command: "calendar-mcp".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+                enabled: true,
+            }],
+        );
+
+        let snapshot = build_capability_snapshot("test-agent", &runtime_config, &[], &[]);
+        let capability = snapshot
+            .capabilities
+            .iter()
+            .find(|record| record.id == "mcp:calendar")
+            .expect("calendar capability");
+
+        assert_eq!(capability.status, CapabilityStatus::Degraded);
+        assert_eq!(
+            capability.confidence,
+            CapabilityConfidence::ConfiguredButNotConnected
+        );
+        assert_eq!(capability.source, None);
+        assert_eq!(capability.last_verified_at, None);
     }
 }
